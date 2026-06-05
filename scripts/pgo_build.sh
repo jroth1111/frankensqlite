@@ -11,7 +11,8 @@
 #   7. Optional BOLT post-link optimization if `llvm-bolt` is available.
 #
 # Outputs into a unique run directory under `/tmp/frankensqlite-pgo/` by
-# default; override with $PGO_DIR and $PGO_RUN_ID.
+# default, and mirrors small proof artifacts into $PGO_LOCAL_ARTIFACT_DIR.
+# Override with $PGO_DIR and $PGO_RUN_ID.
 #
 # Usage:
 #   scripts/pgo_build.sh                   # full PGO + hyperfine pipeline
@@ -132,6 +133,39 @@ quote_cmd() {
     printf "%q " "$@"
 }
 
+copy_artifact_if_distinct() {
+    local src="$1"
+    local dst="$2"
+
+    if [[ ! -f "${src}" ]]; then
+        return 0
+    fi
+    if [[ "$(realpath -m "${src}")" == "$(realpath -m "${dst}")" ]]; then
+        return 0
+    fi
+    cp "${src}" "${dst}"
+}
+
+publish_local_artifacts() {
+    mkdir -p "${LOCAL_ARTIFACT_DIR}"
+    {
+        echo "run_dir=${RUN_DIR}"
+        echo "profdata=${PROFDATA}"
+        echo "baseline_bin=${BASELINE_BIN}"
+        echo "pgo_bin=${PGO_BIN}"
+        echo "training_args=${TRAINING_ARGS}"
+        echo "bench_args=${BENCH_ARGS}"
+        echo "hyperfine_json=${HYPERFINE_JSON}"
+    } > "${LOCAL_ARTIFACT_DIR}/manifest.txt"
+
+    copy_artifact_if_distinct \
+        "${RUN_DIR}/training_run.log" \
+        "${LOCAL_ARTIFACT_DIR}/training_run.log"
+    copy_artifact_if_distinct \
+        "${HYPERFINE_JSON}" \
+        "${LOCAL_ARTIFACT_DIR}/hyperfine-pgo.json"
+}
+
 mkdir -p "${RUN_DIR}" "${PROFRAW_DIR}"
 
 BASELINE_BIN="${BASELINE_TARGET}/release-perf/comprehensive-bench"
@@ -239,8 +273,11 @@ if [[ "${RUN_BOLT}" -eq 1 ]]; then
     fi
 fi
 
+publish_local_artifacts
+
 echo
 echo "Done."
 echo "Baseline binary: ${BASELINE_BIN}"
 echo "PGO binary: ${PGO_BIN}"
 echo "Artifacts: ${RUN_DIR}"
+echo "Local proof artifacts: ${LOCAL_ARTIFACT_DIR}"

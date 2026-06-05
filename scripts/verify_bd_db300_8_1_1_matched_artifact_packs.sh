@@ -6,7 +6,8 @@
 # row/fixture/placement/storage tuple, writes mode-specific benchmark artifacts,
 # and produces a matched-pack manifest/report with shared provenance fields.
 #
-# Heavy work is always routed through `rch exec`.
+# Benchmark work is routed through `rch exec`; H3's verify-suite packaging path
+# intentionally uses plain local `cargo run` because it is a fast packaging check.
 
 set -euo pipefail
 
@@ -27,7 +28,13 @@ CLASSIFICATION_JSON="${OUTPUT_DIR}/classification.json"
 CLASSIFICATION_MD="${OUTPUT_DIR}/classification.md"
 VALIDATION_JSON="${OUTPUT_DIR}/validation.json"
 VALIDATION_MD="${OUTPUT_DIR}/validation.md"
+SINGLE_WRITER_ROLE_JSON="${OUTPUT_DIR}/single_writer_role.json"
+SINGLE_WRITER_ROLE_MD="${OUTPUT_DIR}/single_writer_role.md"
 MVCC_DEFAULT_GUARD_LOG="${OUTPUT_DIR}/mvcc_default_guard.log"
+SINGLE_WRITER_VERIFY_DIR="${OUTPUT_DIR}/verify-suite/single-writer"
+SINGLE_WRITER_VERIFY_LOG="${OUTPUT_DIR}/single_writer_verify_suite.log"
+SINGLE_WRITER_VERIFY_TARGET_DIR="${SINGLE_WRITER_VERIFY_TARGET_DIR:-${TMPDIR:-/tmp}/fsqlite_${RUN_ID_SAFE}_single_writer_verify}"
+CONCURRENT_MODE_DEFAULT_GUARD="${OUTPUT_DIR}/concurrent_mode_default_guard.txt"
 ROW_IDS="${ROW_IDS:-mixed_read_write_c4}"
 FIXTURE_IDS="${FIXTURE_IDS:-}"
 PLACEMENT_PROFILE_IDS="${PLACEMENT_PROFILE_IDS:-baseline_unpinned}"
@@ -104,6 +111,10 @@ should_emit_single_writer_classification() {
 
 should_emit_single_writer_validation() {
     [[ "${BEAD_ID}" == "bd-db300.8.2.3" || "${EMIT_SINGLE_WRITER_VALIDATION:-0}" == "1" ]]
+}
+
+should_emit_single_writer_role() {
+    [[ "${BEAD_ID}" == "bd-db300.8.3" || "${EMIT_SINGLE_WRITER_ROLE:-0}" == "1" ]]
 }
 
 ensure_row_exists() {
@@ -814,6 +825,253 @@ run_mvcc_default_guard() {
     fi
 }
 
+run_concurrent_mode_default_source_guard() {
+    if ! rg -n 'concurrent_mode_default: RefCell::new\(true\)' \
+        "${WORKSPACE_ROOT}/crates/fsqlite-core/src/connection.rs" \
+        > "${CONCURRENT_MODE_DEFAULT_GUARD}"; then
+        fail "concurrent-mode-default-guard" "concurrent_mode_default true guard missing"
+    fi
+}
+
+run_single_writer_verify_suite() {
+    mkdir -p "${SINGLE_WRITER_VERIFY_DIR}"
+    local -a command=(
+        env
+        "CARGO_TARGET_DIR=${SINGLE_WRITER_VERIFY_TARGET_DIR}"
+        cargo run
+        -p fsqlite-e2e
+        --bin realdb-e2e
+        --
+        verify-suite
+        --suite-id "${BEAD_ID}.single_writer_role"
+        --execution-context local
+        --mode fsqlite_single_writer
+        --placement-profile baseline_unpinned
+        --verification-depth quick
+        --activation-regime low_concurrency_fixed_cost
+        --shadow-mode off
+        --db frankensqlite
+        --workload all
+        --concurrency 1
+        --output-dir "${SINGLE_WRITER_VERIFY_DIR}"
+        --pretty
+    )
+    local rendered_command
+    rendered_command="$(shell_join "${command[@]}")"
+    log_event "INFO" "single-writer-verify-suite" "running ${rendered_command}"
+    if ! "${command[@]}" > "${SINGLE_WRITER_VERIFY_LOG}" 2>&1; then
+        fail "single-writer-verify-suite" "forced single-writer verify-suite packaging failed; see ${SINGLE_WRITER_VERIFY_LOG}"
+    fi
+    require_nonempty_file "${SINGLE_WRITER_VERIFY_DIR}/suite_package.json"
+    require_nonempty_file "${SINGLE_WRITER_VERIFY_DIR}/suite_summary.md"
+    require_nonempty_file "${SINGLE_WRITER_VERIFY_DIR}/logs/verify_suite.jsonl"
+}
+
+build_single_writer_role() {
+    local baseline_report_json="${BASELINE_REPORT_JSON:-$(latest_report_file "${WORKSPACE_ROOT}/artifacts/perf/bd-db300.8.1.2")}"
+    [[ -n "${baseline_report_json}" ]] || fail "single-writer-role" "failed to resolve a baseline bd-db300.8.1.2 report.json"
+    require_nonempty_file "${baseline_report_json}"
+    require_nonempty_file "${REPORT_JSON}"
+    require_nonempty_file "${SINGLE_WRITER_VERIFY_DIR}/suite_package.json"
+    require_nonempty_file "${SINGLE_WRITER_VERIFY_DIR}/logs/verify_suite.jsonl"
+    require_nonempty_file "${CONCURRENT_MODE_DEFAULT_GUARD}"
+
+    jq -n \
+        --arg schema_version "fsqlite-e2e.db300.single_writer_role.v1" \
+        --arg bead_id "${BEAD_ID}" \
+        --arg run_id "${RUN_ID}" \
+        --arg generated_at "${GENERATED_AT}" \
+        --arg baseline_report_json "${baseline_report_json}" \
+        --arg current_report_json "${REPORT_JSON}" \
+        --arg verify_suite_package_json "${SINGLE_WRITER_VERIFY_DIR}/suite_package.json" \
+        --arg verify_suite_summary_md "${SINGLE_WRITER_VERIFY_DIR}/suite_summary.md" \
+        --arg verify_suite_log_jsonl "${SINGLE_WRITER_VERIFY_DIR}/logs/verify_suite.jsonl" \
+        --arg verify_suite_stdout_log "${SINGLE_WRITER_VERIFY_LOG}" \
+        --arg concurrent_mode_default_guard "${CONCURRENT_MODE_DEFAULT_GUARD}" \
+        --slurpfile baseline "${baseline_report_json}" \
+        --slurpfile current "${REPORT_JSON}" \
+        --slurpfile verify_suite "${SINGLE_WRITER_VERIFY_DIR}/suite_package.json" \
+        '
+        def pack($doc; $placement; $storage):
+            $doc[0].packs[]
+            | select(
+                .fixture_id == "frankensqlite"
+                and .row_id == "mixed_read_write_c4"
+                and .placement_profile_id == $placement
+                and .storage_profile_id == $storage
+            );
+        def ratio($num; $den):
+            if $den == null or $den == 0 then null else ($num / $den) end;
+        def percent_delta($current; $previous):
+            if $previous == null or $previous == 0 then null else ((($current - $previous) / $previous) * 100.0) end;
+        def comparison($placement; $storage):
+            (pack($baseline; $placement; $storage)) as $baseline_pack |
+            (pack($current; $placement; $storage)) as $current_pack |
+            {
+              placement_profile_id: $placement,
+              storage_profile_id: $storage,
+              comparability_status: $current_pack.comparability_status,
+              baseline_single_writer_median_ops_per_sec: $baseline_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec,
+              current_single_writer_median_ops_per_sec: $current_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec,
+              single_writer_median_ops_delta: (
+                $current_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec
+                - $baseline_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec
+              ),
+              single_writer_median_ops_percent_delta:
+                percent_delta(
+                  $current_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec;
+                  $baseline_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec
+                ),
+              current_sqlite_median_ops_per_sec: $current_pack.mode_results.sqlite_reference.throughput.median_ops_per_sec,
+              current_mvcc_median_ops_per_sec: $current_pack.mode_results.fsqlite_mvcc.throughput.median_ops_per_sec,
+              current_single_writer_vs_sqlite_ratio:
+                ratio(
+                  $current_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec;
+                  $current_pack.mode_results.sqlite_reference.throughput.median_ops_per_sec
+                ),
+              current_single_writer_vs_mvcc_ratio: $current_pack.deltas.single_writer_vs_mvcc_median_ops_ratio,
+              current_single_writer_minus_mvcc_mean_retries: $current_pack.deltas.single_writer_minus_mvcc_mean_retries,
+              current_single_writer_minus_mvcc_median_latency_ms: $current_pack.deltas.single_writer_minus_mvcc_median_latency_ms,
+              role_read: (
+                if $current_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec
+                   >= $baseline_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec
+                then "shared_optimizations_helped_single_writer_absolute_ops"
+                else "single_writer_needs_followup"
+                end
+              )
+            };
+        [
+          comparison("recommended_pinned"; "file_backed"),
+          comparison("recommended_pinned"; "memory"),
+          comparison("adversarial_cross_node"; "file_backed"),
+          comparison("adversarial_cross_node"; "memory")
+        ] as $comparisons |
+        {
+          schema_version: $schema_version,
+          bead_id: $bead_id,
+          run_id: $run_id,
+          generated_at: $generated_at,
+          baseline_report_json: $baseline_report_json,
+          current_report_json: $current_report_json,
+          single_writer_role: {
+            role_id: "comparison_or_fallback_only",
+            product_default: "fsqlite_mvcc",
+            default_contract: "BEGIN stays MVCC-by-default through concurrent_mode_default=true; forced single-writer is opt-in via PRAGMA fsqlite.concurrent_mode=OFF or --no-mvcc.",
+            report_contract: "G4 may use forced single-writer as a causal bridge between SQLite and MVCC, or as restricted fallback evidence, but not as the headline product mode."
+          },
+          verify_suite: {
+            package_json: $verify_suite_package_json,
+            summary_md: $verify_suite_summary_md,
+            log_jsonl: $verify_suite_log_jsonl,
+            stdout_log: $verify_suite_stdout_log,
+            package: $verify_suite[0]
+          },
+          concurrent_mode_default_guard: {
+            source_guard_file: $concurrent_mode_default_guard,
+            status: "passed"
+          },
+          evidence_scope: {
+            fixture_id: "frankensqlite",
+            workload_row: "mixed_read_write_c4",
+            benchmark_command_family: "scripts/verify_bd_db300_8_1_1_matched_artifact_packs.sh",
+            verification_suite_command_family: "realdb-e2e verify-suite --mode fsqlite_single_writer --activation-regime low_concurrency_fixed_cost",
+            placement_profiles: [
+              "recommended_pinned",
+              "adversarial_cross_node"
+            ],
+            storage_profiles: [
+              "file_backed",
+              "memory"
+            ]
+          },
+          comparisons: $comparisons,
+          verification_plan: {
+            unit_tests: [
+              "cargo test -p fsqlite-e2e --test bd_2yqp6_6_5_concurrent_mode_defaults",
+              "cargo test -p fsqlite-e2e --test bd_db300_7_1_2_counter_schema_alignment"
+            ],
+            end_to_end_scenarios: [
+              "realdb-e2e verify-suite --mode fsqlite_single_writer --verification-depth quick --activation-regime low_concurrency_fixed_cost --placement-profile baseline_unpinned",
+              "matched packs for sqlite_reference, fsqlite_mvcc, and fsqlite_single_writer on mixed_read_write_c4 with recommended_pinned and adversarial_cross_node placement metadata"
+            ],
+            logging_artifacts: [
+              "events.jsonl",
+              "report.json",
+              "single_writer_role.json",
+              "single_writer_role.md",
+              "verify-suite/single-writer/logs/verify_suite.jsonl",
+              "concurrent_mode_default_guard.txt"
+            ],
+            g4_inputs: [
+              "current_report_json",
+              "single_writer_role.comparisons",
+              "single_writer_role.role_id",
+              "verify_suite.package.rerun_entrypoint",
+              "verify_suite.package.focused_rerun_entrypoint"
+            ]
+          }
+        }
+        | .summary = {
+            single_writer_role: .single_writer_role.role_id,
+            default_mode: .single_writer_role.product_default,
+            forced_single_writer_verify_suite_status: "passed",
+            concurrent_mode_default_guard_status: .concurrent_mode_default_guard.status,
+            all_single_writer_absolute_ops_improved: ([.comparisons[].role_read] | all(. == "shared_optimizations_helped_single_writer_absolute_ops")),
+            file_backed_single_writer_ops_percent_delta_range: {
+              min: ([.comparisons[] | select(.storage_profile_id == "file_backed") | .single_writer_median_ops_percent_delta] | min),
+              max: ([.comparisons[] | select(.storage_profile_id == "file_backed") | .single_writer_median_ops_percent_delta] | max)
+            },
+            memory_single_writer_ops_percent_delta_range: {
+              min: ([.comparisons[] | select(.storage_profile_id == "memory") | .single_writer_median_ops_percent_delta] | min),
+              max: ([.comparisons[] | select(.storage_profile_id == "memory") | .single_writer_median_ops_percent_delta] | max)
+            }
+          }
+        ' > "${SINGLE_WRITER_ROLE_JSON}"
+
+    jq -r '
+        [
+            "# H3 Single-Writer Role And Evidence",
+            "",
+            "- run_id: `\(.run_id)`",
+            "- role: `\(.single_writer_role.role_id)`",
+            "- product default: `\(.single_writer_role.product_default)`",
+            "- forced single-writer verify-suite: `passed`",
+            "- concurrent_mode_default guard: `\(.concurrent_mode_default_guard.status)`",
+            "- baseline_report_json: `\(.baseline_report_json)`",
+            "- current_report_json: `\(.current_report_json)`",
+            "",
+            "## Role",
+            "",
+            .single_writer_role.default_contract,
+            "",
+            .single_writer_role.report_contract,
+            "",
+            "## Benchmark Evidence",
+            "",
+            "| placement_profile_id | storage_profile_id | current single-writer ops/s | baseline single-writer ops/s | ops delta | percent delta | single/sqlite ratio | single/mvcc ratio | retry delta vs MVCC | role read |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+            (
+                .comparisons[]
+                | "| \(.placement_profile_id) | \(.storage_profile_id) | \(.current_single_writer_median_ops_per_sec) | \(.baseline_single_writer_median_ops_per_sec) | \(.single_writer_median_ops_delta) | \(.single_writer_median_ops_percent_delta) | \(.current_single_writer_vs_sqlite_ratio) | \(.current_single_writer_vs_mvcc_ratio) | \(.current_single_writer_minus_mvcc_mean_retries) | \(.role_read) |"
+            ),
+            "",
+            "## Verification Plan For G4",
+            "",
+            "Unit tests:",
+            (.verification_plan.unit_tests[] | "- " + .),
+            "",
+            "End-to-end scenarios:",
+            (.verification_plan.end_to_end_scenarios[] | "- " + .),
+            "",
+            "Logging artifacts:",
+            (.verification_plan.logging_artifacts[] | "- " + .),
+            "",
+            "G4 inputs:",
+            (.verification_plan.g4_inputs[] | "- " + .)
+        ] | join("\n")
+    ' "${SINGLE_WRITER_ROLE_JSON}" > "${SINGLE_WRITER_ROLE_MD}"
+}
+
 build_single_writer_validation() {
     local previous_report_json="${PREVIOUS_SHARED_PLACEMENT_REPORT_JSON:-$(latest_report_file "${WORKSPACE_ROOT}/artifacts/perf/bd-db300.8.1.2")}"
     [[ -n "${previous_report_json}" ]] || fail "validation" "failed to resolve a previous shared-placement report.json"
@@ -1019,6 +1277,11 @@ main() {
         run_mvcc_default_guard
         build_single_writer_validation
     fi
+    if should_emit_single_writer_role; then
+        run_concurrent_mode_default_source_guard
+        run_single_writer_verify_suite
+        build_single_writer_role
+    fi
     log_event "INFO" "complete" "matched artifact pack collection completed"
 
     echo "RUN_ID:      ${RUN_ID}"
@@ -1033,6 +1296,11 @@ main() {
         echo "VALIDATION_JSON: ${VALIDATION_JSON}"
         echo "VALIDATION_MD:   ${VALIDATION_MD}"
         echo "MVCC_DEFAULT_GUARD_LOG: ${MVCC_DEFAULT_GUARD_LOG}"
+    fi
+    if should_emit_single_writer_role; then
+        echo "SINGLE_WRITER_ROLE_JSON: ${SINGLE_WRITER_ROLE_JSON}"
+        echo "SINGLE_WRITER_ROLE_MD:   ${SINGLE_WRITER_ROLE_MD}"
+        echo "SINGLE_WRITER_VERIFY_DIR: ${SINGLE_WRITER_VERIFY_DIR}"
     fi
 }
 

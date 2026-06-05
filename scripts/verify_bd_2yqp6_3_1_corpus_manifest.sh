@@ -116,6 +116,25 @@ for family in required_families:
         raise SystemExit(
             f"required category family missing from category_floors: {family_name}"
         )
+hash_locked_roots = fixture_roots.get("hash_locked_roots", [])
+if not hash_locked_roots:
+    raise SystemExit("fixture_roots.hash_locked_roots must be non-empty")
+for root in hash_locked_roots:
+    root_id = str(root.get("root_id", "")).strip()
+    if not root_id:
+        raise SystemExit("fixture_roots.hash_locked_roots entry missing root_id")
+    for key in ("path", "kind", "hash_algorithm", "content_hash"):
+        if not str(root.get(key, "")).strip():
+            raise SystemExit(f"hash-locked root {root_id} missing {key}")
+    if root.get("hash_algorithm") != "sha256-tree-v1":
+        raise SystemExit(f"hash-locked root {root_id} has unsupported hash_algorithm")
+    content_hash = str(root.get("content_hash", "")).strip()
+    if len(content_hash) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in content_hash):
+        raise SystemExit(f"hash-locked root {root_id} content_hash must be SHA-256 hex")
+    if not root.get("include_extensions"):
+        raise SystemExit(f"hash-locked root {root_id} missing include_extensions")
+    if int(root.get("min_files", 0)) <= 0:
+        raise SystemExit(f"hash-locked root {root_id} min_files must be > 0")
 
 entries = manifest.get("entries", [])
 if not entries:
