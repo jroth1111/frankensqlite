@@ -3957,4 +3957,420 @@ mod tests {
         assert_eq!(limited[0].frame_id, 302);
         assert_eq!(limited[1].frame_id, 303);
     }
+
+    // -- Pure-logic tests for untested public API surface --
+
+    #[test]
+    fn test_wal_fec_path_for_wal_dash_suffix() {
+        let path = wal_fec_path_for_wal(Path::new("/tmp/test.db-wal"));
+        assert_eq!(path, PathBuf::from("/tmp/test.db-wal-fec"));
+    }
+
+    #[test]
+    fn test_wal_fec_path_for_wal_dot_suffix() {
+        let path = wal_fec_path_for_wal(Path::new("/tmp/test.wal"));
+        assert_eq!(path, PathBuf::from("/tmp/test.wal-fec"));
+    }
+
+    #[test]
+    fn test_wal_fec_path_for_wal_no_wal_suffix() {
+        let path = wal_fec_path_for_wal(Path::new("/tmp/test.db"));
+        assert_eq!(path, PathBuf::from("/tmp/test.db.wal-fec"));
+    }
+
+    #[test]
+    fn test_build_source_page_hashes_deterministic() {
+        let pages = vec![vec![0xAA; 4096], vec![0xBB; 4096]];
+        let hashes1 = build_source_page_hashes(&pages);
+        let hashes2 = build_source_page_hashes(&pages);
+        assert_eq!(hashes1, hashes2);
+        assert_eq!(hashes1.len(), 2);
+    }
+
+    #[test]
+    fn test_build_source_page_hashes_empty() {
+        let hashes = build_source_page_hashes(&[]);
+        assert!(hashes.is_empty());
+    }
+
+    #[test]
+    fn test_build_source_page_hashes_distinct_pages_produce_distinct_hashes() {
+        let pages = vec![vec![0x00; 4096], vec![0xFF; 4096]];
+        let hashes = build_source_page_hashes(&pages);
+        assert_ne!(hashes[0], hashes[1]);
+    }
+
+    #[test]
+    fn test_verify_salt_binding_match() {
+        let meta = WalFecGroupMeta::from_init(make_test_init(2)).expect("from_init");
+        let salts = WalSalts {
+            salt1: 0x1234_5678,
+            salt2: 0xABCD_EF01,
+        };
+        assert!(meta.verify_salt_binding(salts).is_ok());
+    }
+
+    #[test]
+    fn test_verify_salt_binding_mismatch_salt1() {
+        let meta = WalFecGroupMeta::from_init(make_test_init(2)).expect("from_init");
+        let salts = WalSalts {
+            salt1: 0xDEAD_BEEF,
+            salt2: 0xABCD_EF01,
+        };
+        let err = meta.verify_salt_binding(salts);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("salt mismatch"));
+    }
+
+    #[test]
+    fn test_verify_salt_binding_mismatch_salt2() {
+        let meta = WalFecGroupMeta::from_init(make_test_init(2)).expect("from_init");
+        let salts = WalSalts {
+            salt1: 0x1234_5678,
+            salt2: 0x0000_0000,
+        };
+        assert!(meta.verify_salt_binding(salts).is_err());
+    }
+
+    #[test]
+    fn test_group_record_new_wrong_repair_count() {
+        let meta = WalFecGroupMeta::from_init(make_test_init(2)).expect("from_init");
+        let result = WalFecGroupRecord::new(meta, vec![]);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("repair symbol count")
+        );
+    }
+
+    #[test]
+    fn test_group_record_new_wrong_object_id() {
+        let meta = WalFecGroupMeta::from_init(make_test_init(1)).expect("from_init");
+        let bad_symbol = SymbolRecord {
+            esi: meta.k_source,
+            object_id: ObjectId::from_bytes([0xBB; 16]),
+            oti: meta.oti,
+            flags: SymbolRecordFlags::empty(),
+            symbol_data: vec![0; meta.page_size as usize],
+            frame_xxh3: 0,
+            auth_tag: [0; 16],
+        };
+        let bad_symbol2 = SymbolRecord {
+            esi: meta.k_source + 1,
+            object_id: ObjectId::from_bytes([0xBB; 16]),
+            oti: meta.oti,
+            flags: SymbolRecordFlags::empty(),
+            symbol_data: vec![0; meta.page_size as usize],
+            frame_xxh3: 0,
+            auth_tag: [0; 16],
+        };
+        let result = WalFecGroupRecord::new(meta, vec![bad_symbol, bad_symbol2]);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("object_id mismatch")
+        );
+    }
+
+    #[test]
+    fn test_group_record_new_wrong_esi() {
+        let meta = WalFecGroupMeta::from_init(make_test_init(1)).expect("from_init");
+        let sym = SymbolRecord {
+            esi: 999,
+            object_id: meta.object_id,
+            oti: meta.oti,
+            flags: SymbolRecordFlags::empty(),
+            symbol_data: vec![0; meta.page_size as usize],
+            frame_xxh3: 0,
+            auth_tag: [0; 16],
+        };
+        let sym2 = SymbolRecord {
+            esi: 1000,
+            object_id: meta.object_id,
+            oti: meta.oti,
+            flags: SymbolRecordFlags::empty(),
+            symbol_data: vec![0; meta.page_size as usize],
+            frame_xxh3: 0,
+            auth_tag: [0; 16],
+        };
+        let result = WalFecGroupRecord::new(meta, vec![sym, sym2]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("ESI"));
+    }
+
+    #[test]
+    fn test_group_id_display() {
+        let id = WalFecGroupId {
+            wal_salt1: 1,
+            wal_salt2: 2,
+            end_frame_no: 42,
+        };
+        assert_eq!(format!("{id}"), "(1, 2, 42)");
+    }
+
+    #[test]
+    fn test_severity_bucket_as_str_roundtrip() {
+        let buckets = [
+            WalFecRepairSeverityBucket::One,
+            WalFecRepairSeverityBucket::TwoToFive,
+            WalFecRepairSeverityBucket::SixToTen,
+            WalFecRepairSeverityBucket::ElevenPlus,
+        ];
+        for bucket in buckets {
+            let s = bucket.as_str();
+            let parsed: WalFecRepairSeverityBucket = s.parse().expect(s);
+            assert_eq!(parsed, bucket);
+        }
+    }
+
+    #[test]
+    fn test_severity_bucket_from_str_aliases() {
+        assert_eq!(
+            "one".parse::<WalFecRepairSeverityBucket>().unwrap(),
+            WalFecRepairSeverityBucket::One
+        );
+        assert_eq!(
+            "two-to-five"
+                .parse::<WalFecRepairSeverityBucket>()
+                .unwrap(),
+            WalFecRepairSeverityBucket::TwoToFive
+        );
+        assert_eq!(
+            "six_to_ten"
+                .parse::<WalFecRepairSeverityBucket>()
+                .unwrap(),
+            WalFecRepairSeverityBucket::SixToTen
+        );
+        assert_eq!(
+            "eleven_plus"
+                .parse::<WalFecRepairSeverityBucket>()
+                .unwrap(),
+            WalFecRepairSeverityBucket::ElevenPlus
+        );
+        assert!("unknown".parse::<WalFecRepairSeverityBucket>().is_err());
+    }
+
+    #[test]
+    fn test_severity_histogram_bump_all_buckets() {
+        let mut hist = WalFecRepairSeverityHistogram::default();
+        assert_eq!(hist.one, 0);
+        hist.bump(WalFecRepairSeverityBucket::One);
+        hist.bump(WalFecRepairSeverityBucket::One);
+        hist.bump(WalFecRepairSeverityBucket::TwoToFive);
+        hist.bump(WalFecRepairSeverityBucket::SixToTen);
+        hist.bump(WalFecRepairSeverityBucket::ElevenPlus);
+        hist.bump(WalFecRepairSeverityBucket::ElevenPlus);
+        assert_eq!(hist.one, 2);
+        assert_eq!(hist.two_to_five, 1);
+        assert_eq!(hist.six_to_ten, 1);
+        assert_eq!(hist.eleven_plus, 2);
+    }
+
+    #[test]
+    fn test_evidence_card_hex_methods() {
+        let card = WalFecRepairEvidenceCard {
+            group_id: WalFecGroupId {
+                wal_salt1: 1,
+                wal_salt2: 2,
+                end_frame_no: 10,
+            },
+            frame_id: 10,
+            wal_file_offset_bytes: None,
+            monotonic_timestamp_ns: 0,
+            wall_clock_unix_ns: 0,
+            corruption_signature_blake3: [0xAB; 32],
+            bit_error_pattern: None,
+            repair_source: WalFecRepairSource::WalRepairSymbols,
+            symbols_used: 2,
+            validated_source_symbols: 1,
+            validated_repair_symbols: 1,
+            required_symbols: 2,
+            available_symbols: 2,
+            witness: WalFecRepairWitnessTriple {
+                corrupted_hash_blake3: [0; 32],
+                repaired_hash_blake3: [0; 32],
+                expected_hash_blake3: [0; 32],
+            },
+            repair_latency_ns: 0,
+            confidence_per_mille: 1000,
+            severity_bucket: WalFecRepairSeverityBucket::One,
+            ledger_epoch: 0,
+            chain_hash: [0xFF; 32],
+        };
+        assert_eq!(card.chain_hash_hex().len(), 64);
+        assert!(card.chain_hash_hex().chars().all(|c| c == 'f'));
+        assert_eq!(card.corruption_signature_hex().len(), 64);
+        assert!(card.corruption_signature_hex().chars().all(|c| c == 'a' || c == 'b'));
+    }
+
+    #[test]
+    fn test_repair_source_as_str() {
+        assert_eq!(
+            WalFecRepairSource::WalRepairSymbols.as_str(),
+            "wal_repair_symbols"
+        );
+        assert_eq!(
+            WalFecRepairSource::SnapshotRepairSymbols.as_str(),
+            "snapshot_repair_symbols"
+        );
+        assert_eq!(
+            WalFecRepairSource::WalAndSnapshotRepairSymbols.as_str(),
+            "wal_and_snapshot_repair_symbols"
+        );
+    }
+
+    #[test]
+    fn test_recovery_log_from_recovered_outcome() {
+        let group_id = WalFecGroupId {
+            wal_salt1: 10,
+            wal_salt2: 20,
+            end_frame_no: 5,
+        };
+        let proof = WalFecDecodeProof {
+            group_id,
+            required_symbols: 3,
+            available_symbols: 4,
+            validated_source_symbols: 2,
+            validated_repair_symbols: 2,
+            corruption_observations: 1,
+            decode_attempted: true,
+            decode_succeeded: true,
+            recovered_frame_nos: vec![3, 4],
+            fallback_reason: None,
+        };
+        let meta = WalFecGroupMeta::from_init(make_test_init(3)).expect("from_init");
+        let outcome = WalFecRecoveryOutcome::Recovered(WalFecRecoveredGroup {
+            meta,
+            recovered_pages: vec![vec![0; 4096]; 3],
+            recovered_frame_nos: vec![3, 4],
+            db_size_pages: 100,
+            decode_proof: proof,
+        });
+        let log = recovery_log_from_outcome(group_id, &outcome, true);
+        assert!(log.outcome_is_recovered);
+        assert!(log.recovery_enabled);
+        assert!(log.fallback_reason.is_none());
+        assert_eq!(log.validated_source_symbols, 2);
+        assert_eq!(log.validated_repair_symbols, 2);
+        assert_eq!(log.recovered_frame_nos, vec![3, 4]);
+        assert!(log.decode_attempted);
+        assert!(log.decode_succeeded);
+    }
+
+    #[test]
+    fn test_recovery_log_from_truncate_outcome() {
+        let group_id = WalFecGroupId {
+            wal_salt1: 10,
+            wal_salt2: 20,
+            end_frame_no: 5,
+        };
+        let proof = WalFecDecodeProof {
+            group_id,
+            required_symbols: 3,
+            available_symbols: 1,
+            validated_source_symbols: 1,
+            validated_repair_symbols: 0,
+            corruption_observations: 2,
+            decode_attempted: false,
+            decode_succeeded: false,
+            recovered_frame_nos: vec![],
+            fallback_reason: Some(WalFecRecoveryFallbackReason::InsufficientSymbols),
+        };
+        let outcome = WalFecRecoveryOutcome::TruncateBeforeGroup {
+            truncate_before_frame_no: 3,
+            decode_proof: proof,
+        };
+        let log = recovery_log_from_outcome(group_id, &outcome, true);
+        assert!(!log.outcome_is_recovered);
+        assert_eq!(
+            log.fallback_reason,
+            Some(WalFecRecoveryFallbackReason::InsufficientSymbols)
+        );
+        assert_eq!(log.available_symbols, 1);
+        assert!(!log.decode_attempted);
+    }
+
+    #[test]
+    fn test_recovery_fallback_reason_codes_all_variants() {
+        let variants = [
+            (
+                WalFecRecoveryFallbackReason::MissingSidecarGroup,
+                "missing_sidecar_group",
+            ),
+            (
+                WalFecRecoveryFallbackReason::SidecarUnreadable,
+                "sidecar_unreadable",
+            ),
+            (
+                WalFecRecoveryFallbackReason::SaltMismatch,
+                "salt_mismatch",
+            ),
+            (
+                WalFecRecoveryFallbackReason::InsufficientSymbols,
+                "insufficient_symbols",
+            ),
+            (
+                WalFecRecoveryFallbackReason::DecodeFailed,
+                "decode_failed",
+            ),
+            (
+                WalFecRecoveryFallbackReason::DecodedPayloadMismatch,
+                "decoded_payload_mismatch",
+            ),
+            (
+                WalFecRecoveryFallbackReason::RecoveryDisabled,
+                "recovery_disabled",
+            ),
+        ];
+        for (variant, expected_code) in variants {
+            assert_eq!(variant.reason_code(), expected_code);
+        }
+    }
+
+    #[test]
+    fn test_meta_from_init_rejects_zero_start_frame() {
+        let mut init = make_test_init(2);
+        init.start_frame_no = 0;
+        init.k_source = 0;
+        assert!(WalFecGroupMeta::from_init(init).is_err());
+    }
+
+    #[test]
+    fn test_meta_from_init_rejects_end_before_start() {
+        let mut init = make_test_init(3);
+        init.start_frame_no = 5;
+        init.end_frame_no = 3;
+        assert!(WalFecGroupMeta::from_init(init).is_err());
+    }
+
+    #[test]
+    fn test_meta_from_init_rejects_zero_r_repair() {
+        let mut init = make_test_init(2);
+        init.r_repair = 0;
+        assert!(WalFecGroupMeta::from_init(init).is_err());
+    }
+
+    #[test]
+    fn test_meta_from_init_rejects_zero_db_size() {
+        let mut init = make_test_init(2);
+        init.db_size_pages = 0;
+        assert!(WalFecGroupMeta::from_init(init).is_err());
+    }
+
+    #[test]
+    fn test_recovery_config_default_enabled() {
+        let config = WalFecRecoveryConfig::default();
+        assert!(config.recovery_enabled);
+    }
+
+    #[test]
+    fn test_repair_pipeline_config_default() {
+        let config = WalFecRepairPipelineConfig::default();
+        assert_eq!(config.queue_capacity, 64);
+        assert_eq!(config.per_symbol_delay, Duration::ZERO);
+    }
 }

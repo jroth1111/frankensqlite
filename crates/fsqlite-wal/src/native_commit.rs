@@ -1273,4 +1273,106 @@ mod tests {
         assert!(matches!(result, CommitResult::Committed { .. }));
         assert_eq!(coord.current_epoch(), 1);
     }
+
+    #[test]
+    fn test_group_commit_batch_accessors() {
+        let batch = GroupCommitBatch::new(4);
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+        assert!(!batch.is_full());
+    }
+
+    #[test]
+    fn test_fsync_barriers_default_equals_new() {
+        let a = FsyncBarriers::new();
+        let b = FsyncBarriers::default();
+        assert_eq!(a.fsync1_complete, b.fsync1_complete);
+        assert_eq!(a.fsync2_complete, b.fsync2_complete);
+        assert!(!a.all_complete());
+    }
+
+    #[test]
+    fn test_commit_index_record_and_conflict_check() {
+        let mut idx = CommitIndex::new();
+        let p1 = PageNumber::new(1).unwrap();
+        let p2 = PageNumber::new(2).unwrap();
+        let p3 = PageNumber::new(3).unwrap();
+
+        idx.record_commit(&[p1, p2], CommitSeq::new(5));
+        idx.record_commit(&[p2, p3], CommitSeq::new(10));
+
+        let conflicts = idx.check_conflicts(&[p1, p2, p3], CommitSeq::new(7));
+        assert!(conflicts.contains(&p2), "p2 modified at seq 10 > 7");
+        assert!(conflicts.contains(&p3), "p3 modified at seq 10 > 7");
+        assert!(!conflicts.contains(&p1), "p1 last modified at seq 5 <= 7");
+
+        assert!(idx.check_conflicts(&[p1, p2], CommitSeq::new(10)).is_empty());
+    }
+
+    #[test]
+    fn commit_result_debug_clone_eq_all_variants() {
+        let committed = CommitResult::Committed {
+            commit_seq: CommitSeq::new(1),
+            commit_time_unix_ns: 42,
+        };
+        let dbg = format!("{committed:?}");
+        assert!(dbg.contains("Committed"));
+        assert_eq!(committed.clone(), committed);
+
+        let fcw = CommitResult::ConflictFcw {
+            conflicting_pages: vec![PageNumber::new(5).unwrap()],
+        };
+        assert_eq!(fcw.clone(), fcw);
+        assert_ne!(fcw, committed);
+
+        let ssi = CommitResult::ConflictSsi;
+        assert_eq!(ssi.clone(), ssi);
+
+        let shutdown = CommitResult::ShuttingDown;
+        assert_eq!(shutdown.clone(), shutdown);
+        assert_ne!(ssi, shutdown);
+    }
+
+    #[test]
+    fn commit_submission_debug_and_clone() {
+        let sub = make_submission(&[1, 2], 5, 7);
+        let dbg = format!("{sub:?}");
+        assert!(dbg.contains("CommitSubmission"));
+        let cloned = sub.clone();
+        assert_eq!(cloned.write_set_pages.len(), 2);
+        assert_eq!(cloned.begin_seq, CommitSeq::new(5));
+        assert_eq!(cloned.capsule_digest, [7u8; 32]);
+    }
+
+    #[test]
+    fn fsync_barriers_debug_clone_copy() {
+        let mut b = FsyncBarriers::new();
+        b.fsync1_complete = true;
+        let dbg = format!("{b:?}");
+        assert!(dbg.contains("FsyncBarriers"));
+        let copied = b;
+        assert_eq!(copied, b);
+        assert!(copied.fsync1_complete);
+        assert!(!copied.fsync2_complete);
+    }
+
+    #[test]
+    fn group_commit_batch_is_full_at_max() {
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 3);
+        let base = 1_000_000_u64;
+        for i in 0..3u8 {
+            let sub = make_submission(&[u32::from(i) + 1], 0, i);
+            coord.submit(sub, base + u64::from(i)).unwrap();
+        }
+        assert!(coord.batch.is_full());
+        assert_eq!(coord.batch.len(), 3);
+    }
+
+    #[test]
+    fn test_commit_index_default_equals_new() {
+        let a = CommitIndex::new();
+        let b = CommitIndex::default();
+        assert!(a.check_conflicts(&[PageNumber::new(1).unwrap()], CommitSeq::ZERO).is_empty());
+        assert!(b.check_conflicts(&[PageNumber::new(1).unwrap()], CommitSeq::ZERO).is_empty());
+    }
 }

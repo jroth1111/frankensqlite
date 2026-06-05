@@ -2967,4 +2967,95 @@ mod tests {
         assert_eq!(v.replayable_frames, 3);
         assert_eq!(v.last_commit_frame, Some(2));
     }
+
+    #[test]
+    fn test_tier_for_algorithm_known_and_unknown() {
+        assert_eq!(tier_for_algorithm("xxh3_128"), Some(HashTier::Integrity));
+        assert_eq!(tier_for_algorithm("xxh3"), Some(HashTier::Integrity));
+        assert_eq!(
+            tier_for_algorithm("blake3_128"),
+            Some(HashTier::ContentAddressing)
+        );
+        assert_eq!(
+            tier_for_algorithm("blake3"),
+            Some(HashTier::ContentAddressing)
+        );
+        assert_eq!(tier_for_algorithm("crc32c"), Some(HashTier::Protocol));
+        assert_eq!(tier_for_algorithm("  XXH3  "), Some(HashTier::Integrity));
+        assert_eq!(
+            tier_for_algorithm("BLAKE3_128"),
+            Some(HashTier::ContentAddressing)
+        );
+        assert_eq!(tier_for_algorithm("sha256"), None);
+        assert_eq!(tier_for_algorithm(""), None);
+    }
+
+    #[test]
+    fn test_checksum_transform_identity_is_noop() {
+        let id = WalChecksumTransform::identity();
+        for seed in [
+            SqliteWalChecksum { s1: 0, s2: 0 },
+            SqliteWalChecksum {
+                s1: 0xDEAD_BEEF,
+                s2: 0xCAFE_BABE,
+            },
+            SqliteWalChecksum {
+                s1: u32::MAX,
+                s2: u32::MAX,
+            },
+        ] {
+            assert_eq!(id.apply(seed), seed, "identity must leave seed unchanged");
+        }
+    }
+
+    #[test]
+    fn test_checksum_transform_then_identity_laws() {
+        let data = vec![0x42_u8; 64];
+        let t = WalChecksumTransform::from_aligned_bytes(&data, false).expect("transform");
+        let id = WalChecksumTransform::identity();
+        let seed = SqliteWalChecksum {
+            s1: 0x1111_2222,
+            s2: 0x3333_4444,
+        };
+        assert_eq!(
+            id.then(t).apply(seed),
+            t.apply(seed),
+            "id.then(t) == t"
+        );
+        assert_eq!(
+            t.then(id).apply(seed),
+            t.apply(seed),
+            "t.then(id) == t"
+        );
+    }
+
+    #[test]
+    fn test_xxh3_checksum128_to_le_bytes_roundtrip() {
+        let data = b"deterministic test payload";
+        let digest = Xxh3Checksum128::compute(data);
+        let le = digest.to_le_bytes();
+        let reconstructed = read_xxh3_from_bytes(&le);
+        assert_eq!(digest, reconstructed);
+    }
+
+    #[test]
+    fn test_crc32c_and_content_address_determinism() {
+        let data = b"hello world";
+        let c1 = crc32c_checksum(data);
+        let c2 = crc32c_checksum(data);
+        assert_eq!(c1, c2, "crc32c must be deterministic");
+        assert_ne!(crc32c_checksum(data), crc32c_checksum(b"hello worlD"));
+
+        let h1 = content_address_hash_128(data);
+        let h2 = content_address_hash_128(data);
+        assert_eq!(h1, h2, "content_address_hash must be deterministic");
+        assert_ne!(
+            content_address_hash_128(data),
+            content_address_hash_128(b"different")
+        );
+
+        let i1 = integrity_hash_xxh3_128(data);
+        let i2 = integrity_hash_xxh3_128(data);
+        assert_eq!(i1, i2, "integrity_hash must be deterministic");
+    }
 }

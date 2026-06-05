@@ -1478,3 +1478,289 @@ fn bd_ncivz_2_abort_cleanup_drops_non_committed_records() {
         "recovery input should only contain committed records"
     );
 }
+
+// -- PerCoreWalBuffer unit-level state machine tests --
+
+#[test]
+fn seal_active_on_already_sealed_returns_error() {
+    let config = BufferConfig {
+        capacity_bytes: 640,
+        ..BufferConfig::default()
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+    buf.seal_active(1).expect("first seal");
+    assert!(buf.seal_active(2).is_err());
+}
+
+#[test]
+fn begin_flush_on_writable_returns_error() {
+    let config = BufferConfig {
+        capacity_bytes: 640,
+        ..BufferConfig::default()
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+    assert!(buf.begin_flush().is_err());
+}
+
+#[test]
+fn complete_flush_on_non_flushing_returns_error() {
+    let config = BufferConfig {
+        capacity_bytes: 640,
+        ..BufferConfig::default()
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+    assert!(buf.complete_flush().is_err());
+}
+
+#[test]
+fn force_serialized_drain_collects_all_lanes() {
+    let config = BufferConfig {
+        capacity_bytes: 640,
+        overflow_policy: OverflowPolicy::AllocateOverflow,
+        overflow_fallback_bytes: 4096,
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+
+    buf.append(make_record(0, 1, 64));
+    buf.seal_active(1).unwrap();
+    buf.begin_flush().unwrap();
+
+    buf.append(make_record(0, 2, 64));
+
+    let drained = buf.force_serialized_drain();
+    assert_eq!(drained.len(), 2);
+    assert_eq!(buf.active_state(), BufferState::Writable);
+    assert_eq!(buf.flush_state(), BufferState::Writable);
+    assert_eq!(buf.active_len(), 0);
+    assert_eq!(buf.flush_len(), 0);
+    assert_eq!(buf.overflow_len(), 0);
+    assert_eq!(buf.fallback_decision(), FallbackDecision::ContinueParallel);
+}
+
+#[test]
+fn overflow_drains_into_active_after_complete_flush() {
+    let config = BufferConfig {
+        capacity_bytes: 160,
+        overflow_policy: OverflowPolicy::AllocateOverflow,
+        overflow_fallback_bytes: 4096,
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+
+    buf.append(make_record(0, 1, 48));
+    assert_eq!(
+        buf.append(make_record(0, 2, 48)),
+        AppendOutcome::QueuedOverflow
+    );
+    assert_eq!(buf.active_len(), 1);
+    assert_eq!(buf.overflow_len(), 1);
+
+    buf.seal_active(1).unwrap();
+    buf.begin_flush().unwrap();
+    buf.complete_flush().unwrap();
+
+    assert!(buf.overflow_len() == 0 || buf.active_len() > 0);
+    assert_eq!(buf.active_state(), BufferState::Writable);
+}
+
+#[test]
+fn append_record_exceeding_capacity_latches_fallback() {
+    let config = BufferConfig {
+        capacity_bytes: 32,
+        ..BufferConfig::default()
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+    let outcome = buf.append(make_record(0, 1, 128));
+    assert_eq!(outcome, AppendOutcome::Blocked);
+    assert_eq!(buf.fallback_decision(), FallbackDecision::ForceSerializedDrain);
+}
+
+#[test]
+fn append_batch_with_oversized_single_record_latches_fallback() {
+    let config = BufferConfig {
+        capacity_bytes: 32,
+        ..BufferConfig::default()
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+    let outcome = buf.append_batch(vec![make_record(0, 1, 128)]);
+    assert_eq!(outcome, AppendOutcome::Blocked);
+    assert_eq!(buf.fallback_decision(), FallbackDecision::ForceSerializedDrain);
+}
+
+#[test]
+fn append_batch_all_fit_returns_appended() {
+    let config = BufferConfig {
+        capacity_bytes: 4096,
+        ..BufferConfig::default()
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+    let records = vec![make_record(0, 1, 32), make_record(0, 2, 32)];
+    assert_eq!(buf.append_batch(records), AppendOutcome::Appended);
+    assert_eq!(buf.active_len(), 2);
+}
+
+#[test]
+fn recovery_order_sorts_by_epoch_then_seq() {
+    let mut r1 = make_record(0, 10, 16);
+    r1.epoch = 2;
+    let mut r2 = make_record(0, 5, 16);
+    r2.epoch = 1;
+    let mut r3 = make_record(0, 7, 16);
+    r3.epoch = 2;
+
+    let ordered = EpochOrderCoordinator::recovery_order(&[r1, r2.clone(), r3]);
+    assert_eq!(ordered[0].epoch, 1);
+    assert_eq!(ordered[0].begin_seq.get(), r2.begin_seq.get());
+    assert!(ordered[1].epoch <= ordered[2].epoch);
+}
+
+#[test]
+fn buffer_config_default_values() {
+    let config = BufferConfig::default();
+    assert_eq!(config.capacity_bytes, DEFAULT_BUFFER_CAPACITY_BYTES);
+    assert_eq!(config.overflow_fallback_bytes, DEFAULT_OVERFLOW_FALLBACK_BYTES);
+    assert_eq!(config.overflow_policy, OverflowPolicy::AllocateOverflow);
+}
+
+#[test]
+fn thread_buffer_slot_stable_within_thread() {
+    let slot1 = thread_buffer_slot(16);
+    let slot2 = thread_buffer_slot(16);
+    assert_eq!(slot1, slot2);
+    assert!(slot1 < 16);
+}
+
+#[test]
+fn pool_invalid_core_id_returns_error() {
+    let pool = PerCoreWalBufferPool::new(2, BufferConfig::default());
+    assert!(pool.append_to_core(2, make_record(0, 1, 16)).is_err());
+    assert!(pool.append_to_core(99, make_record(0, 1, 16)).is_err());
+    assert!(pool.append_to_core(0, make_record(0, 1, 16)).is_ok());
+}
+
+#[test]
+fn pool_core_count_and_contention_start_at_zero() {
+    let pool = PerCoreWalBufferPool::new(4, BufferConfig::default());
+    assert_eq!(pool.core_count(), 4);
+    assert_eq!(pool.contention_events_total(), 0);
+}
+
+#[test]
+fn epoch_config_default_values() {
+    let cfg = EpochConfig::default();
+    assert_eq!(cfg.advance_interval_ms, DEFAULT_EPOCH_ADVANCE_INTERVAL_MS);
+}
+
+#[test]
+fn epoch_flush_batch_total_records() {
+    let batch = EpochFlushBatch {
+        epoch: 1,
+        records: vec![make_record(0, 1, 8), make_record(0, 2, 8)],
+        records_per_core: vec![2],
+    };
+    assert_eq!(batch.total_records(), 2);
+
+    let empty = EpochFlushBatch {
+        epoch: 0,
+        records: Vec::new(),
+        records_per_core: Vec::new(),
+    };
+    assert_eq!(empty.total_records(), 0);
+}
+
+#[test]
+fn wal_record_encoded_len_includes_images() {
+    let r = make_record(0, 1, 100);
+    let len = r.encoded_len();
+    assert!(len >= RECORD_FIXED_OVERHEAD_BYTES + 200);
+    let small = make_record(0, 1, 0);
+    assert!(small.encoded_len() >= RECORD_FIXED_OVERHEAD_BYTES);
+    assert!(small.encoded_len() < len);
+}
+
+#[test]
+fn buffer_state_variant_equality() {
+    assert_eq!(BufferState::Writable, BufferState::Writable);
+    assert_eq!(
+        BufferState::Sealed { epoch: 5 },
+        BufferState::Sealed { epoch: 5 }
+    );
+    assert_ne!(
+        BufferState::Sealed { epoch: 5 },
+        BufferState::Sealed { epoch: 6 }
+    );
+    assert_ne!(
+        BufferState::Sealed { epoch: 1 },
+        BufferState::Flushing { epoch: 1 }
+    );
+    let dbg = format!("{:?}", BufferState::Flushing { epoch: 3 });
+    assert!(dbg.contains("Flushing"));
+}
+
+#[test]
+fn pool_append_batch_to_core_works() {
+    let pool = PerCoreWalBufferPool::new(2, BufferConfig::default());
+    let records = vec![make_record(0, 1, 16), make_record(0, 2, 16)];
+    let outcome = pool.append_batch_to_core(0, records).unwrap();
+    assert_eq!(outcome, AppendOutcome::Appended);
+    assert!(pool.append_batch_to_core(99, vec![make_record(0, 1, 16)]).is_err());
+}
+
+#[test]
+fn overflow_policy_debug_clone_copy_eq() {
+    let a = OverflowPolicy::BlockWriter;
+    let b = OverflowPolicy::AllocateOverflow;
+    assert_ne!(a, b);
+    let copied = a;
+    assert_eq!(copied, a);
+    let dbg = format!("{a:?}");
+    assert!(dbg.contains("BlockWriter"));
+    let dbg_b = format!("{b:?}");
+    assert!(dbg_b.contains("AllocateOverflow"));
+}
+
+#[test]
+fn append_outcome_debug_clone_copy_eq() {
+    let variants = [AppendOutcome::Appended, AppendOutcome::QueuedOverflow, AppendOutcome::Blocked];
+    for v in &variants {
+        let copied = *v;
+        assert_eq!(copied, *v);
+    }
+    let dbg = format!("{:?}", AppendOutcome::QueuedOverflow);
+    assert!(dbg.contains("QueuedOverflow"));
+    assert_ne!(AppendOutcome::Appended, AppendOutcome::Blocked);
+}
+
+#[test]
+fn fallback_decision_debug_clone_copy_eq() {
+    let a = FallbackDecision::ContinueParallel;
+    let b = FallbackDecision::ForceSerializedDrain;
+    assert_ne!(a, b);
+    let copied = a;
+    assert_eq!(copied, a);
+    let dbg = format!("{b:?}");
+    assert!(dbg.contains("ForceSerializedDrain"));
+}
+
+#[test]
+fn wal_record_debug_and_clone() {
+    let r = make_record(0, 5, 32);
+    let dbg = format!("{r:?}");
+    assert!(dbg.contains("WalRecord"));
+    let cloned = r.clone();
+    assert_eq!(cloned.epoch, r.epoch);
+    assert_eq!(cloned.page_id, r.page_id);
+    assert_eq!(cloned.before_image.len(), r.before_image.len());
+    assert_eq!(cloned.after_image, r.after_image);
+}
+
+#[test]
+fn epoch_coordinator_mark_and_query_durable_epoch() {
+    let coord = EpochOrderCoordinator::new(2, BufferConfig::default(), EpochConfig::default());
+    assert_eq!(coord.durable_epoch(), None);
+    coord.mark_epoch_durable(5);
+    assert_eq!(coord.durable_epoch(), Some(5));
+    coord.mark_epoch_durable(3);
+    assert_eq!(coord.durable_epoch(), Some(5), "should keep max");
+    coord.mark_epoch_durable(10);
+    assert_eq!(coord.durable_epoch(), Some(10));
+}

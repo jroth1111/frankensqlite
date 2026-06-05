@@ -896,6 +896,160 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_page_number_legacy_marker_with_embedded_zero() {
+        let marker = LEGACY_CELL_DELTA_FRAME_MARKER | 0;
+        assert_eq!(extract_page_number_from_marker(marker), None);
+    }
+
+    #[test]
+    fn test_extract_page_number_pure_zero_marker() {
+        assert_eq!(extract_page_number_from_marker(0), None);
+    }
+
+    #[test]
+    fn test_extract_page_number_non_legacy_nonzero() {
+        assert_eq!(extract_page_number_from_marker(42), None);
+        assert_eq!(extract_page_number_from_marker(0x7FFF_FFFF), None);
+    }
+
+    #[test]
+    fn test_deserialize_rejects_page_number_zero() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(100),
+            test_txn_id(42),
+            vec![1, 2, 3],
+        );
+        let mut serialized = frame.serialize().unwrap();
+        serialized[4..8].copy_from_slice(&0u32.to_be_bytes());
+        let checksum_offset = serialized.len() - CELL_DELTA_CHECKSUM_SIZE;
+        let checksum = crc32c::crc32c(&serialized[..checksum_offset]);
+        serialized[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+
+        let result = CellDeltaWalFrame::deserialize(&serialized);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid page number 0"));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_invalid_op_byte() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(100),
+            test_txn_id(42),
+            vec![1, 2, 3],
+        );
+        let mut serialized = frame.serialize().unwrap();
+        serialized[24] = 0;
+        let checksum_offset = serialized.len() - CELL_DELTA_CHECKSUM_SIZE;
+        let checksum = crc32c::crc32c(&serialized[..checksum_offset]);
+        serialized[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+
+        let result = CellDeltaWalFrame::deserialize(&serialized);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid op byte"));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_txn_id_zero() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(100),
+            test_txn_id(42),
+            vec![1, 2, 3],
+        );
+        let mut serialized = frame.serialize().unwrap();
+        serialized[33..41].copy_from_slice(&0u64.to_be_bytes());
+        let checksum_offset = serialized.len() - CELL_DELTA_CHECKSUM_SIZE;
+        let checksum = crc32c::crc32c(&serialized[..checksum_offset]);
+        serialized[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+
+        let result = CellDeltaWalFrame::deserialize(&serialized);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid txn_id"));
+    }
+
+    #[test]
+    fn test_is_cell_delta_frame_rejects_bad_op_in_valid_envelope() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(100),
+            test_txn_id(42),
+            vec![1, 2, 3],
+        );
+        let mut serialized = frame.serialize().unwrap();
+        serialized[24] = 4;
+        let checksum_offset = serialized.len() - CELL_DELTA_CHECKSUM_SIZE;
+        let checksum = crc32c::crc32c(&serialized[..checksum_offset]);
+        serialized[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+
+        assert!(!is_cell_delta_frame(&serialized));
+    }
+
+    #[test]
+    fn test_is_cell_delta_frame_rejects_page_zero_in_envelope() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(100),
+            test_txn_id(42),
+            vec![1, 2, 3],
+        );
+        let mut serialized = frame.serialize().unwrap();
+        serialized[4..8].copy_from_slice(&0u32.to_be_bytes());
+        let checksum_offset = serialized.len() - CELL_DELTA_CHECKSUM_SIZE;
+        let checksum = crc32c::crc32c(&serialized[..checksum_offset]);
+        serialized[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+
+        assert!(!is_cell_delta_frame(&serialized));
+    }
+
+    #[test]
+    fn test_constant_values() {
+        assert_eq!(CELL_DELTA_FRAME_MARKER, 0);
+        assert_eq!(CELL_DELTA_HEADER_SIZE, 45);
+        assert_eq!(CELL_DELTA_CHECKSUM_SIZE, 4);
+        assert_eq!(CELL_DELTA_MIN_FRAME_SIZE, 49);
+        assert_eq!(CELL_DELTA_MAX_DATA_SIZE, 65536);
+    }
+
+    #[test]
+    fn test_recovery_summary_default_all_zero() {
+        let summary = WalRecoverySummary::default();
+        assert_eq!(summary.full_page_frames, 0);
+        assert_eq!(summary.cell_delta_frames, 0);
+        assert_eq!(summary.cell_delta_uncommitted, 0);
+        assert_eq!(summary.checksum_errors, 0);
+        assert_eq!(summary.cell_data_bytes, 0);
+    }
+
+    #[test]
+    fn test_uncommitted_frame_round_trip() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(0),
+            test_txn_id(7),
+            vec![0xDE, 0xAD],
+        );
+
+        let serialized = frame.serialize().unwrap();
+        let deserialized = CellDeltaWalFrame::deserialize(&serialized).unwrap();
+        assert_eq!(deserialized.commit_seq.get(), 0);
+        assert_eq!(frame, deserialized);
+    }
+
+    #[test]
     fn test_deserialize_rejects_legacy_marker_word() {
         let frame = CellDeltaWalFrame::new(
             test_page_number(),
@@ -918,5 +1072,70 @@ mod tests {
                 .to_string()
                 .contains("invalid marker word")
         );
+    }
+
+    #[test]
+    fn test_serialized_size_empty_delete_frame() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Delete,
+            CommitSeq::new(1),
+            test_txn_id(1),
+            vec![],
+        );
+        assert_eq!(frame.serialized_size(), CELL_DELTA_MIN_FRAME_SIZE);
+        assert_eq!(frame.serialize().unwrap().len(), CELL_DELTA_MIN_FRAME_SIZE);
+    }
+
+    #[test]
+    fn test_cell_delta_wal_frame_clone_preserves_equality() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Update,
+            CommitSeq::new(77),
+            test_txn_id(33),
+            vec![0xAA; 200],
+        );
+        let cloned = frame.clone();
+        assert_eq!(frame, cloned);
+        assert_eq!(cloned.cell_data.len(), 200);
+
+        let dbg = format!("{frame:?}");
+        assert!(dbg.contains("CellDeltaWalFrame"));
+    }
+
+    #[test]
+    fn test_is_cell_delta_frame_rejects_corrupted_checksum() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(100),
+            test_txn_id(42),
+            vec![1, 2, 3],
+        );
+        let mut serialized = frame.serialize().unwrap();
+        let last = serialized.len() - 1;
+        serialized[last] ^= 0xFF;
+        assert!(!is_cell_delta_frame(&serialized));
+    }
+
+    #[test]
+    fn test_serialize_exact_max_data_size_succeeds() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(1),
+            test_txn_id(1),
+            vec![0u8; CELL_DELTA_MAX_DATA_SIZE],
+        );
+        let serialized = frame.serialize().unwrap();
+        let expected = CELL_DELTA_HEADER_SIZE + CELL_DELTA_MAX_DATA_SIZE + CELL_DELTA_CHECKSUM_SIZE;
+        assert_eq!(serialized.len(), expected);
+        let deserialized = CellDeltaWalFrame::deserialize(&serialized).unwrap();
+        assert_eq!(deserialized.cell_data.len(), CELL_DELTA_MAX_DATA_SIZE);
     }
 }

@@ -4052,4 +4052,87 @@ mod tests {
         assert_eq!(wal2.header().salts, new_salts);
         wal2.close(&cx).expect("close");
     }
+
+    #[test]
+    fn test_truncated_file_mid_second_txn_recovers_first_commit() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        // Txn 1: commit at frame 2.
+        wal.append_frame(&cx, 1, &sample_page(0x11), 0)
+            .expect("append");
+        wal.append_frame(&cx, 2, &sample_page(0x22), 2)
+            .expect("commit txn1");
+
+        // Txn 2: partial — one full frame + start of another.
+        wal.append_frame(&cx, 3, &sample_page(0x33), 0)
+            .expect("append");
+        wal.append_frame(&cx, 4, &sample_page(0x44), 0)
+            .expect("append");
+        assert_eq!(wal.frame_count(), 4);
+        let frame_size = wal.frame_size();
+        wal.close(&cx).expect("close");
+
+        // Truncate: remove the last frame entirely and half of frame 3.
+        let truncate_offset =
+            u64::try_from(WAL_HEADER_SIZE + frame_size * 2 + frame_size / 2).unwrap();
+        let mut f = open_wal_file(&vfs, &cx);
+        f.truncate(&cx, truncate_offset).expect("truncate");
+        drop(f);
+
+        let file2 = open_wal_file(&vfs, &cx);
+        let wal2 = WalFile::open(&cx, file2).expect("reopen after truncation");
+        assert_eq!(
+            wal2.frame_count(),
+            2,
+            "only first committed transaction (2 frames) should survive truncation"
+        );
+        let h = wal2.read_frame_header(&cx, 1).expect("read frame 2 header");
+        assert!(h.is_commit(), "frame 2 must be a commit frame");
+        wal2.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn test_recovery_is_idempotent_across_multiple_reopens() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        // Two committed transactions.
+        wal.append_frame(&cx, 1, &sample_page(0xAA), 0)
+            .expect("append");
+        wal.append_frame(&cx, 2, &sample_page(0xBB), 2)
+            .expect("commit txn1");
+        wal.append_frame(&cx, 3, &sample_page(0xCC), 0)
+            .expect("append");
+        wal.append_frame(&cx, 4, &sample_page(0xDD), 4)
+            .expect("commit txn2");
+        // One uncommitted frame.
+        wal.append_frame(&cx, 5, &sample_page(0xEE), 0)
+            .expect("append");
+        wal.close(&cx).expect("close");
+
+        // Reopen three times — frame count must be stable.
+        for reopen in 0..3_u32 {
+            let f = open_wal_file(&vfs, &cx);
+            let wal_reopened = WalFile::open(&cx, f).expect("reopen");
+            assert_eq!(
+                wal_reopened.frame_count(),
+                4,
+                "reopen {reopen}: committed frame count must be 4"
+            );
+            let (_, data) = wal_reopened.read_frame(&cx, 3).expect("read frame 4");
+            assert_eq!(
+                data,
+                sample_page(0xDD),
+                "reopen {reopen}: frame 4 content must be intact"
+            );
+            wal_reopened.close(&cx).expect("close");
+        }
+    }
 }

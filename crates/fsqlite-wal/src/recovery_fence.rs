@@ -899,4 +899,230 @@ mod tests {
             "barrier must surface unrecoverable error on mismatch",
         );
     }
+
+    // -- PidOwnedLockRegistry unit tests --
+
+    #[test]
+    fn registry_new_is_empty() {
+        let reg = PidOwnedLockRegistry::new();
+        assert!(reg.is_empty());
+        assert_eq!(reg.len(), 0);
+        assert!(reg.snapshot().is_empty());
+    }
+
+    #[test]
+    fn registry_register_and_snapshot() {
+        let reg = PidOwnedLockRegistry::new();
+        let page = PageNumber::new(5).unwrap();
+        let seq = reg.register(page, 100);
+        assert!(seq > 0);
+        assert_eq!(reg.len(), 1);
+        assert!(!reg.is_empty());
+        let snap = reg.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].page, page);
+        assert_eq!(snap[0].pid, 100);
+        assert_eq!(snap[0].sequence, seq);
+    }
+
+    #[test]
+    fn registry_register_idempotent_same_page_pid() {
+        let reg = PidOwnedLockRegistry::new();
+        let page = PageNumber::new(3).unwrap();
+        let seq1 = reg.register(page, 42);
+        let seq2 = reg.register(page, 42);
+        assert_eq!(seq1, seq2);
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn registry_register_same_page_different_pid() {
+        let reg = PidOwnedLockRegistry::new();
+        let page = PageNumber::new(7).unwrap();
+        let seq1 = reg.register(page, 10);
+        let seq2 = reg.register(page, 20);
+        assert_ne!(seq1, seq2);
+        assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn registry_deregister_returns_false_for_absent() {
+        let reg = PidOwnedLockRegistry::new();
+        let page = PageNumber::new(1).unwrap();
+        assert!(!reg.deregister(page, 999));
+    }
+
+    #[test]
+    fn registry_deregister_only_matching_pair() {
+        let reg = PidOwnedLockRegistry::new();
+        let p1 = PageNumber::new(1).unwrap();
+        let p2 = PageNumber::new(2).unwrap();
+        reg.register(p1, 10);
+        reg.register(p2, 10);
+        assert_eq!(reg.len(), 2);
+        assert!(reg.deregister(p1, 10));
+        assert_eq!(reg.len(), 1);
+        assert!(!reg.deregister(p1, 10));
+        let snap = reg.snapshot();
+        assert_eq!(snap[0].page, p2);
+    }
+
+    #[test]
+    fn registry_release_dead_pid_keeps_alive() {
+        let reg = PidOwnedLockRegistry::new();
+        let page = PageNumber::new(1).unwrap();
+        reg.register(page, 100);
+        reg.register(page, 200);
+        let released = reg.release_dead_pid_locks(|pid| pid == 100);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].pid, 200);
+        assert_eq!(reg.len(), 1);
+        let snap = reg.snapshot();
+        assert_eq!(snap[0].pid, 100);
+    }
+
+    #[test]
+    fn registry_release_dead_pid_releases_all_dead() {
+        let reg = PidOwnedLockRegistry::new();
+        reg.register(PageNumber::new(1).unwrap(), 10);
+        reg.register(PageNumber::new(2).unwrap(), 20);
+        reg.register(PageNumber::new(3).unwrap(), 30);
+        let released = reg.release_dead_pid_locks(|_| false);
+        assert_eq!(released.len(), 3);
+        assert!(reg.is_empty());
+    }
+
+    // -- RecoveryFence edge tests --
+
+    #[test]
+    fn fence_initial_state_not_recovering() {
+        let fence = RecoveryFence::default();
+        assert!(!fence.is_recovery_in_progress());
+        assert_eq!(fence.generation(), 0);
+    }
+
+    #[test]
+    fn fence_guard_marks_recovery_in_progress() {
+        let fence = RecoveryFence::default();
+        let guard = fence.try_acquire_for_recovery().expect("uncontended");
+        assert!(fence.is_recovery_in_progress());
+        assert_eq!(guard.fence().generation(), 0);
+        drop(guard);
+        assert!(!fence.is_recovery_in_progress());
+        assert_eq!(fence.generation(), 1);
+    }
+
+    #[test]
+    fn fence_concurrent_acquire_returns_none() {
+        let fence = RecoveryFence::default();
+        let _guard = fence.try_acquire_for_recovery().expect("first acquire");
+        assert!(fence.try_acquire_for_recovery().is_none());
+    }
+
+    // -- verify_checkpoint_checksum_prefix edge: empty expected --
+
+    #[test]
+    fn verify_checkpoint_empty_expected_returns_match() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_db_file(&vfs, &cx);
+        let verdict =
+            verify_checkpoint_checksum_prefix(&cx, &file, 4096, &[]).expect("verify");
+        assert_eq!(verdict, CheckpointChecksumVerdict::Match);
+    }
+
+    #[test]
+    fn pid_alive_os_zero_is_dead() {
+        assert!(!pid_alive_os(0));
+    }
+
+    #[test]
+    fn fence_new_matches_default() {
+        let a = RecoveryFence::new();
+        let b = RecoveryFence::default();
+        assert_eq!(a.is_recovery_in_progress(), b.is_recovery_in_progress());
+        assert_eq!(a.generation(), b.generation());
+    }
+
+    #[test]
+    fn fence_generation_increments_across_cycles() {
+        let fence = RecoveryFence::new();
+        for expected in 1..=3u64 {
+            let guard = fence.try_acquire_for_recovery().unwrap();
+            drop(guard);
+            assert_eq!(fence.generation(), expected);
+        }
+    }
+
+    #[test]
+    fn fence_acquire_with_budget_returns_busy_when_held() {
+        let fence = RecoveryFence::new();
+        let _guard = fence.try_acquire_for_recovery().unwrap();
+        let result = fence.acquire_for_recovery_with(0, Duration::from_millis(1));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn checkpoint_checksum_verdict_equality() {
+        let m1 = CheckpointChecksumVerdict::Match;
+        let m2 = CheckpointChecksumVerdict::Match;
+        assert_eq!(m1, m2);
+
+        let page = PageNumber::new(5).unwrap();
+        let mm = CheckpointChecksumVerdict::Mismatch {
+            first_bad_page: page,
+        };
+        assert_ne!(m1, mm);
+    }
+
+    #[test]
+    fn pid_lock_entry_copy_clone_eq_debug() {
+        let entry = PidOwnedLockEntry {
+            page: PageNumber::new(10).unwrap(),
+            pid: 1234,
+            sequence: 77,
+        };
+        let copied = entry;
+        assert_eq!(entry, copied);
+        let cloned = entry.clone();
+        assert_eq!(entry, cloned);
+        let dbg = format!("{entry:?}");
+        assert!(dbg.contains("PidOwnedLockEntry"));
+        assert!(dbg.contains("1234"));
+    }
+
+    #[test]
+    fn recovery_fence_constants_match_documented_values() {
+        assert_eq!(RECOVERY_FENCE_BACKOFF, Duration::from_millis(100));
+        assert_eq!(RECOVERY_FENCE_MAX_RETRIES, 10);
+        assert_eq!(RECOVERY_FENCE_SPIN_ATTEMPTS, 4096);
+    }
+
+    #[test]
+    fn checkpoint_checksum_verdict_clone_and_debug() {
+        let m = CheckpointChecksumVerdict::Match;
+        let mc = m.clone();
+        assert_eq!(m, mc);
+
+        let page = PageNumber::new(3).unwrap();
+        let mm = CheckpointChecksumVerdict::Mismatch {
+            first_bad_page: page,
+        };
+        let mmc = mm.clone();
+        assert_eq!(mm, mmc);
+
+        let dbg_match = format!("{m:?}");
+        assert!(dbg_match.contains("Match"));
+        let dbg_mismatch = format!("{mm:?}");
+        assert!(dbg_mismatch.contains("Mismatch"));
+    }
+
+    #[test]
+    fn pid_alive_os_nonexistent_high_pid() {
+        #[cfg(unix)]
+        {
+            let high_pid = 4_000_000_000;
+            assert!(!pid_alive_os(high_pid));
+        }
+    }
 }
