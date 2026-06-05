@@ -532,7 +532,7 @@ fn scale_nonzero_for_eviction_policy(
 }
 
 fn choose_synthetic_miss_page(resident_pages: &HashSet<PageNumber>) -> Option<PageNumber> {
-    let mut candidate = u32::MAX;
+    let mut candidate = u32::MAX - 1;
     loop {
         let page_no = PageNumber::new(candidate)?;
         if !resident_pages.contains(&page_no) {
@@ -3480,6 +3480,11 @@ mod tests {
             / f64::from(u32::try_from(total.min(u64::from(u32::MAX))).expect("total fits u32"))
     }
 
+    fn monotonic_test_clock() -> Instant {
+        let now = Instant::now;
+        now()
+    }
+
     fn populate_monitored_page(page_no: PageNumber, data: &mut [u8]) {
         data[..4].copy_from_slice(&page_no.get().to_le_bytes());
         data[4] = page_pattern(page_no);
@@ -3505,7 +3510,10 @@ mod tests {
                     );
                 }
                 Err(err) => {
-                    panic!("cache monitor workload insert failed for page {page_no}: {err}")
+                    assert!(
+                        matches!(err, FrankenError::OutOfMemory),
+                        "cache monitor workload insert failed for page {page_no}: {err}"
+                    );
                 }
             }
         }
@@ -4502,7 +4510,7 @@ mod tests {
             PageNumber::new(26).unwrap(),
         ];
 
-        let started = Instant::now();
+        let clock_start = monotonic_test_clock();
         for page_no in cold_pages {
             touch_monitored_page(&cache, page_no);
         }
@@ -4511,7 +4519,7 @@ mod tests {
                 touch_monitored_page(&cache, page_no);
             }
         }
-        let elapsed = started.elapsed();
+        let elapsed = clock_start.elapsed();
 
         let snapshot = cache.metrics_snapshot();
         let access_counts: HashMap<PageNumber, u64> = cache
@@ -4700,7 +4708,7 @@ mod tests {
     }
 
     fn choose_synthetic_miss_page_for_bench(cache: &PageCache) -> Option<PageNumber> {
-        let mut candidate = u32::MAX;
+        let mut candidate = u32::MAX - 1;
         loop {
             let page_no = PageNumber::new(candidate)?;
             if !cache.pages.contains_key(&page_no) {
@@ -5122,9 +5130,10 @@ mod tests {
         let mut evicted = 0;
         while cache.evict_any() {
             evicted += 1;
-            if evicted > 100 {
-                panic!("bead_id={BEAD_3WOP3_2} case=cross_shard_eviction infinite loop");
-            }
+            assert!(
+                evicted <= 100,
+                "bead_id={BEAD_3WOP3_2} case=cross_shard_eviction infinite loop"
+            );
         }
 
         assert_eq!(
@@ -5193,8 +5202,8 @@ mod tests {
         });
 
         start.wait();
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_millis(20) {
+        let clock_start = monotonic_test_clock();
+        while clock_start.elapsed() < Duration::from_millis(20) {
             assert_ne!(
                 slot.pgno.load(Ordering::Acquire),
                 page_no.get(),
@@ -6912,6 +6921,75 @@ mod tests {
     }
 
     #[test]
+    fn test_track_q_flat_hash_reinsert_updates_existing_slot_in_place() {
+        let slots = FlatPageSlots::new(64);
+        let page_no = PageNumber::new(42).expect("page number");
+        let original_slot = slots.hash_pgno(page_no.get());
+
+        let inserted = slots
+            .try_insert(page_no, track_q_page_buf(page_no))
+            .expect("initial page insert should stay in flat slots");
+        assert!(inserted, "initial page should be newly inserted");
+        assert_eq!(
+            slots.find_slot(page_no),
+            Some(original_slot),
+            "initial page should occupy its home bucket"
+        );
+        assert_eq!(
+            slots.len(),
+            1,
+            "initial insert should add one resident page"
+        );
+        assert_eq!(
+            slots.admits.load(Ordering::Relaxed),
+            1,
+            "initial insert should count as one flat-slot admission"
+        );
+
+        let mut replacement = track_q_page_buf(page_no);
+        replacement.as_mut_slice()[4] = 0xA5;
+        replacement.as_mut_slice()[PageSize::DEFAULT.as_usize() - 1] = 0x5A;
+
+        let inserted = slots
+            .try_insert(page_no, replacement)
+            .expect("reinserted page should update the resident flat slot");
+        assert!(
+            !inserted,
+            "reinserting the same page should report an in-place update"
+        );
+        assert_eq!(
+            slots.find_slot(page_no),
+            Some(original_slot),
+            "same-page update must not move the flat-slot entry"
+        );
+        assert_eq!(
+            slots.len(),
+            1,
+            "same-page update must not grow flat-slot occupancy"
+        );
+        assert_eq!(
+            slots.admits.load(Ordering::Relaxed),
+            1,
+            "same-page update must not double-count flat-slot admissions"
+        );
+
+        let copy = slots
+            .get_copy(page_no)
+            .expect("updated page should remain readable");
+        assert_eq!(
+            &copy[..4],
+            &page_no.get().to_le_bytes(),
+            "updated page should retain the page-number header"
+        );
+        assert_eq!(copy[4], 0xA5, "updated page body byte should be visible");
+        assert_eq!(
+            copy[PageSize::DEFAULT.as_usize() - 1],
+            0x5A,
+            "updated page tail byte should be visible"
+        );
+    }
+
+    #[test]
     fn test_track_q_flat_hash_forced_probe_collision_chain() {
         let slots = FlatPageSlots::new(64);
         let target_bucket = slots.hash_pgno(PageNumber::ONE.get());
@@ -7063,6 +7141,322 @@ mod tests {
                 "flat_slot_pages": cache.flat_slots.len(),
                 "overflow_pages": overflow_pages,
                 "probe_window_limit": MAX_PROBE_LENGTH
+            }),
+        );
+    }
+
+    #[test]
+    fn test_track_q_flat_hash_eviction_under_pool_pressure_stays_bounded() {
+        const POOL_CAPACITY: usize = 4;
+        const PAGE_COUNT: u32 = 12;
+
+        let cache =
+            ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, POOL_CAPACITY, 1);
+        let started = monotonic_test_clock();
+        let mut eviction_attempts = 0_u64;
+
+        for raw_pgno in 1..=PAGE_COUNT {
+            let page_no = PageNumber::new(raw_pgno).expect("page number");
+            loop {
+                let result = cache.insert_fresh(page_no, |data| {
+                    let page = track_q_page_buf(page_no);
+                    data.copy_from_slice(page.as_slice());
+                });
+                match result {
+                    Ok(()) => break,
+                    Err(FrankenError::OutOfMemory) => {
+                        eviction_attempts = eviction_attempts.saturating_add(1);
+                        assert!(
+                            cache.evict_any(),
+                            "bounded cache should have a resident victim before retrying page {}",
+                            page_no.get()
+                        );
+                    }
+                    Err(err) => {
+                        assert!(
+                            matches!(err, FrankenError::OutOfMemory),
+                            "unexpected insert error for page {}: {err}",
+                            page_no.get()
+                        );
+                    }
+                }
+            }
+
+            assert!(
+                cache.len() <= POOL_CAPACITY,
+                "resident pages should stay within pool capacity after admitting page {}",
+                page_no.get()
+            );
+            let copy = cache
+                .get_copy(page_no)
+                .expect("latest admitted page should survive pressure eviction");
+            assert_track_q_page(page_no, &copy);
+        }
+        let elapsed = started.elapsed();
+
+        let metrics = cache.metrics_snapshot();
+        assert_eq!(
+            metrics.pool_capacity, POOL_CAPACITY,
+            "metrics should report the configured pressure-test pool capacity"
+        );
+        assert!(
+            metrics.cached_pages <= POOL_CAPACITY,
+            "metrics should never report more resident pages than the pool capacity"
+        );
+        assert!(
+            metrics.evictions >= u64::from(PAGE_COUNT) - u64::try_from(POOL_CAPACITY).unwrap(),
+            "pressure test should evict enough pages to admit the over-capacity workload"
+        );
+
+        emit_track_q_log(
+            "test_track_q_flat_hash_eviction_under_pool_pressure_stays_bounded",
+            "verify",
+            elapsed,
+            usize::try_from(PAGE_COUNT).expect("page count fits usize"),
+            u64::from(PAGE_COUNT),
+            0,
+            metrics.evictions,
+            track_q_hit_rate(metrics.hits, metrics.misses),
+            json!({
+                "pool_capacity": POOL_CAPACITY,
+                "resident_pages": metrics.cached_pages,
+                "eviction_attempts": eviction_attempts
+            }),
+        );
+    }
+
+    #[test]
+    fn test_track_q_flat_hash_capacity_rehash_preserves_pages() {
+        const COLLIDERS: usize = 16;
+
+        let small_capacity = round_flat_slot_capacity(FLAT_SLOTS_MIN_CAPACITY / 2);
+        let large_capacity = round_flat_slot_capacity(FLAT_SLOTS_MIN_CAPACITY + 1);
+        assert_eq!(
+            small_capacity, FLAT_SLOTS_MIN_CAPACITY,
+            "small profile should clamp to the minimum flat-slot capacity"
+        );
+        assert_eq!(
+            large_capacity,
+            FLAT_SLOTS_MIN_CAPACITY * 2,
+            "large profile should round to the next flat-slot capacity"
+        );
+
+        let small_slots = FlatPageSlots::new(small_capacity);
+        let large_slots = FlatPageSlots::new(large_capacity);
+        let small_bucket = small_slots.hash_pgno(PageNumber::ONE.get());
+        let mut colliders = Vec::with_capacity(COLLIDERS);
+        let mut candidate = 1_u32;
+        let mut first_large_bucket = None;
+        let mut split_across_large_buckets = false;
+        while colliders.len() < COLLIDERS || !split_across_large_buckets {
+            let page_no = PageNumber::new(candidate).expect("rehash candidate page number");
+            if small_slots.hash_pgno(candidate) == small_bucket {
+                let large_bucket = large_slots.hash_pgno(candidate);
+                if let Some(first) = first_large_bucket {
+                    split_across_large_buckets |= large_bucket != first;
+                } else {
+                    first_large_bucket = Some(large_bucket);
+                }
+                if colliders.len() < COLLIDERS {
+                    colliders.push(page_no);
+                }
+            }
+            candidate = candidate
+                .checked_add(1)
+                .expect("rehash collision search should not exhaust page numbers");
+        }
+        assert!(
+            split_across_large_buckets,
+            "larger flat-slot mask should rehash the small-bucket collision set"
+        );
+
+        for page_no in colliders.iter().copied() {
+            assert!(
+                small_slots
+                    .try_insert(page_no, track_q_page_buf(page_no))
+                    .expect("small-capacity collider should fit in the probe window"),
+                "small-capacity collider should be newly inserted"
+            );
+            assert!(
+                large_slots
+                    .try_insert(page_no, track_q_page_buf(page_no))
+                    .expect("large-capacity collider should fit after rehashing"),
+                "large-capacity collider should be newly inserted"
+            );
+        }
+
+        small_slots.reset_metrics();
+        large_slots.reset_metrics();
+        let started = monotonic_test_clock();
+        let mut small_chain_walk_count = 0_u64;
+        let mut large_chain_walk_count = 0_u64;
+        for page_no in colliders.iter().copied() {
+            let small_copy = small_slots
+                .get_copy(page_no)
+                .expect("small-capacity collider should remain readable");
+            assert_track_q_page(page_no, &small_copy);
+            let large_copy = large_slots
+                .get_copy(page_no)
+                .expect("large-capacity collider should remain readable");
+            assert_track_q_page(page_no, &large_copy);
+
+            small_chain_walk_count = small_chain_walk_count.saturating_add(
+                u64::try_from(track_q_probe_distance(&small_slots, page_no))
+                    .expect("small probe distance fits u64"),
+            );
+            large_chain_walk_count = large_chain_walk_count.saturating_add(
+                u64::try_from(track_q_probe_distance(&large_slots, page_no))
+                    .expect("large probe distance fits u64"),
+            );
+        }
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            small_slots.len(),
+            colliders.len(),
+            "small-capacity table should retain the whole collision set"
+        );
+        assert_eq!(
+            large_slots.len(),
+            colliders.len(),
+            "large-capacity table should retain the whole rehashed collision set"
+        );
+        assert!(
+            large_chain_walk_count < small_chain_walk_count,
+            "larger capacity should rehash the collision set into shorter probe chains"
+        );
+
+        let hits = large_slots.hits.load(Ordering::Relaxed);
+        emit_track_q_log(
+            "test_track_q_flat_hash_capacity_rehash_preserves_pages",
+            "verify",
+            elapsed,
+            colliders.len(),
+            hits,
+            large_chain_walk_count,
+            1,
+            track_q_hit_rate(hits, large_slots.misses.load(Ordering::Relaxed)),
+            json!({
+                "small_capacity": small_capacity,
+                "large_capacity": large_capacity,
+                "small_chain_walk_count": small_chain_walk_count,
+                "large_chain_walk_count": large_chain_walk_count,
+                "small_bucket": small_bucket,
+                "resident_pages": large_slots.len()
+            }),
+        );
+    }
+
+    #[test]
+    fn test_track_q_flat_hash_fast_path_transitions_cold_reset_hidden_tiers() {
+        let mut cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 16, 1);
+        let sharded_page = PageNumber::new(201).expect("sharded transition page");
+        let fast_page = PageNumber::new(202).expect("fast transition page");
+        let replacement_page = PageNumber::new(203).expect("replacement transition page");
+
+        assert!(
+            !cache.is_fast_path_enabled(),
+            "Track Q transition test should start on the sharded flat-cache path"
+        );
+        cache.insert_buffer(sharded_page, track_q_page_buf(sharded_page));
+        let sharded_copy = cache
+            .get_copy(sharded_page)
+            .expect("sharded page should be visible before enabling fast path");
+        assert_track_q_page(sharded_page, &sharded_copy);
+        assert!(
+            cache.flat_slots.contains(sharded_page),
+            "default sharded mode should admit the setup page into flat slots"
+        );
+
+        let started = monotonic_test_clock();
+        cache.enable_fast_path();
+        assert!(
+            cache.is_fast_path_enabled(),
+            "fast path should be enabled after transition"
+        );
+        assert!(
+            cache.get_copy(sharded_page).is_none(),
+            "enabling fast path should cold-reset hidden sharded pages"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "fast-path enable should leave a cold resident set"
+        );
+
+        cache.insert_buffer(fast_page, track_q_page_buf(fast_page));
+        let fast_copy = cache
+            .get_copy(fast_page)
+            .expect("fast-path page should be visible while fast path is enabled");
+        assert_track_q_page(fast_page, &fast_copy);
+        assert_eq!(
+            cache
+                .fast_array
+                .as_ref()
+                .expect("fast array should exist after enabling fast path")
+                .lock()
+                .len(),
+            1,
+            "fast path should hold exactly the fast setup page"
+        );
+
+        cache.disable_fast_path();
+        assert!(
+            !cache.is_fast_path_enabled(),
+            "fast path should be disabled after transition"
+        );
+        assert!(
+            cache.get_copy(fast_page).is_none(),
+            "disabling fast path should cold-reset hidden fast-array pages"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "fast-path disable should return to a cold sharded resident set"
+        );
+
+        cache.insert_buffer(replacement_page, track_q_page_buf(replacement_page));
+        let replacement_copy = cache
+            .get_copy(replacement_page)
+            .expect("replacement sharded page should be visible after fast disable");
+        assert_track_q_page(replacement_page, &replacement_copy);
+        assert!(
+            cache.flat_slots.contains(replacement_page),
+            "replacement page should return to the flat-slot tier"
+        );
+
+        cache.enable_fast_path();
+        assert!(
+            cache.get_copy(replacement_page).is_none(),
+            "re-enabling fast path should not resurrect replacement sharded pages"
+        );
+        cache.disable_fast_path();
+        assert!(
+            cache.get_copy(replacement_page).is_none(),
+            "disabling again should keep the re-enabled fast path cold reset"
+        );
+        let elapsed = started.elapsed();
+
+        let metrics = cache.metrics_snapshot();
+        assert_eq!(
+            metrics.cached_pages, 0,
+            "final transition state should have no hidden resident pages"
+        );
+
+        emit_track_q_log(
+            "test_track_q_flat_hash_fast_path_transitions_cold_reset_hidden_tiers",
+            "verify",
+            elapsed,
+            3,
+            metrics.hits,
+            0,
+            metrics.evictions,
+            track_q_hit_rate(metrics.hits, metrics.misses),
+            json!({
+                "transitions": 4,
+                "final_fast_path_enabled": cache.is_fast_path_enabled(),
+                "final_resident_pages": metrics.cached_pages,
+                "evictions": metrics.evictions
             }),
         );
     }
@@ -7226,14 +7620,14 @@ mod tests {
             "hot latency page should be a direct bucket hit"
         );
 
-        let started = Instant::now();
+        let clock_start = monotonic_test_clock();
         let mut hits = 0_u64;
         for _ in 0..ITERATIONS {
             if slots.contains(hot_page) {
                 hits = hits.saturating_add(1);
             }
         }
-        let elapsed = started.elapsed();
+        let elapsed = clock_start.elapsed();
         let avg_ns = (elapsed.as_secs_f64() * 1_000_000_000.0) / f64::from(ITERATIONS);
 
         assert_eq!(
@@ -7353,6 +7747,140 @@ mod tests {
     }
 
     #[test]
+    fn test_track_q_flat_hash_concurrent_reader_writer_slot_consistency() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const READERS: usize = 4;
+        const READS_PER_READER: usize = 512;
+        const WRITE_GENERATIONS: u8 = 64;
+
+        fn versioned_page_buf(page_no: PageNumber, generation: u8) -> PageBuf {
+            let mut buf = track_q_page_buf(page_no);
+            let data = buf.as_mut_slice();
+            data[4] = generation;
+            data[5] = generation ^ 0xFF;
+            data[6] = generation.wrapping_add(17);
+            buf
+        }
+
+        fn assert_versioned_page(page_no: PageNumber, data: &[u8]) {
+            assert_track_q_page(page_no, data);
+            let generation = data[4];
+            assert_eq!(
+                data[5],
+                generation ^ 0xFF,
+                "reader saw a torn version complement for page {}",
+                page_no.get()
+            );
+            assert_eq!(
+                data[6],
+                generation.wrapping_add(17),
+                "reader saw a torn version offset for page {}",
+                page_no.get()
+            );
+        }
+
+        let slots = Arc::new(FlatPageSlots::new(64));
+        let page_no = PageNumber::new(117).expect("page number");
+        assert!(
+            slots
+                .try_insert(page_no, versioned_page_buf(page_no, 0))
+                .expect("initial versioned page should stay in flat slots"),
+            "initial versioned page should be newly inserted"
+        );
+        slots.reset_metrics();
+
+        let start_barrier = Arc::new(Barrier::new(READERS + 2));
+        let reader_handles = (0..READERS)
+            .map(|_| {
+                let slots = Arc::clone(&slots);
+                let start_barrier = Arc::clone(&start_barrier);
+                thread::spawn(move || {
+                    start_barrier.wait();
+                    for _ in 0..READS_PER_READER {
+                        let copy = slots
+                            .get_copy(page_no)
+                            .expect("concurrent reader should find the hot slot");
+                        assert_versioned_page(page_no, &copy);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let writer_slots = Arc::clone(&slots);
+        let writer_barrier = Arc::clone(&start_barrier);
+        let writer_handle = thread::spawn(move || {
+            writer_barrier.wait();
+            for generation in 1..=WRITE_GENERATIONS {
+                let inserted = writer_slots
+                    .try_insert(page_no, versioned_page_buf(page_no, generation))
+                    .expect("same-page writer update should stay in the resident flat slot");
+                assert!(
+                    !inserted,
+                    "same-page writer update should replace the slot in place"
+                );
+            }
+        });
+
+        let started = monotonic_test_clock();
+        start_barrier.wait();
+        writer_handle
+            .join()
+            .expect("track q flat-slot writer should not panic");
+        for handle in reader_handles {
+            handle
+                .join()
+                .expect("track q flat-slot reader should not panic");
+        }
+        let elapsed = started.elapsed();
+
+        let final_copy = slots
+            .get_copy(page_no)
+            .expect("hot slot should remain readable after writer completes");
+        assert_versioned_page(page_no, &final_copy);
+        assert_eq!(
+            final_copy[4], WRITE_GENERATIONS,
+            "final slot copy should contain the last writer generation"
+        );
+        assert_eq!(
+            slots.len(),
+            1,
+            "reader/writer churn should keep a single resident slot"
+        );
+        assert_eq!(
+            slots.admits.load(Ordering::Relaxed),
+            0,
+            "same-page updates after metric reset should not count as new admissions"
+        );
+
+        let expected_reader_hits =
+            u64::try_from(READERS * READS_PER_READER).expect("reader hit count fits u64");
+        let hits = slots.hits.load(Ordering::Relaxed);
+        assert!(
+            hits >= expected_reader_hits,
+            "reader/writer test should record at least one hit per reader copy"
+        );
+
+        emit_track_q_log(
+            "test_track_q_flat_hash_concurrent_reader_writer_slot_consistency",
+            "verify",
+            elapsed,
+            1,
+            hits,
+            u64::try_from(track_q_probe_distance(&slots, page_no)).expect("probe distance fits"),
+            0,
+            track_q_hit_rate(hits, slots.misses.load(Ordering::Relaxed)),
+            json!({
+                "readers": READERS,
+                "reads_per_reader": READS_PER_READER,
+                "write_generations": WRITE_GENERATIONS,
+                "resident_pages": slots.len()
+            }),
+        );
+    }
+
+    #[test]
     #[ignore = "benchmark evidence only"]
     fn test_fast_path_vs_sharded_latency_comparison() {
         // Compare latency of fast path vs sharded path for single-thread workload.
@@ -7393,5 +7921,117 @@ mod tests {
             "bead_id={BEAD_FZR07} case=latency_comparison \
              fast path should be at least 1.2x faster, got {speedup:.2}x"
         );
+    }
+
+    // -- Pure-logic snapshot/metric type tests --
+
+    #[test]
+    fn lightweight_snapshot_total_accesses() {
+        let snap = PageCacheLightweightSnapshot {
+            hits: 75,
+            misses: 25,
+            ..PageCacheLightweightSnapshot::default()
+        };
+        assert_eq!(snap.total_accesses(), 100);
+    }
+
+    #[test]
+    fn lightweight_snapshot_hit_rate_zero_accesses() {
+        let snap = PageCacheLightweightSnapshot::default();
+        assert!((snap.hit_rate_percent() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn lightweight_snapshot_hit_rate_percent() {
+        let snap = PageCacheLightweightSnapshot {
+            hits: 80,
+            misses: 20,
+            ..PageCacheLightweightSnapshot::default()
+        };
+        assert!((snap.hit_rate_percent() - 80.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn metrics_snapshot_total_accesses() {
+        let snap = PageCacheMetricsSnapshot {
+            hits: 50,
+            misses: 50,
+            ..PageCacheMetricsSnapshot::default()
+        };
+        assert_eq!(snap.total_accesses(), 100);
+    }
+
+    #[test]
+    fn metrics_snapshot_hit_rate_zero() {
+        let snap = PageCacheMetricsSnapshot::default();
+        assert!((snap.hit_rate_percent() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn metrics_snapshot_hit_rate_100() {
+        let snap = PageCacheMetricsSnapshot {
+            hits: 100,
+            misses: 0,
+            ..PageCacheMetricsSnapshot::default()
+        };
+        assert!((snap.hit_rate_percent() - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn metrics_snapshot_efficiency_snapshot_preserves_fields() {
+        let snap = PageCacheMetricsSnapshot {
+            hits: 42,
+            misses: 8,
+            admits: 20,
+            evictions: 10,
+            cached_pages: 15,
+            pool_capacity: 100,
+            dirty_ratio_pct: 30,
+            t1_size: 5,
+            t2_size: 10,
+            b1_size: 3,
+            b2_size: 2,
+            p_target: 50,
+            mvcc_multi_version_pages: 1,
+        };
+        let eff = snap.efficiency_snapshot();
+        assert_eq!(eff.hits, 42);
+        assert_eq!(eff.misses, 8);
+        assert_eq!(eff.admits, 20);
+        assert_eq!(eff.evictions, 10);
+        assert_eq!(eff.cached_pages, 15);
+        assert_eq!(eff.pool_capacity, 100);
+        assert_eq!(eff.dirty_ratio_pct, 30);
+        assert_eq!(eff.t1_size, 5);
+        assert_eq!(eff.t2_size, 10);
+        assert_eq!(eff.mvcc_multi_version_pages, 1);
+    }
+
+    #[test]
+    fn queue_kind_as_str_covers_all_variants() {
+        assert_eq!(PageCacheQueueKind::T1.as_str(), "t1");
+        assert_eq!(PageCacheQueueKind::T2.as_str(), "t2");
+        assert_eq!(PageCacheQueueKind::B1.as_str(), "b1");
+        assert_eq!(PageCacheQueueKind::B2.as_str(), "b2");
+    }
+
+    #[test]
+    fn eviction_policy_default_is_arbitrary() {
+        assert_eq!(
+            PageCacheEvictionPolicy::default(),
+            PageCacheEvictionPolicy::Arbitrary
+        );
+    }
+
+    #[test]
+    fn resolve_page_buffer_max_explicit_overrides_default() {
+        let explicit = resolve_page_buffer_max(Some(42));
+        assert_eq!(explicit, 42);
+    }
+
+    #[test]
+    fn resolve_page_buffer_max_none_uses_default() {
+        let default_val = resolve_page_buffer_max(None);
+        assert!(default_val > 0);
     }
 }

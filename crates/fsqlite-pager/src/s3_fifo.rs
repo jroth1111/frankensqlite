@@ -2652,4 +2652,177 @@ mod tests {
             "re-accessed pages should be promotable to MAIN after readmission"
         );
     }
+
+    #[test]
+    fn config_with_limits_small_equals_capacity() {
+        let config = S3FifoConfig::with_limits(5, 5, 2, 1);
+        assert_eq!(config.small_capacity(), 5);
+        assert_eq!(config.main_capacity(), 0);
+        assert_eq!(config.ghost_capacity(), 2);
+    }
+
+    #[test]
+    fn insert_already_resident_returns_already_resident_event() {
+        let mut fifo = S3Fifo::with_config(S3FifoConfig::with_limits(4, 2, 2, 1));
+        let _ = fifo.insert(pg(1));
+        let events = fifo.insert(pg(1));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            S3FifoEvent::AlreadyResident {
+                page_id,
+                queue: QueueKind::Small,
+            } if *page_id == pg(1)
+        )));
+        assert_eq!(fifo.resident_len(), 1);
+    }
+
+    #[test]
+    fn access_unknown_page_returns_false() {
+        let mut fifo = S3Fifo::new(10);
+        assert!(!fifo.access(pg(99)));
+    }
+
+    #[test]
+    fn resident_and_ghost_len_track_inserts_and_evictions() {
+        let mut fifo = S3Fifo::with_config(S3FifoConfig::with_limits(2, 1, 1, 1));
+        assert_eq!(fifo.resident_len(), 0);
+        assert_eq!(fifo.ghost_len(), 0);
+
+        let _ = fifo.insert(pg(1));
+        assert_eq!(fifo.resident_len(), 1);
+
+        let _ = fifo.insert(pg(2));
+        assert_eq!(fifo.resident_len(), 2);
+        assert_eq!(fifo.ghost_len(), 0);
+
+        let _ = fifo.insert(pg(3));
+        assert!(fifo.resident_len() <= 2);
+        assert!(fifo.ghost_len() >= 1);
+    }
+
+    #[test]
+    fn rollout_gate_reset_clears_bad_streak_and_sets_policy() {
+        let baseline = RolloutMetrics::new(100_000, 1_000);
+        let bad = RolloutMetrics::new(106_000, 1_000);
+        let mut gate = S3FifoRolloutGate::default();
+
+        let _ = gate.evaluate_window(baseline, bad);
+        let _ = gate.evaluate_window(baseline, bad);
+        assert_eq!(gate.consecutive_bad_windows(), 2);
+
+        gate.reset(RolloutPolicy::S3Fifo);
+        assert_eq!(gate.consecutive_bad_windows(), 0);
+        assert_eq!(gate.active_policy(), RolloutPolicy::S3Fifo);
+    }
+
+    #[test]
+    fn rollout_metrics_accessors() {
+        let m = RolloutMetrics::new(42_000, 750);
+        assert_eq!(m.miss_rate_ppm(), 42_000);
+        assert_eq!(m.p99_read_latency_micros(), 750);
+    }
+
+    #[test]
+    fn config_new_capacity_one_edge() {
+        let config = S3FifoConfig::new(1);
+        assert_eq!(config.capacity(), 1);
+        assert_eq!(config.small_capacity(), 1);
+        assert_eq!(config.main_capacity(), 0);
+        assert_eq!(config.ghost_capacity(), 1);
+    }
+
+    #[test]
+    fn config_accessors_sum_correctly() {
+        for cap in [2, 10, 100, 1000] {
+            let config = S3FifoConfig::new(cap);
+            assert_eq!(
+                config.small_capacity() + config.main_capacity(),
+                config.capacity(),
+                "small + main must equal capacity for cap={cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollout_gate_default_field_values() {
+        let gate = S3FifoRolloutGate::default();
+        assert_eq!(gate.active_policy(), RolloutPolicy::S3Fifo);
+        assert_eq!(gate.consecutive_bad_windows(), 0);
+    }
+
+    #[test]
+    fn queue_kind_and_location_debug_clone_copy_eq() {
+        let variants = [QueueKind::Small, QueueKind::Main, QueueKind::Ghost];
+        for v in &variants {
+            let copied = *v;
+            assert_eq!(copied, *v);
+        }
+        assert_ne!(QueueKind::Small, QueueKind::Main);
+        let dbg = format!("{:?}", QueueKind::Ghost);
+        assert!(dbg.contains("Ghost"));
+
+        let loc = QueueLocation { kind: QueueKind::Small };
+        let loc2 = loc;
+        assert_eq!(loc, loc2);
+        let dbg_loc = format!("{loc:?}");
+        assert!(dbg_loc.contains("QueueLocation"));
+    }
+
+    #[test]
+    fn s3_fifo_event_debug_clone_copy_eq_all_variants() {
+        let pg1 = pg(1);
+        let events = [
+            S3FifoEvent::Inserted(pg1),
+            S3FifoEvent::AlreadyResident { page_id: pg1, queue: QueueKind::Small },
+            S3FifoEvent::GhostReadmission(pg1),
+            S3FifoEvent::PromotedToMain(pg1),
+            S3FifoEvent::EvictedFromSmallToGhost(pg1),
+            S3FifoEvent::ReinsertedInMain { page_id: pg1, reinsert_count: 2 },
+            S3FifoEvent::EvictedFromMain(pg1),
+            S3FifoEvent::GhostTrimmed(pg1),
+            S3FifoEvent::AdaptiveSplitChanged { old_small_capacity: 5, new_small_capacity: 10 },
+        ];
+        for e in &events {
+            let copied = *e;
+            assert_eq!(copied, *e);
+        }
+        let dbg = format!("{:?}", S3FifoEvent::GhostReadmission(pg1));
+        assert!(dbg.contains("GhostReadmission"));
+        assert_ne!(S3FifoEvent::Inserted(pg1), S3FifoEvent::EvictedFromMain(pg1));
+    }
+
+    #[test]
+    fn rollout_policy_debug_clone_copy_eq() {
+        let a = RolloutPolicy::Arc;
+        let b = RolloutPolicy::S3Fifo;
+        assert_ne!(a, b);
+        let copied = a;
+        assert_eq!(copied, a);
+        let dbg = format!("{b:?}");
+        assert!(dbg.contains("S3Fifo"));
+    }
+
+    #[test]
+    fn rollout_decision_debug_clone_copy_eq() {
+        let variants = [RolloutDecision::KeepArc, RolloutDecision::KeepS3Fifo, RolloutDecision::FallbackToArc];
+        for v in &variants {
+            let copied = *v;
+            assert_eq!(copied, *v);
+        }
+        assert_ne!(RolloutDecision::KeepArc, RolloutDecision::FallbackToArc);
+        let dbg = format!("{:?}", RolloutDecision::KeepS3Fifo);
+        assert!(dbg.contains("KeepS3Fifo"));
+    }
+
+    #[test]
+    fn rollout_gate_new_clamps_zero_required_windows_to_one() {
+        let baseline = RolloutMetrics::new(100_000, 1_000);
+        let bad = RolloutMetrics::new(200_000, 1_000);
+        let mut gate = S3FifoRolloutGate::new(500, 1000, 0, RolloutPolicy::S3Fifo);
+        assert_eq!(
+            gate.evaluate_window(baseline, bad),
+            RolloutDecision::FallbackToArc,
+            "required_consecutive_bad_windows=0 must clamp to 1, so one bad window triggers fallback"
+        );
+    }
 }

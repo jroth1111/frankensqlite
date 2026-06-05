@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
 };
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -30,7 +30,10 @@ use smallvec::SmallVec;
 
 use crate::journal::{JournalHeader, JournalPageRecord};
 use crate::page_buf::{PageBuf, PageBufPool};
-use crate::page_cache::{PageCacheMetricsSnapshot, PageCachePageSnapshot, ShardedPageCache};
+use crate::page_cache::{
+    PageCacheEvictionPolicy, PageCacheMetricsSnapshot, PageCachePageSnapshot, ShardedPageCache,
+};
+use crate::s3_fifo::S3FifoConfig;
 use crate::traits::{self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend};
 
 /// Identity-hashed `HashMap<PageNumber, V>` used on the INSERT hot path.
@@ -203,6 +206,8 @@ const GROUP_COMMIT_SPARSE_ARRIVAL_WAIT: Duration = Duration::from_micros(8);
 const GROUP_COMMIT_BALANCED_ARRIVAL_WAIT: Duration = LEGACY_GROUP_COMMIT_ARRIVAL_WAIT;
 const GROUP_COMMIT_BURST_ARRIVAL_WAIT: Duration = Duration::from_micros(40);
 const GROUP_COMMIT_ARRIVAL_WAIT_POLICY: &str = "bounded_fair_commit_v1";
+const SINGLE_WRITER_BATON_SPINS: u32 = 128;
+const SINGLE_WRITER_BATON_PARK: Duration = Duration::from_micros(50);
 const PHYSICAL_WRITER_LANE_RUN_ID: &str = "physical-writer-batching-lane";
 const PHYSICAL_WRITER_CHECKPOINT_RUN_ID: &str = "physical-writer-checkpoint-decoupling";
 const PHYSICAL_WRITER_CHECKPOINT_SCENARIO_ID: &str = "parallel_wal_checkpoint_coordination";
@@ -4216,6 +4221,63 @@ const fn decode_journal_mode(raw: u8) -> JournalMode {
     }
 }
 
+#[inline]
+const fn transaction_mode_is_eager_writer(mode: TransactionMode) -> bool {
+    matches!(
+        mode,
+        TransactionMode::Immediate | TransactionMode::Exclusive
+    )
+}
+
+fn wait_for_single_writer_baton<'a, F: VfsFile>(
+    inner_mutex: &'a Mutex<PagerInner<F>>,
+    writer_idle: &Condvar,
+    mut inner: MutexGuard<'a, PagerInner<F>>,
+) -> Result<MutexGuard<'a, PagerInner<F>>> {
+    if !inner.writer_active {
+        return Ok(inner);
+    }
+
+    drop(inner);
+    for _ in 0..SINGLE_WRITER_BATON_SPINS {
+        std::hint::spin_loop();
+    }
+
+    inner = inner_mutex
+        .lock()
+        .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+    if !inner.writer_active {
+        return Ok(inner);
+    }
+
+    let deadline = Instant::now() + SINGLE_WRITER_BATON_PARK;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(FrankenError::Busy);
+        };
+        if remaining.is_zero() {
+            return Err(FrankenError::Busy);
+        }
+
+        let wait_result = writer_idle
+            .wait_timeout(inner, remaining)
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        inner = wait_result.0;
+        if !inner.writer_active {
+            return Ok(inner);
+        }
+        if wait_result.1.timed_out() {
+            return Err(FrankenError::Busy);
+        }
+    }
+}
+
+fn release_single_writer_baton<F: VfsFile>(inner: &mut PagerInner<F>) -> bool {
+    let was_active = inner.writer_active;
+    inner.writer_active = false;
+    was_active
+}
+
 /// A concrete single-writer pager backed by a VFS file.
 pub struct SimplePager<V: Vfs> {
     /// VFS used to open journal/WAL companion files.
@@ -4224,6 +4286,8 @@ pub struct SimplePager<V: Vfs> {
     db_path: PathBuf,
     /// Shared mutable state used by transactions.
     inner: Arc<Mutex<PagerInner<V::File>>>,
+    /// Parks single-writer waiters for bounded baton handoff.
+    writer_idle: Arc<Condvar>,
     /// Sharded page cache for high-concurrency workloads (bd-3wop3.2).
     /// Each shard has its own mutex, eliminating global lock contention.
     cache: Arc<ShardedPageCache>,
@@ -4490,6 +4554,11 @@ where
             return Err(FrankenError::Busy);
         }
 
+        let eager_writer = transaction_mode_is_eager_writer(mode);
+        if eager_writer {
+            inner = wait_for_single_writer_baton(&self.inner, &self.writer_idle, inner)?;
+        }
+
         let active_transactions_before_begin = inner.active_transactions;
 
         // ── In-memory fast path ─────────────────────────────────────
@@ -4546,10 +4615,6 @@ where
                 );
             }
 
-            let eager_writer = matches!(
-                mode,
-                TransactionMode::Immediate | TransactionMode::Exclusive
-            );
             if eager_writer && inner.writer_active {
                 return Err(FrankenError::Busy);
             }
@@ -4581,6 +4646,7 @@ where
                     &self.db_path,
                 ),
                 inner: Arc::clone(&self.inner),
+                writer_idle: Arc::clone(&self.writer_idle),
                 cache: Arc::clone(&self.cache),
                 published: Arc::clone(&self.published),
                 wal_backend: Arc::clone(&self.wal_backend),
@@ -4723,10 +4789,6 @@ where
                 .publish_clear_if(cx, publication_update, clear_published_pages);
         }
 
-        let eager_writer = matches!(
-            mode,
-            TransactionMode::Immediate | TransactionMode::Exclusive
-        );
         if eager_writer && inner.writer_active {
             if active_transactions_before_begin == 0 {
                 inner.db_file.unlock(cx, LockLevel::None)?;
@@ -4753,14 +4815,16 @@ where
             let wal_begin_result =
                 with_wal_backend(&self.wal_backend, |wal| wal.begin_transaction(cx));
             if let Err(err) = wal_begin_result {
-                if eager_writer {
-                    inner.writer_active = false;
-                }
+                let notify_writer_idle = eager_writer && release_single_writer_baton(&mut inner);
                 let preserve_level = retained_lock_level_after_txn_exit(
                     active_transactions_before_begin,
                     inner.writer_active,
                 );
                 inner.db_file.unlock(cx, preserve_level)?;
+                drop(inner);
+                if notify_writer_idle {
+                    self.writer_idle.notify_one();
+                }
                 return Err(err);
             }
         }
@@ -4779,6 +4843,7 @@ where
             journal_path: Self::journal_path(&self.db_path),
             group_commit_queue: group_commit_queue_for_backend(self.vfs.as_ref(), &self.db_path),
             inner: Arc::clone(&self.inner),
+            writer_idle: Arc::clone(&self.writer_idle),
             cache: Arc::clone(&self.cache),
             published: Arc::clone(&self.published),
             wal_backend: Arc::clone(&self.wal_backend),
@@ -5632,6 +5697,9 @@ where
         let resolved_max = crate::page_cache::resolve_page_buffer_max(page_buffer_max);
         let cache =
             ShardedPageCache::with_max_buffers_for_initial_pages(page_size, resolved_max, db_size);
+        cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(
+            resolved_max,
+        )));
         let pool = cache.pool().clone();
         Ok(Self {
             vfs,
@@ -5654,6 +5722,7 @@ where
                 committed_db_change_counter: u64::from(header.change_counter),
                 committed_wal_generation: None,
             })),
+            writer_idle: Arc::new(Condvar::new()),
             cache: Arc::new(cache),
             pool,
             published: Arc::new(PublishedPagerState::new(
@@ -5816,6 +5885,9 @@ where
         let resolved_max = crate::page_cache::resolve_page_buffer_max(page_buffer_max);
         let cache =
             ShardedPageCache::with_max_buffers_for_initial_pages(page_size, resolved_max, db_size);
+        cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(
+            resolved_max,
+        )));
         let pool = cache.pool().clone();
         Ok(Self {
             vfs,
@@ -5840,6 +5912,7 @@ where
                     .map_or(0, |header| u64::from(header.change_counter)),
                 committed_wal_generation: None,
             })),
+            writer_idle: Arc::new(Condvar::new()),
             cache: Arc::new(cache),
             pool,
             published: Arc::new(PublishedPagerState::new(
@@ -6208,6 +6281,7 @@ pub struct SimpleTransaction<V: Vfs> {
     journal_path: PathBuf,
     group_commit_queue: GroupCommitQueueRef,
     inner: Arc<Mutex<PagerInner<V::File>>>,
+    writer_idle: Arc<Condvar>,
     cache: Arc<ShardedPageCache>,
     published: Arc<PublishedPagerState>,
     /// WAL backend for WAL-mode operation (D1-CRITICAL: separate lock for split-lock commit).
@@ -8210,6 +8284,23 @@ where
                     return Err(FrankenError::Busy);
                 }
                 if inner.writer_active {
+                    inner = wait_for_single_writer_baton(&self.inner, &self.writer_idle, inner)?;
+                }
+                if inner.checkpoint_active {
+                    let active_transactions = inner.active_transactions;
+                    let checkpoint_active = inner.checkpoint_active;
+                    drop(inner);
+                    log_checkpoint_coordination(
+                        cx,
+                        &self.group_commit_queue,
+                        "active_gate",
+                        "ensure_writer",
+                        transaction_mode_name(self.mode),
+                        "checkpoint_excludes_foreground_writer_upgrade_after_baton_wait",
+                        true,
+                        active_transactions,
+                        checkpoint_active,
+                    );
                     return Err(FrankenError::Busy);
                 }
                 // Escalate to RESERVED lock for cross-process writer exclusion.
@@ -8775,13 +8866,15 @@ where
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             self.restore_uncommitted_allocations_for_clean_commit(&mut inner);
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            if self.mode != TransactionMode::Concurrent {
-                inner.writer_active = false;
-            }
+            let notify_writer_idle =
+                self.mode != TransactionMode::Concurrent && release_single_writer_baton(&mut inner);
             let preserve_level =
                 retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
             let _ = inner.db_file.unlock(cx, preserve_level);
             drop(inner);
+            if notify_writer_idle {
+                self.writer_idle.notify_one();
+            }
             self.committed = true;
             self.finished = true;
             // IMPL-3 / AG-4B: reset scratch arena on no-writes commit path.
@@ -9060,9 +9153,8 @@ where
             }
             record_pager_commit_duration(&PAGER_COMMIT_FILE_SIZE_TIME_NS, t_file_size_start);
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            if self.mode != TransactionMode::Concurrent {
-                inner.writer_active = false;
-            }
+            let notify_writer_idle =
+                self.mode != TransactionMode::Concurrent && release_single_writer_baton(&mut inner);
             let publish_update = PublishedPagerUpdate {
                 visible_commit_seq: inner.commit_seq,
                 db_size: inner.db_size,
@@ -9086,6 +9178,9 @@ where
             let _ = inner.db_file.unlock(cx, preserve_level);
             record_pager_commit_duration(&PAGER_COMMIT_UNLOCK_TIME_NS, t_unlock_start);
             drop(inner);
+            if notify_writer_idle {
+                self.writer_idle.notify_one();
+            }
             record_pager_commit_duration(
                 &PAGER_COMMIT_PHASE_C_METADATA_TIME_NS,
                 t_phase_c_metadata_start,
@@ -9097,12 +9192,10 @@ where
             // but before snapshot publish. WAL frames are durable, commit_seq
             // incremented in-memory, but snapshot plane not yet updated.
             #[cfg(any(test, feature = "fault-injection"))]
-            if !metadata_only_single_connection_fast_path {
-                crate::fault_hooks::maybe_inject_during_phase_c(
-                    publish_update.visible_commit_seq.get(),
-                    publish_update.db_size,
-                )?;
-            }
+            crate::fault_hooks::maybe_inject_during_phase_c(
+                publish_update.visible_commit_seq.get(),
+                publish_update.db_size,
+            )?;
 
             // Phase C2 (outside inner.lock): publish to the shared snapshot
             // plane. In isolated single-connection mode, only metadata needs
@@ -9646,6 +9739,7 @@ where
             false
         };
 
+        let mut notify_writer_idle = false;
         if restored_from_journal {
             // ShardedPageCache uses per-shard internal locking
             self.cache.clear();
@@ -9658,7 +9752,7 @@ where
             // page numbers don't exist — just drop them.
             self.page_lease.clear();
             if self.mode != TransactionMode::Concurrent {
-                inner.writer_active = false;
+                notify_writer_idle |= release_single_writer_baton(&mut inner);
             }
         } else {
             // Restore pages allocated from the freelist.
@@ -9684,7 +9778,7 @@ where
                     2
                 };
 
-                inner.writer_active = false;
+                notify_writer_idle |= release_single_writer_baton(&mut inner);
             } else if self.is_writer && self.mode == TransactionMode::Concurrent {
                 // Concurrent: next_page is NOT reset, so lease pages and
                 // aborted EOF allocations must return to the in-memory
@@ -9704,6 +9798,9 @@ where
             retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
         let _ = inner.db_file.unlock(cx, preserve_level);
         drop(inner);
+        if notify_writer_idle {
+            self.writer_idle.notify_one();
+        }
         if self.is_writer {
             // Delete any partial journal file.
             let _ = self.vfs.delete(cx, &self.journal_path, true);
@@ -9858,6 +9955,7 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
         if self.finished {
             return;
         }
+        let mut notify_writer_idle = false;
         if let Ok(mut inner) = self.inner.lock() {
             // Restore freelist allocations.
             return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
@@ -9878,7 +9976,7 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
                     2
                 };
 
-                inner.writer_active = false;
+                notify_writer_idle = release_single_writer_baton(&mut inner);
             } else if self.is_writer && self.mode == TransactionMode::Concurrent {
                 // Concurrent: next_page stays advanced, so return lease
                 // pages and EOF allocations to the freelist.
@@ -9895,6 +9993,9 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
             // inherited cancellation strand the file lock during drop cleanup.
             let _mask = self.cleanup_cx.masked();
             let _ = inner.db_file.unlock(&self.cleanup_cx, preserve_level);
+        }
+        if notify_writer_idle {
+            self.writer_idle.notify_one();
         }
         // We cannot easily delete the journal file here because Drop doesn't
         // take a Context or return a Result. It's best effort cleanup.
@@ -10410,7 +10511,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex, OnceLock};
 
+    static FAULT_HOOK_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     const BEAD_ID: &str = "bd-bca.1";
+    const DB300_E3_3_A_BEAD_ID: &str = "bd-db300.5.3.3.1";
     const TRACK_U_BEAD_ID: &str = "bd-c9pxw";
     const CHECKPOINT_DECOUPLING_BEAD_ID: &str = "bd-1dp9.6.7.9.2";
     const COMMIT_SERVICE_POLICY_BEAD_ID: &str = "bd-1dp9.6.7.9.4";
@@ -11560,8 +11664,44 @@ mod tests {
         let _writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
         let mut deferred = pager.begin(&cx, TransactionMode::Deferred).unwrap();
 
+        let started = Instant::now();
         let err = deferred.allocate_page(&cx).unwrap_err();
         assert!(matches!(err, FrankenError::Busy));
+        assert!(
+            started.elapsed() < Duration::from_millis(10),
+            "bead_id={BEAD_ID} case=deferred_upgrade_baton_wait_is_bounded"
+        );
+    }
+
+    #[test]
+    fn test_single_writer_baton_handoff_budget_is_bounded() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let _writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let started = Instant::now();
+        let err = match pager.begin(&cx, TransactionMode::Immediate) {
+            Ok(_) => panic!("bead_id={BEAD_ID} case=single_writer_baton_should_return_busy"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, FrankenError::Busy));
+        assert!(
+            started.elapsed() < Duration::from_millis(10),
+            "bead_id={BEAD_ID} case=single_writer_baton_wait_is_bounded"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_begin_bypasses_single_writer_baton() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let _writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let concurrent = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        assert!(
+            !concurrent.is_writer,
+            "bead_id={BEAD_ID} case=concurrent_begin_not_blocked_by_single_writer"
+        );
     }
 
     #[test]
@@ -15734,6 +15874,9 @@ mod tests {
     #[test]
     fn test_group_commit_fault_hook_after_flush_before_publish_wakes_waiters_with_error_and_records_context()
      {
+        let _guard = FAULT_HOOK_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for attempt in 0..32 {
             crate::fault_hooks::clear();
 
@@ -15862,6 +16005,9 @@ mod tests {
     /// Replay: `cargo test -p fsqlite-pager --lib -- test_fault_drop_condvar_notify --nocapture`
     #[test]
     fn test_fault_drop_condvar_notify_waiters_recover_via_timeout() {
+        let _guard = FAULT_HOOK_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for attempt in 0..32 {
             crate::fault_hooks::clear();
 
@@ -15970,6 +16116,9 @@ mod tests {
     /// Replay: `cargo test -p fsqlite-pager --lib -- test_fault_during_phase_c --nocapture`
     #[test]
     fn test_fault_during_phase_c_returns_error_and_wal_frames_survive() {
+        let _guard = FAULT_HOOK_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::fault_hooks::clear();
 
         let cx = Cx::new();
@@ -22482,6 +22631,76 @@ mod tests {
     }
 
     #[test]
+    fn test_committed_snapshot_retained_reader_arc_survives_publication_swap() {
+        init_publication_test_tracing();
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+        let shared_connection_count = Arc::new(AtomicUsize::new(2));
+        pager.bind_shared_connection_count(Arc::clone(&shared_connection_count));
+
+        let first_page = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, page, &vec![0x33; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+            page
+        };
+
+        let retained = pager.committed_snapshot();
+        let retained_commit_seq = retained.commit_seq;
+        let retained_db_size = retained.db_size;
+        assert_eq!(
+            Arc::strong_count(&retained),
+            2,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=retained_snapshot_starts_shared_with_publication_slot"
+        );
+
+        let second_page = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, page, &vec![0x44; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+            page
+        };
+
+        let latest = pager.committed_snapshot();
+        assert!(
+            latest.commit_seq > retained_commit_seq,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=latest_snapshot_advances_after_swap"
+        );
+        assert!(
+            latest.db_size > retained_db_size,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=latest_snapshot_reflects_second_allocation"
+        );
+        assert_eq!(
+            retained.commit_seq, retained_commit_seq,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=retained_snapshot_commit_seq_remains_stable"
+        );
+        assert_eq!(
+            retained.db_size, retained_db_size,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=retained_snapshot_db_size_remains_stable"
+        );
+        assert_eq!(
+            Arc::strong_count(&retained),
+            1,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=old_snapshot_slot_released_after_swap"
+        );
+
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, first_page).unwrap().as_ref()[0],
+            0x33,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=first_page_still_visible"
+        );
+        assert_eq!(
+            reader.get_page(&cx, second_page).unwrap().as_ref()[0],
+            0x44,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=second_page_visible_after_swap"
+        );
+    }
+
+    #[test]
     fn test_single_connection_commit_and_retain_rollback_preserves_last_committed_page() {
         init_publication_test_tracing();
         let (pager, _) = test_pager();
@@ -26459,6 +26678,39 @@ mod tests {
         eprintln!(
             "INFO bead_id=bd-3wop3.8 case=16t_throughput_gate \
              status=skipped reason=requires_benchmark_harness"
+        );
+    }
+
+    #[test]
+    fn test_simple_pager_open_defaults_to_s3_fifo_eviction() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/s3fifo_default_rw.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        assert!(
+            matches!(
+                pager.cache.eviction_policy(),
+                crate::page_cache::PageCacheEvictionPolicy::S3Fifo(_)
+            ),
+            "read-write pager must default to S3-FIFO eviction"
+        );
+    }
+
+    #[test]
+    fn test_simple_pager_open_readonly_defaults_to_s3_fifo_eviction() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/s3fifo_default_ro.db");
+        {
+            let _rw = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        }
+        let cx = Cx::new();
+        let pager =
+            SimplePager::open_readonly_with_cx(&cx, vfs, &path, PageSize::DEFAULT).unwrap();
+        assert!(
+            matches!(
+                pager.cache.eviction_policy(),
+                crate::page_cache::PageCacheEvictionPolicy::S3Fifo(_)
+            ),
+            "read-only pager must default to S3-FIFO eviction"
         );
     }
 }

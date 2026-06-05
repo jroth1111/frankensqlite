@@ -347,4 +347,155 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn record_outcome_miss_increments_beta() {
+        let p = ThompsonPartitioner::new();
+        let idx = p.current_arm_index();
+        let beta_before = p.arms()[idx].beta.load(Ordering::Relaxed);
+        let alpha_before = p.arms()[idx].alpha.load(Ordering::Relaxed);
+
+        for _ in 0..50 {
+            p.record_outcome(false);
+        }
+
+        assert_eq!(p.arms()[idx].beta.load(Ordering::Relaxed), beta_before + 50);
+        assert_eq!(p.arms()[idx].alpha.load(Ordering::Relaxed), alpha_before);
+    }
+
+    #[test]
+    fn default_trait_matches_new() {
+        let d = ThompsonPartitioner::default();
+        let n = ThompsonPartitioner::new();
+        assert_eq!(d.arm_count(), n.arm_count());
+        assert_eq!(d.current_arm_index(), n.current_arm_index());
+        assert!((d.current_hot_ratio() - n.current_hot_ratio()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resample_is_deterministic_for_same_access_count() {
+        let p1 = ThompsonPartitioner::new();
+        let p2 = ThompsonPartitioner::new();
+
+        for _ in 0..100 {
+            p1.record_outcome(true);
+            p2.record_outcome(true);
+        }
+        p1.access_count.store(42, Ordering::Relaxed);
+        p2.access_count.store(42, Ordering::Relaxed);
+
+        p1.resample();
+        p2.resample();
+        assert_eq!(p1.current_arm_index(), p2.current_arm_index());
+    }
+
+    #[test]
+    fn splitmix64_zero_seed_avoids_degenerate_state() {
+        let mut rng = SplitMix64::new(0);
+        let mut all_zero = true;
+        for _ in 0..10 {
+            if rng.next_u64() != 0 {
+                all_zero = false;
+                break;
+            }
+        }
+        assert!(!all_zero, "zero-seeded PRNG must not produce all zeros");
+    }
+
+    #[test]
+    fn penalized_arm_loses_to_rewarded_arm() {
+        let p = ThompsonPartitioner::new();
+        p.current_arm.store(0, Ordering::Relaxed);
+        for _ in 0..500 {
+            p.record_outcome(false);
+        }
+        p.current_arm.store(8, Ordering::Relaxed);
+        for _ in 0..500 {
+            p.record_outcome(true);
+        }
+
+        p.resample();
+        assert_eq!(
+            p.current_arm_index(),
+            8,
+            "arm 8 (heavily rewarded) must beat arm 0 (heavily penalized)"
+        );
+    }
+
+    #[test]
+    fn beta_arm_new_initializes_uniform_prior() {
+        let arm = BetaArm::new(0.42);
+        assert!((arm.arm_ratio - 0.42).abs() < f64::EPSILON);
+        assert_eq!(arm.alpha.load(Ordering::Relaxed), 1);
+        assert_eq!(arm.beta.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn splitmix64_next_f64_open_stays_in_unit_interval() {
+        let mut rng = SplitMix64::new(0xCAFE);
+        for i in 0..1_000 {
+            let v = rng.next_f64_open();
+            assert!(v > 0.0 && v < 1.0, "sample {i}: {v} not in (0,1)");
+        }
+    }
+
+    #[test]
+    fn splitmix64_next_normal_mean_near_zero() {
+        let mut rng = SplitMix64::new(999);
+        let n = 10_000;
+        let sum: f64 = (0..n).map(|_| rng.next_normal()).sum();
+        let mean = sum / n as f64;
+        assert!(
+            mean.abs() < 0.1,
+            "normal mean {mean} too far from 0 over {n} samples"
+        );
+    }
+
+    #[test]
+    fn tick_returns_false_on_first_call() {
+        let p = ThompsonPartitioner::new();
+        assert!(!p.tick(), "first tick must not trigger resample");
+    }
+
+    #[test]
+    fn beta_arm_debug_contains_fields() {
+        let arm = BetaArm::new(0.75);
+        arm.alpha.store(10, Ordering::Relaxed);
+        arm.beta.store(20, Ordering::Relaxed);
+        let dbg = format!("{arm:?}");
+        assert!(dbg.contains("BetaArm"));
+        assert!(dbg.contains("alpha"));
+        assert!(dbg.contains("beta"));
+        assert!(dbg.contains("arm_ratio"));
+        assert!(dbg.contains("0.75"));
+    }
+
+    #[test]
+    fn thompson_partitioner_debug_contains_fields() {
+        let p = ThompsonPartitioner::new();
+        let dbg = format!("{p:?}");
+        assert!(dbg.contains("ThompsonPartitioner"));
+        assert!(dbg.contains("arms"));
+        assert!(dbg.contains("current_arm"));
+        assert!(dbg.contains("access_count"));
+    }
+
+    #[test]
+    fn splitmix64_clone_produces_independent_stream() {
+        let mut rng1 = SplitMix64::new(0xBEEF);
+        let _ = rng1.next_u64();
+        let mut rng2 = rng1.clone();
+        let a = rng1.next_u64();
+        let b = rng2.next_u64();
+        assert_eq!(a, b, "cloned PRNG must produce same next value");
+        let _ = rng1.next_u64();
+        let c = rng1.next_u64();
+        let d = rng2.next_u64();
+        assert_ne!(c, d, "diverged PRNGs must produce different values");
+    }
+
+    #[test]
+    fn resample_interval_constant_is_ten_thousand() {
+        assert_eq!(RESAMPLE_INTERVAL, 10_000);
+    }
 }

@@ -857,4 +857,108 @@ mod tests {
         assert_eq!(&aad2[4..], db_id.as_bytes());
         assert_eq!(&aad3[4..], db_id.as_bytes());
     }
+
+    #[test]
+    fn test_encrypt_error_display_all_variants() {
+        let cases: Vec<(EncryptError, &str)> = vec![
+            (
+                EncryptError::InsufficientReservedBytes {
+                    available: 10,
+                    required: 40,
+                },
+                "insufficient reserved bytes: 10 < 40",
+            ),
+            (EncryptError::EncryptionFailed, "AEAD encryption failed"),
+            (
+                EncryptError::AuthenticationFailed,
+                "AEAD authentication failed",
+            ),
+            (
+                EncryptError::PageTooSmall {
+                    page_len: 20,
+                    required_reserved: 40,
+                },
+                "page too small",
+            ),
+            (
+                EncryptError::DekUnwrapFailed,
+                "DEK unwrap failed",
+            ),
+            (EncryptError::InvalidKdfParams, "invalid Argon2id parameters"),
+        ];
+        for (err, expected_substr) in cases {
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(expected_substr),
+                "Display for {err:?} = \"{msg}\" missing \"{expected_substr}\""
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_reserved_bytes_exact_boundary() {
+        assert!(validate_reserved_bytes(ENCRYPTION_RESERVED_BYTES).is_ok());
+        assert!(validate_reserved_bytes(ENCRYPTION_RESERVED_BYTES + 1).is_ok());
+        assert!(validate_reserved_bytes(ENCRYPTION_RESERVED_BYTES - 1).is_err());
+    }
+
+    #[test]
+    fn test_argon2_params_default_values() {
+        let p = Argon2Params::default();
+        assert_eq!(p.m_cost, 65_536);
+        assert_eq!(p.t_cost, 3);
+        assert_eq!(p.p_cost, 4);
+    }
+
+    #[test]
+    fn test_page_encryptor_dek_accessor() {
+        let enc = PageEncryptor::new(&TEST_DEK, TEST_DB_ID);
+        assert_eq!(enc.dek(), &TEST_DEK);
+    }
+
+    #[test]
+    fn test_database_id_roundtrip() {
+        let bytes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let id = DatabaseId::from_bytes(bytes);
+        assert_eq!(*id.as_bytes(), bytes);
+    }
+
+    #[test]
+    fn test_database_id_eq_and_hash() {
+        use std::collections::HashSet;
+        let a = DatabaseId::from_bytes([0x11; DATABASE_ID_SIZE]);
+        let b = DatabaseId::from_bytes([0x11; DATABASE_ID_SIZE]);
+        let c = DatabaseId::from_bytes([0x22; DATABASE_ID_SIZE]);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        let mut set = HashSet::new();
+        set.insert(a);
+        assert!(set.contains(&b));
+        assert!(!set.contains(&c));
+    }
+
+    #[test]
+    fn test_encrypt_error_clone_and_eq() {
+        let e1 = EncryptError::AuthenticationFailed;
+        let e2 = e1.clone();
+        assert_eq!(e1, e2);
+        assert_ne!(e1, EncryptError::EncryptionFailed);
+    }
+
+    #[test]
+    fn test_dek_wrap_unwrap_roundtrip() {
+        let kek = [0xCC; KEY_SIZE];
+        let nonce = test_nonce(50);
+        let wrapped = KeyManager::wrap_dek(&TEST_DEK, &kek, &nonce).unwrap();
+        assert_eq!(wrapped.len(), NONCE_SIZE + KEY_SIZE + TAG_SIZE);
+        let recovered = KeyManager::unwrap_dek(&wrapped, &kek).unwrap();
+        assert_eq!(recovered, TEST_DEK);
+    }
+
+    #[test]
+    fn test_page_encryptor_database_id_accessor() {
+        let db_id = DatabaseId::from_bytes([0x77; DATABASE_ID_SIZE]);
+        let enc = PageEncryptor::new(&TEST_DEK, db_id);
+        assert_eq!(enc.database_id(), db_id);
+    }
 }

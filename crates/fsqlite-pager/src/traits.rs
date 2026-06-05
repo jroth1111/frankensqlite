@@ -1615,4 +1615,261 @@ mod tests {
             "rollback should restore the mock allocator to its initial state"
         );
     }
+
+    #[test]
+    fn test_checkpoint_mode_default_is_passive() {
+        assert_eq!(CheckpointMode::default(), CheckpointMode::Passive);
+    }
+
+    #[test]
+    fn test_journal_mode_default_is_delete() {
+        assert_eq!(JournalMode::default(), JournalMode::Delete);
+    }
+
+    #[test]
+    fn test_wal_publication_snapshot_authoritative_when_index_full() {
+        let snap = WalPublicationSnapshot {
+            publication_seq: 1,
+            generation: WalGenerationIdentity::default(),
+            last_commit_frame: Some(10),
+            commit_count: 5,
+            latest_frame_entries: 10,
+            index_is_partial: false,
+        };
+        assert!(
+            snap.lookup_contract_is_authoritative(),
+            "full index must be authoritative"
+        );
+    }
+
+    #[test]
+    fn test_wal_publication_snapshot_not_authoritative_when_partial() {
+        let snap = WalPublicationSnapshot {
+            publication_seq: 1,
+            generation: WalGenerationIdentity::default(),
+            last_commit_frame: None,
+            commit_count: 0,
+            latest_frame_entries: 0,
+            index_is_partial: true,
+        };
+        assert!(
+            !snap.lookup_contract_is_authoritative(),
+            "partial index must not be authoritative"
+        );
+    }
+
+    #[test]
+    fn test_prepared_wal_frame_batch_frame_count_and_page_size() {
+        let batch = PreparedWalFrameBatch {
+            frame_size: 4120,
+            page_data_offset: 24,
+            big_endian_checksum: false,
+            frame_metas: vec![
+                PreparedWalFrameMeta { page_number: 1, db_size_if_commit: 0 },
+                PreparedWalFrameMeta { page_number: 2, db_size_if_commit: 10 },
+            ],
+            checksum_transforms: Vec::new(),
+            frame_bytes: vec![0u8; 4120 * 2],
+            last_commit_frame_offset: Some(4120),
+            finalized_for: None,
+            finalized_running_checksum: None,
+        };
+        assert_eq!(batch.frame_count(), 2);
+        assert_eq!(batch.page_size(), 4096);
+    }
+
+    #[test]
+    fn test_prepared_wal_frame_batch_set_db_size_clears_finalized() {
+        let mut batch = PreparedWalFrameBatch {
+            frame_size: 32,
+            page_data_offset: 8,
+            big_endian_checksum: false,
+            frame_metas: vec![
+                PreparedWalFrameMeta { page_number: 1, db_size_if_commit: 0 },
+            ],
+            checksum_transforms: Vec::new(),
+            frame_bytes: vec![0u8; 32],
+            last_commit_frame_offset: None,
+            finalized_for: Some(PreparedWalFinalizationState {
+                checkpoint_seq: 1,
+                salt1: 0xAA,
+                salt2: 0xBB,
+                start_frame_index: 0,
+                seed: PreparedWalChecksumSeed::default(),
+            }),
+            finalized_running_checksum: Some(PreparedWalChecksumSeed { s1: 1, s2: 2 }),
+        };
+
+        batch.set_db_size_if_commit(0, 42);
+
+        assert_eq!(batch.frame_metas[0].db_size_if_commit, 42);
+        assert!(
+            batch.finalized_for.is_none(),
+            "set_db_size_if_commit must invalidate finalized_for"
+        );
+        assert!(
+            batch.finalized_running_checksum.is_none(),
+            "set_db_size_if_commit must invalidate finalized_running_checksum"
+        );
+        let db_bytes = &batch.frame_bytes[4..8];
+        assert_eq!(u32::from_be_bytes(db_bytes.try_into().unwrap()), 42);
+    }
+
+    #[test]
+    fn test_mock_release_savepoint_unknown_name_returns_error() {
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let mut txn = pager.begin(&cx, TransactionMode::Deferred).unwrap();
+
+        let result = txn.release_savepoint(&cx, "nonexistent");
+        assert!(result.is_err(), "releasing unknown savepoint must fail");
+    }
+
+    #[test]
+    fn test_memory_mock_savepoint_rollback_restores_pages() {
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let p1 = PageNumber::new(1).unwrap();
+        let page_size = fsqlite_types::PageSize::default().as_usize();
+        let mut data_a = vec![0u8; page_size];
+        data_a[0] = 0xAA;
+        txn.write_page(&cx, p1, &data_a).unwrap();
+
+        txn.savepoint(&cx, "sp1").unwrap();
+
+        let mut data_b = vec![0u8; page_size];
+        data_b[0] = 0xBB;
+        txn.write_page(&cx, p1, &data_b).unwrap();
+        assert_eq!(txn.get_page(&cx, p1).unwrap().as_bytes()[0], 0xBB);
+
+        txn.rollback_to_savepoint(&cx, "sp1").unwrap();
+        assert_eq!(
+            txn.get_page(&cx, p1).unwrap().as_bytes()[0],
+            0xAA,
+            "rollback_to_savepoint must restore page state"
+        );
+    }
+
+    #[test]
+    fn test_transaction_mode_default_is_deferred() {
+        assert_eq!(TransactionMode::default(), TransactionMode::Deferred);
+    }
+
+    #[test]
+    fn test_checkpoint_result_fields() {
+        let result = CheckpointResult {
+            total_frames: 100,
+            frames_backfilled: 80,
+            completed: false,
+            wal_was_reset: false,
+            requested_mode: CheckpointMode::Full,
+            effective_mode: CheckpointMode::Passive,
+        };
+        assert_eq!(result.total_frames, 100);
+        assert_eq!(result.frames_backfilled, 80);
+        assert!(!result.completed);
+        assert_ne!(result.requested_mode, result.effective_mode);
+    }
+
+    #[test]
+    fn test_journal_mode_debug_clone_copy_eq() {
+        let a = JournalMode::Wal;
+        let b = a;
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_ne!(JournalMode::Delete, JournalMode::Wal);
+        let dbg = format!("{a:?}");
+        assert!(dbg.contains("Wal"));
+    }
+
+    #[test]
+    fn test_checkpoint_result_clone_debug() {
+        let result = CheckpointResult {
+            total_frames: 50,
+            frames_backfilled: 50,
+            completed: true,
+            wal_was_reset: true,
+            requested_mode: CheckpointMode::Truncate,
+            effective_mode: CheckpointMode::Truncate,
+        };
+        let cloned = result.clone();
+        assert_eq!(result, cloned);
+        let dbg = format!("{result:?}");
+        assert!(dbg.contains("CheckpointResult"));
+        assert!(dbg.contains("Truncate"));
+        assert!(dbg.contains("wal_was_reset"));
+    }
+
+    #[test]
+    fn test_wal_publication_snapshot_clone_copy_debug() {
+        let snap = WalPublicationSnapshot {
+            publication_seq: 42,
+            generation: WalGenerationIdentity::default(),
+            last_commit_frame: Some(100),
+            commit_count: 7,
+            latest_frame_entries: 50,
+            index_is_partial: false,
+        };
+        let copied = snap;
+        let cloned = snap.clone();
+        assert_eq!(copied, cloned);
+        let dbg = format!("{snap:?}");
+        assert!(dbg.contains("WalPublicationSnapshot"));
+        assert!(dbg.contains("publication_seq"));
+        assert!(dbg.contains("42"));
+    }
+
+    #[test]
+    fn test_checkpoint_mode_all_variants_debug() {
+        for (mode, expected) in [
+            (CheckpointMode::Passive, "Passive"),
+            (CheckpointMode::Full, "Full"),
+            (CheckpointMode::Restart, "Restart"),
+            (CheckpointMode::Truncate, "Truncate"),
+        ] {
+            let dbg = format!("{mode:?}");
+            assert!(dbg.contains(expected), "expected {expected} in {dbg}");
+            let copy = mode;
+            assert_eq!(mode, copy);
+        }
+    }
+
+    #[test]
+    fn test_prepared_wal_frame_batch_page_data_and_frame_slice() {
+        let frame_size = 32;
+        let page_data_offset = 8;
+        let mut frame_bytes = vec![0u8; frame_size * 2];
+        frame_bytes[8] = 0xAA;
+        frame_bytes[frame_size + 8] = 0xBB;
+
+        let batch = PreparedWalFrameBatch {
+            frame_size,
+            page_data_offset,
+            big_endian_checksum: false,
+            frame_metas: vec![
+                PreparedWalFrameMeta { page_number: 1, db_size_if_commit: 0 },
+                PreparedWalFrameMeta { page_number: 2, db_size_if_commit: 5 },
+            ],
+            checksum_transforms: Vec::new(),
+            frame_bytes,
+            last_commit_frame_offset: None,
+            finalized_for: None,
+            finalized_running_checksum: None,
+        };
+
+        assert_eq!(batch.page_data(0)[0], 0xAA);
+        assert_eq!(batch.page_data(1)[0], 0xBB);
+        assert_eq!(batch.frame_slice(0).len(), frame_size);
+        assert_eq!(batch.frame_slice(1).len(), frame_size);
+
+        let refs = batch.frame_refs();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].page_number, 1);
+        assert_eq!(refs[1].db_size_if_commit, 5);
+        assert_eq!(refs[0].page_data[0], 0xAA);
+        assert_eq!(refs[1].page_data[0], 0xBB);
+    }
 }

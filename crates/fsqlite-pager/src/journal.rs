@@ -794,4 +794,64 @@ mod tests {
             .verify_checksum(header.nonce)
             .expect("rec2 checksum ok");
     }
+
+    #[test]
+    fn test_journal_error_display_invalid_page_count() {
+        let err = JournalError::InvalidPageCount { raw: -5 };
+        let s = err.to_string();
+        assert!(s.contains("-5"));
+        assert!(s.contains("page count"));
+    }
+
+    #[test]
+    fn test_journal_page_record_encoded_size() {
+        let record = JournalPageRecord::new(1, vec![0u8; 4096], 0);
+        assert_eq!(record.encoded_size(), 4 + 4096 + 4);
+        let small = JournalPageRecord::new(2, vec![0u8; 512], 0);
+        assert_eq!(small.encoded_size(), 4 + 512 + 4);
+        assert_eq!(record.encode().len(), record.encoded_size());
+    }
+
+    #[test]
+    fn test_compute_page_count_truncated_record() {
+        let header = JournalHeader {
+            page_count: -1,
+            nonce: 0,
+            initial_db_size: 10,
+            sector_size: 512,
+            page_size: 4096,
+        };
+        let record_size = 4 + 4096 + 4;
+        let full_3 = 512 + 3 * record_size as u64;
+        assert_eq!(header.compute_page_count_from_file_size(full_3), 3);
+        let partial = full_3 + record_size as u64 / 2;
+        assert_eq!(
+            header.compute_page_count_from_file_size(partial),
+            3,
+            "partial trailing record must not count"
+        );
+    }
+
+    #[test]
+    fn test_lock_byte_page_matches_pending_byte_formula() {
+        for &raw in &[512u32, 1024, 4096, 65536] {
+            let ps = PageSize::new(raw).unwrap();
+            let expected = (PENDING_BYTE_OFFSET / u64::from(raw)) as u32 + 1;
+            assert_eq!(lock_byte_page(ps), expected);
+        }
+    }
+
+    #[test]
+    fn test_journal_header_minus_one_page_count_roundtrip() {
+        let header = JournalHeader {
+            page_count: -1,
+            nonce: 0xABCD,
+            initial_db_size: 5,
+            sector_size: 512,
+            page_size: 4096,
+        };
+        let decoded = JournalHeader::decode(&header.encode()).expect("decode");
+        assert_eq!(decoded.page_count, -1);
+        assert_eq!(decoded, header);
+    }
 }

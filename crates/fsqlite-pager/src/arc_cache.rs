@@ -3863,4 +3863,83 @@ mod tests {
         );
         cache.get(&k2).unwrap().unpin();
     }
+
+    #[test]
+    fn test_cache_metrics_snapshot_hit_rate_pct() {
+        let snap = CacheMetricsSnapshot {
+            hits: 75,
+            misses: 25,
+            ghost_hits_b1: 0,
+            ghost_hits_b2: 0,
+            evictions_t1: 0,
+            evictions_t2: 0,
+            version_coalesce_count: 0,
+            admits: 0,
+            t1_len: 0,
+            t2_len: 0,
+            b1_len: 0,
+            b2_len: 0,
+            p: 0,
+            capacity: 0,
+            total_bytes: 0,
+            max_bytes: 0,
+            multi_version_pages: 0,
+            capacity_overflow_events: 0,
+        };
+        assert!((snap.hit_rate_pct() - 75.0).abs() < 0.01);
+
+        let zero = CacheMetricsSnapshot { hits: 0, misses: 0, ..snap };
+        assert!((zero.hit_rate_pct() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_cache_metrics_snapshot_total_accesses_and_resident() {
+        let snap = CacheMetricsSnapshot {
+            hits: 10,
+            misses: 5,
+            ghost_hits_b1: 3,
+            ghost_hits_b2: 2,
+            evictions_t1: 0,
+            evictions_t2: 0,
+            version_coalesce_count: 0,
+            admits: 0,
+            t1_len: 7,
+            t2_len: 4,
+            b1_len: 0,
+            b2_len: 0,
+            p: 0,
+            capacity: 0,
+            total_bytes: 0,
+            max_bytes: 0,
+            multi_version_pages: 0,
+            capacity_overflow_events: 0,
+        };
+        assert_eq!(snap.total_accesses(), 20);
+        assert_eq!(snap.resident_pages(), 11);
+    }
+
+    #[test]
+    fn test_cached_page_debug_format() {
+        let k = key(42, 7);
+        let cp = page(k, 4096);
+        let dbg = format!("{cp:?}");
+        assert!(dbg.contains("CachedPage"));
+        assert!(dbg.contains("data_len"));
+        assert!(dbg.contains("ref_count"));
+    }
+
+    #[test]
+    fn test_cached_page_pin_unpin_is_pinned() {
+        let k = key(99, 0);
+        let cp = page(k, 4096);
+        assert!(!cp.is_pinned());
+        cp.pin();
+        assert!(cp.is_pinned());
+        cp.pin();
+        assert!(cp.is_pinned());
+        cp.unpin();
+        assert!(cp.is_pinned());
+        cp.unpin();
+        assert!(!cp.is_pinned());
+    }
 }

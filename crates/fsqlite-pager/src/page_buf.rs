@@ -734,4 +734,57 @@ mod tests {
              Workspace must have unsafe_code = forbid"
         );
     }
+
+    #[test]
+    fn test_page_buf_clone_is_standalone_copy() {
+        let pool = PageBufPool::new(PageSize::DEFAULT, 4);
+        let mut buf = pool.acquire().unwrap();
+        buf[0] = 0xAB;
+        buf[4095] = 0xCD;
+        assert!(buf.is_pooled());
+
+        let cloned = buf.clone();
+        assert!(!cloned.is_pooled(), "clone must be standalone");
+        assert_eq!(cloned[0], 0xAB);
+        assert_eq!(cloned[4095], 0xCD);
+        assert_eq!(cloned.page_size(), buf.page_size());
+        let ptr = cloned.as_ptr() as usize;
+        assert_eq!(ptr % 4096, 0, "clone must remain aligned");
+    }
+
+    #[test]
+    fn test_page_buf_pool_capacity_accessor() {
+        let pool = PageBufPool::new(PageSize::DEFAULT, 16);
+        assert_eq!(pool.capacity(), 16);
+        let pool2 = PageBufPool::new(PageSize::new(512).unwrap(), 1);
+        assert_eq!(pool2.capacity(), 1);
+    }
+
+    #[test]
+    fn test_page_buf_pool_metrics_snapshot_equality() {
+        let a = PageBufPoolMetricsSnapshot {
+            page_buffer_pool_hits: 5,
+            page_buffer_pool_misses: 3,
+        };
+        let b = PageBufPoolMetricsSnapshot {
+            page_buffer_pool_hits: 5,
+            page_buffer_pool_misses: 3,
+        };
+        let c = PageBufPoolMetricsSnapshot {
+            page_buffer_pool_hits: 5,
+            page_buffer_pool_misses: 4,
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_page_buf_as_mut_slice_write_through() {
+        let mut buf = PageBuf::new(PageSize::DEFAULT);
+        let slice = buf.as_mut_slice();
+        slice[0] = 0xFE;
+        slice[2047] = 0xED;
+        assert_eq!(buf.as_slice()[0], 0xFE);
+        assert_eq!(buf.as_slice()[2047], 0xED);
+    }
 }

@@ -595,4 +595,92 @@ mod tests {
         // which overflows, so we expect the CEIL.
         assert!(e >= E_VALUE_CEIL * 0.99, "expected clamped CEIL, got {e}");
     }
+
+    #[test]
+    fn clear_removes_all_tracked_pages() {
+        let ev = EValueEvictor::new();
+        for i in 1..=5 {
+            ev.record_access(pn(i));
+        }
+        assert_eq!(ev.tracked(), 5);
+        ev.clear();
+        assert_eq!(ev.tracked(), 0);
+        for i in 1..=5 {
+            assert!(ev.e_value(pn(i)).is_none());
+        }
+    }
+
+    #[test]
+    fn tick_n_zero_is_noop() {
+        let ev = EValueEvictor::with_rates(2.0, 0.5);
+        let p = pn(1);
+        ev.record_access(p);
+        let before = ev.e_value(p).unwrap();
+        ev.tick_n(0);
+        let after = ev.e_value(p).unwrap();
+        assert!((before - after).abs() < 1e-12);
+    }
+
+    #[test]
+    fn default_equals_new() {
+        let d = EValueEvictor::default();
+        let n = EValueEvictor::new();
+        assert!((d.r_hit() - n.r_hit()).abs() < 1e-12);
+        assert!((d.r_tick() - n.r_tick()).abs() < 1e-12);
+        assert_eq!(d.tracked(), n.tracked());
+    }
+
+    #[test]
+    fn choose_victim_empty_candidates_returns_none() {
+        let ev = EValueEvictor::new();
+        assert!(ev.choose_victim(&[]).is_none());
+    }
+
+    #[test]
+    fn debug_format_contains_expected_fields() {
+        let ev = EValueEvictor::with_rates(2.0, 0.5);
+        ev.record_access(pn(1));
+        ev.record_access(pn(2));
+        let dbg = format!("{ev:?}");
+        assert!(dbg.contains("EValueEvictor"));
+        assert!(dbg.contains("r_hit"));
+        assert!(dbg.contains("r_tick"));
+        assert!(dbg.contains("initial_e"));
+        assert!(dbg.contains("pages"), "should show page count");
+    }
+
+    #[test]
+    fn clamp_e_handles_nan_negative_infinity() {
+        assert_eq!(clamp_e(f64::NAN), E_VALUE_FLOOR);
+        assert_eq!(clamp_e(f64::NEG_INFINITY), E_VALUE_FLOOR);
+        assert_eq!(clamp_e(f64::INFINITY), E_VALUE_FLOOR);
+        assert_eq!(clamp_e(-1.0), E_VALUE_FLOOR);
+        assert_eq!(clamp_e(0.0), E_VALUE_FLOOR);
+        assert_eq!(clamp_e(E_VALUE_FLOOR), E_VALUE_FLOOR);
+        assert_eq!(clamp_e(E_VALUE_CEIL), E_VALUE_CEIL);
+        assert_eq!(clamp_e(E_VALUE_CEIL + 1.0), E_VALUE_CEIL);
+        assert_eq!(clamp_e(42.0), 42.0);
+    }
+
+    #[test]
+    fn choose_victim_single_candidate_returns_it() {
+        let ev = EValueEvictor::new();
+        let p = pn(7);
+        ev.record_access(p);
+        let victim = ev.choose_victim(&[p]);
+        assert_eq!(victim, Some(p));
+    }
+
+    #[test]
+    fn forget_is_idempotent_and_updates_tracked() {
+        let ev = EValueEvictor::new();
+        ev.record_access(pn(1));
+        ev.record_access(pn(2));
+        assert_eq!(ev.tracked(), 2);
+        ev.forget(pn(1));
+        assert_eq!(ev.tracked(), 1);
+        ev.forget(pn(1));
+        assert_eq!(ev.tracked(), 1, "second forget must be no-op");
+        assert!(ev.e_value(pn(2)).is_some(), "other page unaffected");
+    }
 }
