@@ -453,6 +453,20 @@ mod tests {
     }
 
     #[test]
+    fn test_max_leaf_entries_saturates_on_tiny_pages() {
+        // The formula is (usable/4) - 2, using saturating_sub so that
+        // pathologically small usable sizes yield 0 leaf entries rather than
+        // underflowing (which on u32 would wrap to a huge count and later
+        // overflow the trunk page). test_max_leaf_entries only covers the
+        // ordinary 512/4096 cases.
+        assert_eq!(max_leaf_entries(0), 0);
+        assert_eq!(max_leaf_entries(4), 0); // 4/4 = 1, 1 - 2 saturates to 0
+        assert_eq!(max_leaf_entries(8), 0); // 8/4 = 2, 2 - 2 = 0
+        assert_eq!(max_leaf_entries(11), 0); // 11/4 = 2, 2 - 2 = 0
+        assert_eq!(max_leaf_entries(12), 1); // 12/4 = 3, 3 - 2 = 1 (first nonzero)
+    }
+
+    #[test]
     fn test_trunk_parse_write_roundtrip() {
         let trunk = FreelistTrunk {
             next_trunk: Some(PageNumber::new(10).unwrap()),
@@ -512,6 +526,35 @@ mod tests {
     }
 
     #[test]
+    fn test_trunk_parse_rejects_over_capacity_and_skips_zero_entries() {
+        // A trunk page whose declared leaf_count exceeds what the page can hold
+        // is corruption. A 16-byte page holds max (16/4 - 2) = 2 leaf entries.
+        let mut over = vec![0u8; 16];
+        over[4..8].copy_from_slice(&3u32.to_be_bytes()); // claims 3 > 2
+        assert!(
+            matches!(
+                FreelistTrunk::parse(&over),
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ),
+            "leaf_count over capacity must be rejected"
+        );
+
+        // Zero page-number entries in the leaf array are defensively skipped: a
+        // valid DB never stores them, and parse must never surface page 0.
+        let mut page = vec![0u8; 4096];
+        page[0..4].copy_from_slice(&0u32.to_be_bytes()); // no next trunk
+        page[4..8].copy_from_slice(&3u32.to_be_bytes()); // 3 declared entries
+        page[8..12].copy_from_slice(&20u32.to_be_bytes());
+        page[12..16].copy_from_slice(&0u32.to_be_bytes()); // zero -> skipped
+        page[16..20].copy_from_slice(&40u32.to_be_bytes());
+        let parsed = FreelistTrunk::parse(&page).unwrap();
+        assert!(parsed.next_trunk.is_none());
+        assert_eq!(parsed.leaf_pages.len(), 2, "zero entry must be skipped");
+        assert_eq!(parsed.leaf_pages[0].get(), 20);
+        assert_eq!(parsed.leaf_pages[1].get(), 40);
+    }
+
+    #[test]
     fn test_freelist_allocate_from_free() {
         let mut fl = Freelist::with_pages(
             vec![PageNumber::new(10).unwrap(), PageNumber::new(20).unwrap()],
@@ -552,9 +595,71 @@ mod tests {
     }
 
     #[test]
+    fn test_freelist_reuses_freed_page_before_extending_db() {
+        // Reuse must take precedence over file growth, and extension resumes from
+        // the high-water mark (not the reused page + 1). The existing tests cover
+        // allocate-from-a-prefilled-freelist, pure extension, and a single
+        // deallocate+allocate in isolation, but not this interleaving.
+        let mut fl = Freelist::new(100, 4096);
+
+        // Empty freelist: the first two allocations extend the db file.
+        assert_eq!(fl.allocate().unwrap().get(), 101);
+        assert_eq!(fl.allocate().unwrap().get(), 102);
+        assert_eq!(fl.db_page_count(), 102);
+
+        // Free page 101; the next allocation must reuse it rather than extend.
+        fl.deallocate(PageNumber::new(101).unwrap());
+        assert_eq!(fl.free_count(), 1);
+        assert_eq!(
+            fl.allocate().unwrap().get(),
+            101,
+            "freed page must be reused before extending the db"
+        );
+        assert_eq!(fl.free_count(), 0);
+
+        // Freelist empty again: extension resumes from the high-water mark
+        // (db_page_count is still 102), yielding 103 -- not the reused 101 + 1.
+        assert_eq!(
+            fl.allocate().unwrap().get(),
+            103,
+            "extension must resume from the high-water mark, not the reused page"
+        );
+        assert_eq!(fl.db_page_count(), 103);
+    }
+
+    #[test]
     fn test_freelist_max_page_count() {
         let mut fl = Freelist::new(MAX_PAGE_COUNT, 4096);
         assert!(fl.allocate().is_err());
+    }
+
+    #[test]
+    fn test_freelist_rejects_and_skips_pages_beyond_db_size() {
+        // deallocate must reject pages beyond the current db size — returning
+        // them later would corrupt the freelist on flush.
+        let mut fl = Freelist::new(10, 4096);
+        fl.deallocate(PageNumber::new(5).unwrap()); // in range -> kept
+        fl.deallocate(PageNumber::new(100).unwrap()); // beyond db_page_count -> rejected
+        assert_eq!(fl.free_count(), 1, "out-of-range page must not enter the freelist");
+        assert_eq!(fl.allocate().unwrap().get(), 5);
+
+        // allocate must skip stale freelist entries pointing beyond the db, then
+        // fall through to extending the file.
+        let mut fl = Freelist::with_pages(
+            vec![PageNumber::new(99).unwrap(), PageNumber::new(5).unwrap()],
+            10,
+            4096,
+        );
+        // Top of the LIFO stack (5) is in range and allocated first.
+        assert_eq!(fl.allocate().unwrap().get(), 5);
+        // The remaining entry (99) is stale (> db_page_count 10): it is skipped,
+        // so the allocator extends the db to page 11 rather than returning 99.
+        assert_eq!(
+            fl.allocate().unwrap().get(),
+            11,
+            "stale entry skipped; db extended instead"
+        );
+        assert_eq!(fl.db_page_count(), 11);
     }
 
     #[test]
@@ -690,6 +795,28 @@ mod tests {
     }
 
     #[test]
+    fn test_ptrmap_page_for_header_and_first_ptrmap_page_have_no_entry() {
+        // test_ptrmap_page_for_given_pgno_boundaries covers a regular page, a
+        // group-final page, a next-group page, and a high pointer-map page (822).
+        // The two low-page edges are still unpinned: page 1 (the database header,
+        // raw < 3 -- pointer-map entries begin at page 3) and page 2 (which is
+        // itself the first pointer-map page) both lack a pointer-map entry, via
+        // two different guards.
+        let p1 = PageNumber::new(1).unwrap();
+        let p2 = PageNumber::new(2).unwrap();
+
+        // Page 1 is the database header (raw < 3 guard): no pointer-map entry.
+        assert!(ptrmap_page_for(p1, 4096, 4096).is_none());
+        assert!(ptrmap_entry_offset(p1, 4096, 4096).is_none());
+
+        // Page 2 is the first pointer-map page (is_ptrmap_page guard), so it has
+        // no entry of its own.
+        assert!(is_ptrmap_page(p2, 4096, 4096));
+        assert!(ptrmap_page_for(p2, 4096, 4096).is_none());
+        assert!(ptrmap_entry_offset(p2, 4096, 4096).is_none());
+    }
+
+    #[test]
     fn test_ptrmap_pending_byte_page_collision() {
         // For 1024 byte pages, the pending byte page is 1_048_577.
         // It falls exactly on what would normally be a pointer map page.
@@ -820,5 +947,71 @@ mod tests {
 
         let invalid_bt = [5, 0, 0, 0, 0];
         assert!(PtrMapEntry::decode(&invalid_bt).is_err());
+    }
+
+    #[test]
+    fn test_ptrmap_entry_decode_rejects_short_input_and_invalid_type_code() {
+        // test_ptrmap_type_parent_semantics covers the parent-value guards
+        // (root/free must be 0, btree/overflow must be nonzero), but not the two
+        // structural guards in decode: a buffer shorter than PTRMAP_ENTRY_SIZE_
+        // BYTES, and a type code outside the valid 1..=5 range.
+
+        // Fewer than 5 bytes is rejected as "too small".
+        assert!(PtrMapEntry::decode(&[]).is_err());
+        assert!(PtrMapEntry::decode(&[1, 0, 0, 0]).is_err()); // 4 bytes
+
+        // Type code 0 and 6 are outside the valid 1..=5 range.
+        assert!(PtrMapEntry::decode(&[0, 0, 0, 0, 0]).is_err());
+        assert!(PtrMapEntry::decode(&[6, 0, 0, 0, 1]).is_err());
+
+        // Sanity: well-formed entries at the type-code range boundaries decode.
+        assert!(PtrMapEntry::decode(&[1, 0, 0, 0, 0]).is_ok()); // RootPage, parent 0
+        assert!(PtrMapEntry::decode(&[5, 0, 0, 0, 1]).is_ok()); // Btree, parent 1
+    }
+
+    #[test]
+    fn test_ptrmap_layout_self_consistency_across_a_page_range() {
+        // 512-byte pages, no reserved bytes: 102 entries/ptrmap-page, group=103,
+        // so ptrmap pages fall at 2, 105, 208, ... The pending-byte page (~2M)
+        // is far outside this range, giving a clean periodic layout. Existing
+        // ptrmap tests use 4096-byte pages (group=820 -> only page 2 in range),
+        // so the multi-group periodicity and cross-function consistency are
+        // unexercised. Sweep the range and check the functions agree.
+        let usable = 512u32;
+        let page_size = 512u32;
+        assert_eq!(ptrmap_entries_per_page(usable), 102);
+        let group = ptrmap_group_size(usable);
+        assert_eq!(group, 103);
+
+        for raw in 2u32..=250 {
+            let pg = PageNumber::new(raw).unwrap();
+            let is_map = is_ptrmap_page(pg, usable, page_size);
+            // Ptrmap pages sit exactly at the periodic positions 2, 2+G, 2+2G...
+            assert_eq!(is_map, (raw - 2) % group == 0, "is_ptrmap_page wrong at {raw}");
+
+            match ptrmap_page_for(pg, usable, page_size) {
+                None => {
+                    // Only ptrmap pages themselves (and pages < 3) lack a parent map.
+                    assert!(is_map || raw < 3, "page {raw} unexpectedly has no ptrmap page");
+                }
+                Some(q) => {
+                    assert!(!is_map, "ptrmap page {raw} must not map to another");
+                    assert!(
+                        is_ptrmap_page(q, usable, page_size),
+                        "page {raw} maps to non-ptrmap {q:?}"
+                    );
+                    assert!(q.get() < raw, "ptrmap page {q:?} must precede {raw}");
+                    assert!(raw - q.get() <= group, "page {raw} lies outside its group {q:?}");
+                    // The entry is densely packed and fits on the ptrmap page.
+                    let off = ptrmap_entry_offset(pg, usable, page_size).expect("entry offset");
+                    assert_eq!(
+                        off,
+                        (raw - q.get() - 1) * PTRMAP_ENTRY_SIZE_BYTES,
+                        "entry offset wrong at {raw}"
+                    );
+                    assert!(off < usable, "entry offset {off} past usable {usable}");
+                }
+            }
+        }
     }
 }

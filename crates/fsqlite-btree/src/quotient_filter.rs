@@ -399,6 +399,23 @@ mod tests {
     }
 
     #[test]
+    fn hash_rowid_is_deterministic_and_distinguishes_distinct_rowids() {
+        // hash_rowid is used as a black box throughout the filter tests, but its
+        // own contract is never pinned: it must be deterministic (same rowid ->
+        // same hash, which the insert/contains pairing depends on) and map
+        // distinct rowids to distinct hashes for a normal working set.
+        assert_eq!(hash_rowid(42), hash_rowid(42));
+        assert_eq!(hash_rowid(-1), hash_rowid(-1));
+        assert_eq!(hash_rowid(0), hash_rowid(0));
+
+        // Distinct rowids (including negatives) hash to distinct values.
+        let mut seen = std::collections::HashSet::new();
+        for r in -50_i64..=50 {
+            assert!(seen.insert(hash_rowid(r)), "hash collision for rowid {r}");
+        }
+    }
+
+    #[test]
     fn empty_contains_nothing() {
         let qf = QuotientFilter::new(8, 8).unwrap();
         for h in 0..1000u64 {
@@ -487,6 +504,31 @@ mod tests {
         assert!(
             observed <= theoretical * 6.0 + 1e-3,
             "FP rate too high: observed={observed}, theoretical={theoretical}"
+        );
+    }
+
+    #[test]
+    fn theoretical_fp_rate_is_load_factor_over_two_pow_r() {
+        // theoretical_fp_rate = load_factor / 2^r_bits (Bender 3). The existing
+        // fp_rate test only uses it as an inequality bound; this pins the exact
+        // formula -- crucially that the denominator is 2^r_bits, not 2^q_bits --
+        // plus the empty-filter zero.
+        let mut qf = QuotientFilter::new(4, 8).expect("valid bit sizes");
+        assert_eq!(qf.r_bits(), 8);
+
+        // Empty: zero load -> zero theoretical fp rate.
+        assert!((qf.theoretical_fp_rate() - 0.0).abs() < f64::EPSILON);
+
+        // After a few distinct inserts the rate equals load_factor / 2^r_bits.
+        for h in [0x1111_u64, 0x2222, 0x3333, 0x4444] {
+            let _ = qf.insert(h);
+        }
+        let two_pow_r = (1u64 << qf.r_bits()) as f64; // 2^8 = 256, NOT 2^q (16)
+        let expected = qf.load_factor() / two_pow_r;
+        assert!((qf.theoretical_fp_rate() - expected).abs() < 1e-12);
+        assert!(
+            qf.theoretical_fp_rate() > 0.0,
+            "a non-empty filter has a positive theoretical fp rate"
         );
     }
 

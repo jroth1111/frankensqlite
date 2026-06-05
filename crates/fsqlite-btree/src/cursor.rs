@@ -1343,13 +1343,14 @@ pub enum TableLeafDeleteRunDelete {
 ///
 /// The run owns one table-leaf image and accepts only deletes that cannot
 /// require parent separator repair, overflow-chain cleanup, or structural
-/// rebalance. Unsupported rowids return `Ok(false)` so callers can flush and
+/// rebalance. Unsupported rowids return a miss reason so callers can flush and
 /// fall back to the ordinary cursor delete path.
 #[derive(Debug, Clone)]
 pub struct TableLeafDeleteRun {
     entry: StackEntry,
     tree_depth: usize,
     dirty: bool,
+    compact_cell_area: bool,
     profile_delete_leaf_run: bool,
     deleted_cell_indices: SmallVec<[u16; 16]>,
 }
@@ -1430,11 +1431,11 @@ impl TableLeafDeleteRun {
         }
         let has_compact_cell_area = if self.profile_delete_leaf_run {
             let compact_check_start = Some(std::time::Instant::now());
-            let has_compact_cell_area = self.has_compact_cell_area(usable_size);
+            let has_compact_cell_area = self.compact_cell_area;
             instrumentation::record_delete_leaf_run_compact_check(compact_check_start);
             has_compact_cell_area
         } else {
-            self.has_compact_cell_area(usable_size)
+            self.compact_cell_area
         };
         if !has_compact_cell_area {
             return Ok(TableLeafDeleteRunDelete::Miss(
@@ -1500,16 +1501,19 @@ impl TableLeafDeleteRun {
     }
 
     fn has_compact_cell_area(&self, usable_size: u32) -> bool {
-        self.entry.header.first_freeblock == 0
-            && self.entry.header.fragmented_free_bytes == 0
-            && self
-                .entry
+        Self::has_compact_cell_area_for_entry(&self.entry, usable_size)
+    }
+
+    fn has_compact_cell_area_for_entry(entry: &StackEntry, usable_size: u32) -> bool {
+        entry.header.first_freeblock == 0
+            && entry.header.fragmented_free_bytes == 0
+            && entry
                 .cell_pointers
                 .iter()
                 .copied()
                 .min()
                 .is_some_and(|min_ptr| {
-                    usize::from(min_ptr) == self.entry.header.content_offset(usable_size)
+                    usize::from(min_ptr) == entry.header.content_offset(usable_size)
                 })
     }
 
@@ -2502,6 +2506,25 @@ impl<P: PageReader> BtCursor<P> {
             return None;
         }
         self.stack.last().map(|entry| entry.page_no)
+    }
+
+    /// Return the cursor's current root-to-leaf page path, excluding the root.
+    ///
+    /// Callers that already know the table root can append this slice to their
+    /// own root entry to cover the whole cursor path without double-counting
+    /// root-only trees.
+    #[must_use]
+    pub fn current_page_path(&self) -> Vec<PageNumber> {
+        self.stack
+            .iter()
+            .filter_map(|entry| {
+                if entry.page_no == self.root_page {
+                    None
+                } else {
+                    Some(entry.page_no)
+                }
+            })
+            .collect()
     }
 
     /// Advance a table cursor to `rowid`, reusing local leaf state when possible.
@@ -9175,6 +9198,10 @@ impl<P: PageWriter> BtCursor<P> {
             entry: entry.clone(),
             tree_depth,
             dirty: false,
+            compact_cell_area: TableLeafDeleteRun::has_compact_cell_area_for_entry(
+                entry,
+                self.usable_size,
+            ),
             profile_delete_leaf_run: instrumentation::copy_profile_enabled(),
             deleted_cell_indices: SmallVec::new(),
         }))
@@ -9187,6 +9214,7 @@ impl<P: PageWriter> BtCursor<P> {
         cx: &Cx,
         run: TableLeafPayloadPatchRun,
     ) -> Result<()> {
+        observe_cursor_cancellation(cx)?;
         let (leaf_page, page_data) = run.into_page();
         self.pager.write_page_data(cx, leaf_page, page_data)?;
         self.stack.clear();
@@ -17500,6 +17528,50 @@ mod tests {
     }
 
     #[test]
+    fn test_table_leaf_delete_run_handles_out_of_order_duplicate_checks() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        let payloads: Vec<(i64, Vec<u8>)> = (1_i64..=20_i64)
+            .map(|rowid| (rowid, format!("payload-{rowid:02}").into_bytes()))
+            .collect();
+
+        for (rowid, payload) in &payloads {
+            cursor.table_insert(&cx, *rowid, payload).unwrap();
+        }
+        assert!(cursor.table_move_to(&cx, 9).unwrap().is_found());
+        let mut run = cursor
+            .table_leaf_delete_run_current(9)
+            .unwrap()
+            .expect("positioned root leaf should admit a delete run");
+
+        for rowid in [9_i64, 3, 11] {
+            assert_eq!(
+                run.delete_rowid_with_reason(&cx, rowid, USABLE).unwrap(),
+                TableLeafDeleteRunDelete::Deleted,
+                "delete run should accept out-of-order root-leaf rowid {rowid}"
+            );
+        }
+        assert_eq!(
+            run.delete_rowid_with_reason(&cx, 9, USABLE).unwrap(),
+            TableLeafDeleteRunDelete::Miss(TableLeafDeleteRunMissReason::AlreadyDeleted),
+            "out-of-order delete run must still detect duplicate rowids"
+        );
+        cursor.flush_table_leaf_delete_run(&cx, run).unwrap();
+
+        for (rowid, payload) in &payloads {
+            let found = cursor.table_move_to(&cx, *rowid).unwrap().is_found();
+            if [3_i64, 9, 11].contains(rowid) {
+                assert!(!found, "deleted rowid {rowid} should be absent");
+            } else {
+                assert!(found, "surviving rowid {rowid} should remain reachable");
+                assert_eq!(cursor.payload(&cx).unwrap().as_slice(), payload.as_slice());
+            }
+        }
+    }
+
+    #[test]
     fn test_table_leaf_delete_run_defragments_large_root_leaf_delete_set() {
         let cx = Cx::new();
         let root = pn(2);
@@ -17560,6 +17632,34 @@ mod tests {
         assert!(
             cursor.table_leaf_delete_run_current(10).unwrap().is_none(),
             "non-root leaf maximum deletion must use the ordinary path so the parent separator is repaired"
+        );
+    }
+
+    #[test]
+    fn test_table_leaf_delete_run_honors_cancelled_context_before_search() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        for rowid in 1_i64..=8 {
+            cursor.table_insert(&cx, rowid, b"payload").unwrap();
+        }
+
+        assert!(cursor.table_move_to(&cx, 3).unwrap().is_found());
+        let mut run = cursor
+            .table_leaf_delete_run_current(3)
+            .unwrap()
+            .expect("positioned root leaf should admit a delete run");
+
+        let cancelled_cx = Cx::new();
+        cancelled_cx.transition_to_running();
+        cancelled_cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
+
+        let err = run.delete_rowid(&cancelled_cx, 3, USABLE).unwrap_err();
+        assert!(matches!(err, FrankenError::Abort));
+        assert!(
+            !run.is_dirty(),
+            "cancelled delete-run search must not stage a deletion"
         );
     }
 

@@ -291,6 +291,54 @@ mod tests {
     }
 
     #[test]
+    fn test_swiss_index_remove_absent_returns_none_and_values_yields_remaining() {
+        // basic_ops covers remove of a present key (Some) and contains_key; this
+        // pins remove returning None for an absent key (a no-op leaving the map
+        // intact) and for an already-removed key, plus values() content.
+        let mut map: SwissIndex<&str, i32> = SwissIndex::new();
+        map.insert("a", 1);
+        map.insert("b", 2);
+
+        // Removing a never-inserted key is a None no-op; length is unchanged.
+        assert_eq!(map.remove("missing"), None);
+        assert_eq!(map.len(), 2);
+
+        // Removing a present key returns its value and shrinks the map; a second
+        // remove of the same key now returns None.
+        assert_eq!(map.remove("a"), Some(1));
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.remove("a"), None);
+
+        // values() yields exactly the remaining values.
+        let mut vals: Vec<i32> = map.values().copied().collect();
+        vals.sort_unstable();
+        assert_eq!(vals, vec![2]);
+    }
+
+    #[test]
+    fn test_swiss_index_get_mut_clear_and_insert_returns_old() {
+        let mut map: SwissIndex<&str, i32> = SwissIndex::new();
+
+        // insert returns the previously stored value (None on first insert).
+        assert_eq!(map.insert("k", 1), None);
+        assert_eq!(map.insert("k", 2), Some(1));
+        assert_eq!(map.get("k"), Some(&2));
+
+        // get_mut mutates the stored value in place; absent keys yield None.
+        *map.get_mut("k").unwrap() += 40;
+        assert_eq!(map.get("k"), Some(&42));
+        assert!(map.get_mut("absent").is_none());
+
+        // clear empties the map.
+        map.insert("k2", 7);
+        assert_eq!(map.len(), 2);
+        map.clear();
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
+        assert!(map.get("k").is_none());
+    }
+
+    #[test]
     fn test_swiss_index_capacity_and_load_factor() {
         let mut map = SwissIndex::with_capacity(100);
         assert_eq!(map.load_factor_milli(), 0);

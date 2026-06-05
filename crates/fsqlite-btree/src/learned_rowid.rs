@@ -468,6 +468,29 @@ mod tests {
     }
 
     #[test]
+    fn predict_radius_is_global_and_page_range_matches_predict() {
+        // predict returns (center, radius); the radius is the GLOBAL conformal
+        // radius (== radius()), identical for every rowid -- not recomputed per
+        // query. page_range is exactly [center - radius, center + radius]
+        // (saturating). page_range_contains_predict_center only checks
+        // containment, not these equalities.
+        let obs = synthetic_dense(1_000, 50);
+        let idx = LearnedRowIdIndex::fit(&obs, 0.1);
+        let r = idx.radius();
+
+        for rowid in [0_i64, 137, 499, 999] {
+            let (center, pred_radius) = idx.predict(rowid);
+            // predict reports the same global radius regardless of rowid.
+            assert_eq!(pred_radius, r);
+
+            // page_range is exactly center +/- radius, saturating at u32 bounds.
+            let range = idx.page_range(rowid);
+            assert_eq!(*range.start(), center.saturating_sub(r));
+            assert_eq!(*range.end(), center.saturating_add(r));
+        }
+    }
+
+    #[test]
     fn alpha_clamped_out_of_range() {
         let obs = synthetic_dense(1_000, 50);
         let a = LearnedRowIdIndex::fit(&obs, -1.0);

@@ -436,6 +436,34 @@ mod tests {
     }
 
     #[test]
+    fn avg_segment_size_and_is_fully_sorted_metrics() {
+        // avg_segment_size = len / (num_cracks + 1): a fresh column is a single
+        // segment, and cracking shrinks the average. is_fully_sorted is a pure
+        // ascending-order check. Neither metric was directly tested.
+
+        // Empty column: zero average, vacuously sorted.
+        let empty: CrackedColumn<i32> = CrackedColumn::new(vec![]);
+        assert!((empty.avg_segment_size() - 0.0).abs() < f64::EPSILON);
+        assert!(empty.is_fully_sorted());
+
+        // A pre-sorted column reports fully sorted even before any cracking.
+        let sorted = CrackedColumn::new(vec![1_i32, 2, 3, 4]);
+        assert!(sorted.is_fully_sorted());
+
+        // Unsorted fresh column: a single segment (avg == len), not yet sorted.
+        let mut col = CrackedColumn::new(vec![5_i32, 1, 4, 2, 8, 3, 7, 6]);
+        assert_eq!(col.num_cracks(), 0);
+        assert!((col.avg_segment_size() - 8.0).abs() < f64::EPSILON);
+        assert!(!col.is_fully_sorted());
+
+        // A range query cracks the column into more segments, dropping the
+        // average segment size below the full length.
+        let _ = col.range_query(3, 6);
+        assert!(col.num_cracks() > 0);
+        assert!(col.avg_segment_size() < 8.0);
+    }
+
+    #[test]
     fn partition_functions() {
         let mut data = vec![5, 3, 8, 1, 7, 2];
         let p = partition_lower(&mut data, 5);
@@ -446,5 +474,55 @@ mod tests {
         let p2 = partition_upper(&mut data2, 5);
         assert!(data2[..p2].iter().all(|&x| x <= 5));
         assert!(data2[p2..].iter().all(|&x| x > 5));
+    }
+
+    #[test]
+    fn partition_lower_and_upper_count_pivot_equal_elements_correctly() {
+        // partition_functions checks the partition invariant but not the exact
+        // returned count, nor the lower-vs-upper boundary: partition_lower sends
+        // pivot-equal elements to the upper side (strictly <), while
+        // partition_upper keeps them on the lower side (<=). With three 5s and a
+        // lone 8, lower counts only {3,1} and upper counts everything but 8.
+        let mut lower = vec![5, 3, 8, 5, 1, 5];
+        assert_eq!(partition_lower(&mut lower, 5), 2, "only 3 and 1 are strictly < 5");
+
+        let mut upper = vec![5, 3, 8, 5, 1, 5];
+        assert_eq!(partition_upper(&mut upper, 5), 5, "everything except the lone 8 is <= 5");
+
+        // Edge cases on partition_lower: all-below, none-below, and empty.
+        assert_eq!(partition_lower(&mut vec![1, 2, 3], 5), 3);
+        assert_eq!(partition_lower(&mut vec![5, 6, 7], 5), 0);
+        assert_eq!(partition_lower(&mut Vec::<i32>::new(), 5), 0);
+    }
+
+    #[test]
+    fn cracking_preserves_permutation_and_answers_every_range() {
+        // Database cracking only REORGANIZES the column; after any sequence of
+        // queries it must stay a permutation of the original (no element lost
+        // or duplicated), and every range query must return exactly the in-range
+        // elements -- including with duplicates and degenerate single-value ranges.
+        let original: Vec<i32> = vec![9, 3, 7, 1, 5, 2, 8, 4, 6, 0, 9, 5, 1, 7, 3];
+        let mut col = CrackedColumn::new(original.clone());
+
+        let mut expected_sorted = original.clone();
+        expected_sorted.sort_unstable();
+
+        for (lo, hi) in [(3, 6), (0, 2), (5, 9), (1, 1), (7, 7), (0, 9), (4, 8), (2, 5)] {
+            let mut got: Vec<i32> = col.range_query(lo, hi).to_vec();
+            got.sort_unstable();
+            let mut want: Vec<i32> = original
+                .iter()
+                .copied()
+                .filter(|x| (lo..=hi).contains(x))
+                .collect();
+            want.sort_unstable();
+            assert_eq!(got, want, "range_query({lo},{hi}) returned the wrong set");
+        }
+
+        // The column is still a permutation of the original.
+        let mut after: Vec<i32> = col.full_scan().to_vec();
+        after.sort_unstable();
+        assert_eq!(after, expected_sorted, "cracking must preserve the multiset");
+        assert_eq!(col.len(), original.len());
     }
 }

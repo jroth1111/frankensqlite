@@ -199,6 +199,24 @@ mod tests {
     }
 
     #[test]
+    fn column_count_reflects_base_width_and_is_stable_under_updates() {
+        // column_count is the base row width; applying deltas (which only
+        // overwrite existing columns) must never change it. No existing test
+        // exercises column_count directly.
+        let base = base_row(3);
+        let mut chain = HotRowDeltaChain::new(base);
+        assert_eq!(chain.column_count(), 3);
+
+        apply_update(&mut chain, 1, SqliteValue::Integer(42));
+        apply_update(&mut chain, 1, SqliteValue::Integer(43));
+        apply_update(&mut chain, 2, SqliteValue::Integer(7));
+
+        // Three deltas applied, but the logical row is still 3 columns wide.
+        assert_eq!(chain.column_count(), 3);
+        assert_eq!(chain.depth, 3);
+    }
+
+    #[test]
     fn single_update_visible_in_materialize() {
         let base = base_row(3);
         let mut chain = HotRowDeltaChain::new(Arc::clone(&base));

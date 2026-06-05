@@ -389,6 +389,31 @@ mod tests {
     }
 
     #[test]
+    fn load_page_returns_true_only_on_first_cold_to_hot_transition() {
+        // load_page is documented to return true only when it performs the
+        // COLD -> HOT transition, and false when the page is already HOT or is
+        // re-heated from COOLING. No test pinned this return value.
+        let csm = CoolingStateMachine::new(CoolingConfig::default());
+        csm.register_page(1);
+
+        // First load performs COLD -> HOT and reports the transition.
+        assert!(csm.load_page(1, 0x1000));
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Hot));
+
+        // Cool the page (an idle HOT page cools under the default config).
+        csm.run_cooling_scan();
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cooling));
+
+        // Loading a COOLING page re-heats it to HOT but returns false: there was
+        // no fresh COLD -> HOT transition.
+        assert!(!csm.load_page(1, 0x2000));
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Hot));
+
+        // Loading an already-HOT page also returns false.
+        assert!(!csm.load_page(1, 0x3000));
+    }
+
+    #[test]
     fn re_heat_on_access() {
         let csm = CoolingStateMachine::new(CoolingConfig {
             cooling_threshold: 2,
@@ -403,6 +428,28 @@ mod tests {
         // Access → re-heat.
         csm.access_page(1);
         assert_eq!(csm.temperature(1), Some(PageTemperature::Hot));
+    }
+
+    #[test]
+    fn access_page_is_noop_for_unregistered_and_does_not_reheat_cold() {
+        // re_heat_on_access pins the COOLING -> HOT re-heat; this pins the other
+        // two access_page behaviors: an unregistered page is a safe no-op (not
+        // implicitly registered), and a COLD page is not re-heated (only COOLING
+        // re-heats).
+        let csm = CoolingStateMachine::new(CoolingConfig::default());
+
+        // Accessing an unregistered page does not register it; tracked count
+        // stays zero and the page has no temperature.
+        csm.access_page(999);
+        assert_eq!(csm.tracked_count(), 0);
+        assert_eq!(csm.temperature(999), None);
+
+        // A registered-but-COLD page is not re-heated by an access: only a
+        // COOLING page re-heats, so it stays COLD.
+        csm.register_page(1);
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cold));
+        csm.access_page(1);
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cold));
     }
 
     #[test]
@@ -440,5 +487,142 @@ mod tests {
 
         let err = csm.evict_page(1).unwrap_err();
         assert_eq!(err, "page is a pinned root");
+    }
+
+    #[test]
+    fn evict_page_distinguishes_unregistered_from_already_cold() {
+        // cannot_evict_hot_page / cannot_evict_pinned_root pin the HOT and
+        // pinned rejections; the COLD and unregistered rejections (distinct
+        // messages) were not pinned by message.
+        let csm = CoolingStateMachine::new(CoolingConfig::default());
+
+        // A page that was never registered.
+        assert_eq!(csm.evict_page(99).unwrap_err(), "page not registered");
+
+        // A freshly-registered page is COLD; evicting it reports the distinct
+        // already-cold reason rather than "page not registered".
+        csm.register_page(1);
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cold));
+        assert_eq!(csm.evict_page(1).unwrap_err(), "page is already COLD");
+
+        // After a full load -> cool -> evict cycle the page is COLD again, so a
+        // second evict reports already-cold instead of succeeding twice.
+        csm.load_page(1, 0x1000);
+        csm.run_cooling_scan();
+        csm.evict_page(1).expect("a cooling page should evict");
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cold));
+        assert_eq!(csm.evict_page(1).unwrap_err(), "page is already COLD");
+    }
+
+    #[test]
+    fn run_cooling_scan_keeps_frequently_accessed_hot_pages_hot() {
+        // A HOT page is cooled only when access_count < cooling_threshold. A
+        // page accessed up to the threshold within the interval must stay HOT
+        // (the anti-thrash property) and not be counted as cooled. The existing
+        // scan tests only cool idle pages; the >= threshold branch was untested.
+        let csm = CoolingStateMachine::new(CoolingConfig {
+            cooling_threshold: 3,
+        });
+        csm.register_page(1);
+        csm.load_page(1, 0x1000); // COLD -> HOT, access_count = 1
+        csm.access_page(1); // access_count = 2
+        csm.access_page(1); // access_count = 3 (== threshold)
+
+        let result = csm.run_cooling_scan();
+        // access_count (3) is NOT < threshold (3), so the page stays HOT.
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Hot));
+        assert_eq!(result.pages_cooled, 0);
+        assert_eq!(result.pages_scanned, 1);
+
+        // The scan reset the access counter, so the next (idle) scan cools it.
+        let result2 = csm.run_cooling_scan();
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cooling));
+        assert_eq!(result2.pages_cooled, 1);
+    }
+
+    #[test]
+    fn cooling_tracker_counts_frame_addr_and_multi_page_scan() {
+        let csm = CoolingStateMachine::new(CoolingConfig::default());
+
+        // Two ordinary loaded pages (-> Hot) plus one pinned root (-> Hot).
+        csm.register_page(1);
+        csm.load_page(1, 0x1000);
+        csm.register_page(2);
+        csm.load_page(2, 0x2000);
+        csm.pin_root(3);
+        csm.load_page(3, 0x3000);
+
+        assert_eq!(csm.tracked_count(), 3);
+        assert_eq!(csm.pinned_count(), 1);
+        assert!(csm.is_pinned(3) && !csm.is_pinned(1));
+
+        // frame_addr reports the loaded address; an unregistered page has none.
+        assert_eq!(csm.frame_addr(1), Some(0x1000));
+        assert_eq!(csm.frame_addr(2), Some(0x2000));
+        assert!(csm.temperature(999).is_none(), "unregistered page has no temperature");
+
+        // One scan cools both unpinned pages; the pinned root stays Hot.
+        let result = csm.run_cooling_scan();
+        assert_eq!(result.pages_cooled, 2, "two unpinned pages cool; the pinned root does not");
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cooling));
+        assert_eq!(csm.temperature(2), Some(PageTemperature::Cooling));
+        assert_eq!(csm.temperature(3), Some(PageTemperature::Hot));
+
+        // A cooled page is now evictable; the pinned root is not.
+        assert!(csm.evict_page(1).is_ok());
+        assert!(csm.evict_page(3).is_err());
+    }
+
+    #[test]
+    fn frame_addr_is_none_for_cold_and_unregistered_pages() {
+        // frame_addr reports the address only for Hot/Cooling pages. The
+        // cooling_tracker test only checks the Hot case; this pins the None
+        // branches and that eviction clears the frame address.
+        let csm = CoolingStateMachine::new(CoolingConfig::default());
+
+        // Unregistered page: no frame address.
+        assert_eq!(csm.frame_addr(99), None);
+
+        // Freshly registered page is COLD -> no frame address yet.
+        csm.register_page(1);
+        assert_eq!(csm.frame_addr(1), None);
+
+        // Loaded page is HOT -> reports its frame address.
+        csm.load_page(1, 0x1000);
+        assert_eq!(csm.frame_addr(1), Some(0x1000));
+
+        // Still reported while COOLING (the frame stays resident).
+        csm.run_cooling_scan();
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cooling));
+        assert_eq!(csm.frame_addr(1), Some(0x1000));
+
+        // After eviction (COOLING -> COLD) the frame address is cleared.
+        csm.evict_page(1).expect("a cooling page evicts");
+        assert_eq!(csm.frame_addr(1), None);
+    }
+
+    #[test]
+    fn temperature_counts_buckets_pages_by_thermal_state() {
+        // temperature_counts is only exercised via the Debug impl; pin that it
+        // tallies one page into each of hot/cooling/cold and that the buckets
+        // sum to the tracked count. Set up one page per state.
+        let csm = CoolingStateMachine::new(CoolingConfig::default());
+        csm.register_page(1);
+        csm.register_page(2);
+        csm.register_page(3); // stays COLD (never loaded)
+
+        csm.load_page(1, 0x1000); // -> HOT
+        csm.load_page(2, 0x2000); // -> HOT
+        csm.run_cooling_scan(); // pages 1 and 2 -> COOLING
+        csm.load_page(1, 0x1000); // re-heat page 1 -> HOT, leaving page 2 COOLING
+
+        let counts = csm.temperature_counts();
+        assert_eq!(counts.hot, 1);
+        assert_eq!(counts.cooling, 1);
+        assert_eq!(counts.cold, 1);
+        assert_eq!(
+            counts.hot + counts.cooling + counts.cold,
+            csm.tracked_count()
+        );
     }
 }

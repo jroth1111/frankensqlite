@@ -381,6 +381,40 @@ mod tests {
     }
 
     #[test]
+    fn swizzle_ptr_round_trips_boundary_values() {
+        // The round-trip tests use small values (42, 0x1000) and the overflow
+        // test rejects MAX_PAGE_ID + 1; this pins the accepted boundaries: page
+        // id 0, the largest valid page id (MAX_PAGE_ID), and the largest aligned
+        // frame address (all bits set except the tag bit).
+        let zero = SwizzlePtr::new_unswizzled(0).expect("zero page id encodes");
+        assert_eq!(
+            zero.state(Ordering::Acquire),
+            SwizzleState::Unswizzled { page_id: 0 }
+        );
+        assert!(!zero.is_swizzled(Ordering::Acquire));
+
+        let max = SwizzlePtr::new_unswizzled(MAX_PAGE_ID).expect("max page id encodes");
+        assert_eq!(
+            max.state(Ordering::Acquire),
+            SwizzleState::Unswizzled {
+                page_id: MAX_PAGE_ID
+            }
+        );
+        assert!(!max.is_swizzled(Ordering::Acquire));
+
+        // Largest aligned frame address: all bits set except the tag bit.
+        let top_frame = !SWIZZLED_TAG;
+        let swz = SwizzlePtr::new_swizzled(top_frame).expect("aligned top frame encodes");
+        assert_eq!(
+            swz.state(Ordering::Acquire),
+            SwizzleState::Swizzled {
+                frame_addr: top_frame
+            }
+        );
+        assert!(swz.is_swizzled(Ordering::Acquire));
+    }
+
+    #[test]
     fn unaligned_frame_address_is_rejected() {
         let err = SwizzlePtr::new_swizzled(0x1001).expect_err("must reject unaligned frame addr");
         assert_eq!(
@@ -430,6 +464,30 @@ mod tests {
     }
 
     #[test]
+    fn try_unswizzle_reports_observed_state_on_compare_exchange_failure() {
+        // Symmetric to try_swizzle_reports_observed_state_on_compare_exchange_
+        // failure, which was the only CAS-failure path tested. A pointer
+        // swizzled to 0x4000 rejects an unswizzle that expects a different frame
+        // address (0x5000), reporting the encoded expected vs observed words,
+        // and the pointer is left unchanged.
+        let ptr = SwizzlePtr::new_swizzled(0x4000).expect("aligned frame address should encode");
+        let err = ptr
+            .try_unswizzle(0x5000, 77)
+            .expect_err("mismatched expected frame addr must fail");
+        let expected = 0x5000_u64 | SWIZZLED_TAG;
+        let observed = 0x4000_u64 | SWIZZLED_TAG;
+        assert_eq!(
+            err,
+            SwizzleError::CompareExchangeFailed { expected, observed }
+        );
+        // A failed CAS must leave the pointer untouched.
+        assert_eq!(
+            ptr.state(Ordering::Acquire),
+            SwizzleState::Swizzled { frame_addr: 0x4000 }
+        );
+    }
+
+    #[test]
     fn temperature_state_machine_transitions_match_design_contract() {
         assert!(
             PageTemperature::Hot
@@ -458,6 +516,42 @@ mod tests {
                 to: PageTemperature::Cold,
             },
             "bead_id={BEAD_ID} case=reject_hot_to_cold"
+        );
+    }
+
+    #[test]
+    fn can_transition_to_covers_full_temperature_matrix() {
+        use PageTemperature::{Cold, Cooling, Hot};
+        // Complete the 3x3 transition matrix. temperature_state_machine_
+        // transitions_match_design_contract covers Hot->Cooling, Cooling->Cold,
+        // Cold->Hot, and the Hot->Cold rejection; the self-transitions,
+        // Cooling->Hot, and the Cold->Cooling rejection were unpinned.
+
+        // Self-transitions are always allowed (idempotent re-assertion of state).
+        assert!(Hot.can_transition_to(Hot));
+        assert!(Cooling.can_transition_to(Cooling));
+        assert!(Cold.can_transition_to(Cold));
+
+        // The remaining allowed edges.
+        assert!(Hot.can_transition_to(Cooling));
+        assert!(Cooling.can_transition_to(Hot));
+        assert!(Cooling.can_transition_to(Cold));
+        assert!(Cold.can_transition_to(Hot));
+
+        // The two forbidden edges: Hot cannot skip straight to Cold, and Cold
+        // cannot reheat directly to Cooling.
+        assert!(!Hot.can_transition_to(Cold));
+        assert!(!Cold.can_transition_to(Cooling));
+
+        // transition() surfaces the precise error for the previously-unpinned
+        // Cold->Cooling rejection.
+        assert_eq!(
+            Cold.transition(Cooling)
+                .expect_err("cold_to_cooling must be invalid"),
+            SwizzleError::InvalidTemperatureTransition {
+                from: Cold,
+                to: Cooling,
+            }
         );
     }
 

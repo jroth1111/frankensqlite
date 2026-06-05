@@ -1048,6 +1048,53 @@ mod tests {
     }
 
     #[test]
+    fn test_content_offset_resolves_sentinel_and_empty_page() {
+        // content_offset() is the resolver used on every page load. It clamps
+        // both the empty-page case and the "cell_content_offset == 0 means
+        // 65536" sentinel to usable_size, and otherwise returns the stored
+        // offset verbatim. test_page_header_content_offset_zero_means_65536 only
+        // checks the parse/write round-trip of the sentinel value; the resolver
+        // method itself was never invoked by a test.
+        let usable = 4096u32;
+
+        // Branch 1: an empty page (cell_count == 0) resolves to usable_size even
+        // when the stored offset is a normal in-range value.
+        let empty = BtreePageHeader {
+            page_type: BtreePageType::LeafTable,
+            first_freeblock: 0,
+            cell_count: 0,
+            cell_content_offset: 1234,
+            fragmented_free_bytes: 0,
+            right_child: None,
+        };
+        assert_eq!(empty.content_offset(usable), usable as usize);
+
+        // Branch 2: a non-empty page carrying the 65536 sentinel (on-disk 0)
+        // also resolves to usable_size.
+        let sentinel = BtreePageHeader {
+            page_type: BtreePageType::LeafTable,
+            first_freeblock: 0,
+            cell_count: 5,
+            cell_content_offset: 65536,
+            fragmented_free_bytes: 0,
+            right_child: None,
+        };
+        assert_eq!(sentinel.content_offset(usable), usable as usize);
+
+        // Branch 3: a non-empty page with a real in-range offset returns it
+        // unchanged.
+        let normal = BtreePageHeader {
+            page_type: BtreePageType::LeafTable,
+            first_freeblock: 0,
+            cell_count: 5,
+            cell_content_offset: 3800,
+            fragmented_free_bytes: 0,
+            right_child: None,
+        };
+        assert_eq!(normal.content_offset(usable), 3800);
+    }
+
+    #[test]
     fn test_page_header_invalid_type() {
         let mut page = vec![0u8; 4096];
         page[0] = 0xFF; // Invalid type.
@@ -1178,6 +1225,51 @@ mod tests {
         assert!(has_overflow(1500, 4096, BtreePageType::LeafIndex));
     }
 
+    #[test]
+    fn test_payload_overflow_threshold_and_clamp_across_page_sizes() {
+        // The SQLite payload thresholds must hold for every supported usable size,
+        // not just 4096. Hand-anchored conformance values (independently computed
+        // from the file-format formulas: table-leaf X = U-35; other X =
+        // (U-12)*64/255 - 23; M = (U-12)*32/255 - 23):
+        assert_eq!(max_local_payload(512, BtreePageType::LeafTable), 477);
+        assert_eq!(max_local_payload(1024, BtreePageType::LeafTable), 989);
+        assert_eq!(max_local_payload(65536, BtreePageType::LeafTable), 65_501);
+        assert_eq!(max_local_payload(512, BtreePageType::LeafIndex), 102);
+        assert_eq!(min_local_payload(512), 39);
+
+        for &usable in &[512u32, 1024, 4096, 65536] {
+            for &(page_type, label) in &[
+                (BtreePageType::LeafTable, "table-leaf"),
+                (BtreePageType::LeafIndex, "leaf-index"),
+            ] {
+                let max_local = max_local_payload(usable, page_type);
+                let min_local = min_local_payload(usable);
+                assert!(min_local < max_local, "U={usable} {label}: expect M < X");
+
+                // Exact overflow boundary: a payload of exactly X stays fully
+                // local; X+1 is the first size that overflows.
+                assert!(!has_overflow(max_local, usable, page_type), "U={usable} {label}");
+                assert!(has_overflow(max_local + 1, usable, page_type), "U={usable} {label}");
+                assert_eq!(
+                    local_payload_size(max_local, usable, page_type),
+                    max_local,
+                    "U={usable} {label}: payload == X must be entirely local"
+                );
+
+                // Overflowing payloads keep a local portion clamped to [M, X] and
+                // strictly smaller than the total payload.
+                for &payload in &[max_local + 1, max_local + 100, usable, usable * 4] {
+                    let local = local_payload_size(payload, usable, page_type);
+                    assert!(
+                        (min_local..=max_local).contains(&local),
+                        "U={usable} {label} P={payload}: local {local} not in [{min_local},{max_local}]"
+                    );
+                    assert!(local < payload, "U={usable} {label} P={payload}: overflow must spill");
+                }
+            }
+        }
+    }
+
     // -- Cell parsing tests --
 
     #[test]
@@ -1240,6 +1332,43 @@ mod tests {
         assert_eq!(cell.left_child.unwrap().get(), 7);
         assert_eq!(cell.rowid, Some(100));
         assert_eq!(cell.payload_size, 0);
+    }
+
+    #[test]
+    fn test_read_interior_left_child_parses_be_and_rejects_corruption() {
+        // Interior cells begin with a 4-byte big-endian left-child page number.
+        let mut page = vec![0u8; 16];
+        page[0..4].copy_from_slice(&42u32.to_be_bytes());
+        assert_eq!(
+            CellRef::read_interior_left_child(&page, 0).unwrap(),
+            PageNumber::new(42).unwrap()
+        );
+
+        // Big-endian byte order, read at a non-zero offset.
+        page[8..12].copy_from_slice(&256u32.to_be_bytes()); // 0x0000_0100
+        assert_eq!(
+            CellRef::read_interior_left_child(&page, 8).unwrap(),
+            PageNumber::new(256).unwrap()
+        );
+
+        // A zero left-child pointer is corruption (page 0 is not a valid pgno).
+        assert!(matches!(
+            CellRef::read_interior_left_child(&[0u8; 4], 0),
+            Err(FrankenError::DatabaseCorrupt { .. })
+        ));
+
+        // Reading past the end of the page is rejected (cell_offset + 4 > len).
+        assert!(matches!(
+            CellRef::read_interior_left_child(&[0u8, 0, 0], 0),
+            Err(FrankenError::DatabaseCorrupt { .. })
+        ));
+        assert!(
+            matches!(
+                CellRef::read_interior_left_child(&page, 13), // 13 + 4 = 17 > 16
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ),
+            "offset too close to the end must be rejected"
+        );
     }
 
     #[test]
@@ -1397,6 +1526,36 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_leaf_table_rowid_decodes_rowid_after_payload_size_varint() {
+        use fsqlite_types::serial_type::write_varint;
+
+        // Single-byte payload_size + single-byte rowid.
+        let mut page = vec![0u8; 64];
+        page[10] = 5; // payload_size varint (value < 128 -> 1 byte)
+        page[11] = 42; // rowid varint
+        assert_eq!(CellRef::parse_leaf_table_rowid(&page, 10).unwrap(), 42);
+
+        // Multi-byte payload_size: parse must skip the whole varint to find the rowid.
+        let mut page = vec![0u8; 64];
+        let off = 4;
+        let n = write_varint(&mut page[off..], 200u64); // payload_size = 200 (2-byte varint)
+        let _ = write_varint(&mut page[off + n..], 7u64); // rowid = 7
+        assert_eq!(CellRef::parse_leaf_table_rowid(&page, off).unwrap(), 7);
+
+        // Multi-byte rowid is decoded fully.
+        let mut page = vec![0u8; 64];
+        let n = write_varint(&mut page[0..], 5u64); // payload_size = 5
+        let _ = write_varint(&mut page[n..], 300u64); // rowid = 300 (2-byte varint)
+        assert_eq!(CellRef::parse_leaf_table_rowid(&page, 0).unwrap(), 300);
+
+        // A large rowid round-trips through the varint decode.
+        let mut page = vec![0u8; 64];
+        let n = write_varint(&mut page[0..], 1u64);
+        let _ = write_varint(&mut page[n..], 1_000_000_000u64);
+        assert_eq!(CellRef::parse_leaf_table_rowid(&page, 0).unwrap(), 1_000_000_000);
+    }
+
+    #[test]
     fn test_cellref_parse_reports_out_of_range_offset() {
         let page = vec![0u8; 16];
         let err = CellRef::parse(&page, 17, BtreePageType::LeafTable, 4096).unwrap_err();
@@ -1423,6 +1582,73 @@ mod tests {
             cell_on_page_size_fast(&page, cell_offset, BtreePageType::LeafTable, 4096).unwrap();
         assert_eq!(fast, expected);
         assert_eq!(fast, 1 + 1 + 10);
+    }
+
+    #[test]
+    fn test_cell_on_page_size_fast_interior_table_cell() {
+        use fsqlite_types::serial_type::write_varint;
+        // Interior-table cell layout: a 4-byte left-child page pointer followed
+        // by a rowid varint and NO payload. The existing fast-size tests only
+        // cover leaf-table cells; this exercises the InteriorTable early-return
+        // path, cross-checked against the CellRef-based size like its siblings.
+        let usable: u32 = 4096;
+        let mut page = vec![0u8; 4096];
+        let cell_offset = 100;
+        // 4-byte left child pointer.
+        page[cell_offset..cell_offset + 4].copy_from_slice(&7u32.to_be_bytes());
+        // rowid varint (300 -> 2 bytes).
+        let rowid_len = write_varint(&mut page[cell_offset + 4..], 300u64);
+
+        let cell =
+            CellRef::parse(&page, cell_offset, BtreePageType::InteriorTable, usable).unwrap();
+        let expected = crate::payload::cell_on_page_size(&cell, cell_offset);
+        let fast =
+            cell_on_page_size_fast(&page, cell_offset, BtreePageType::InteriorTable, usable)
+                .unwrap();
+        assert_eq!(fast, expected);
+        assert_eq!(
+            fast,
+            4 + rowid_len,
+            "interior-table cell size = 4-byte child pointer + rowid varint"
+        );
+    }
+
+    #[test]
+    fn test_cell_on_page_size_fast_index_cells_have_no_rowid() {
+        use fsqlite_types::serial_type::write_varint;
+        // Index cells (leaf or interior) carry a payload_size varint + payload
+        // but NO rowid, unlike table cells. Interior-index cells additionally
+        // have the 4-byte left-child prefix. The existing fast-size tests cover
+        // only leaf-table; pin the two index paths, cross-checked against the
+        // CellRef-based size. payload_size 10 is far below the index max-local
+        // threshold (~1002 at usable=4096), so the whole payload stays local.
+        let usable: u32 = 4096;
+
+        // Leaf-index cell: payload_size varint + payload, no child pointer.
+        let mut page = vec![0u8; 4096];
+        let off = 50;
+        let ps_len = write_varint(&mut page[off..], 10u64); // payload_size = 10
+        let cell = CellRef::parse(&page, off, BtreePageType::LeafIndex, usable).unwrap();
+        let expected = crate::payload::cell_on_page_size(&cell, off);
+        let fast = cell_on_page_size_fast(&page, off, BtreePageType::LeafIndex, usable).unwrap();
+        assert_eq!(fast, expected);
+        assert_eq!(fast, ps_len + 10, "leaf-index size = payload_size varint + payload");
+
+        // Interior-index cell: 4-byte left child + payload_size varint + payload.
+        let mut page = vec![0u8; 4096];
+        let off = 50;
+        page[off..off + 4].copy_from_slice(&9u32.to_be_bytes());
+        let ps_len = write_varint(&mut page[off + 4..], 10u64);
+        let cell = CellRef::parse(&page, off, BtreePageType::InteriorIndex, usable).unwrap();
+        let expected = crate::payload::cell_on_page_size(&cell, off);
+        let fast =
+            cell_on_page_size_fast(&page, off, BtreePageType::InteriorIndex, usable).unwrap();
+        assert_eq!(fast, expected);
+        assert_eq!(
+            fast,
+            4 + ps_len + 10,
+            "interior-index size = child pointer + payload_size varint + payload"
+        );
     }
 
     #[test]
