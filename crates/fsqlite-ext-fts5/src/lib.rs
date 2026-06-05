@@ -3,16 +3,22 @@
 //! Provides: tokenizer API (unicode61, ascii, porter, trigram), inverted index,
 //! boolean query parsing (implicit AND, OR, NOT binary-only, phrase, prefix,
 //! NEAR, column filter, caret), BM25 ranking, FTS5 virtual table with content
-//! modes, and secure-delete / contentless-delete configuration.
+//! modes, schema validation, and secure-delete / contentless-delete /
+//! contentless-unindexed / insttoken / locale blob / tokendata configuration.
 
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::ScalarFunction;
 use fsqlite_func::vtab::{
-    ColumnContext, IndexInfo, TransactionalVtabState, VirtualTable, VirtualTableCursor,
+    ColumnContext, IndexInfo, ShadowTablePolicy, TransactionalVtabState, VirtualTable,
+    VirtualTableCursor, VtabIntegrityPolicy, VtabLifecyclePolicy, VtabModuleMetadata,
+    VtabRiskLevel,
 };
 use fsqlite_types::cx::Cx;
+use fsqlite_types::serial_type::{read_varint, write_varint};
 use fsqlite_types::value::{SmallText, SqliteValue};
 use smallvec::SmallVec;
 use tracing::debug;
@@ -61,13 +67,2398 @@ impl std::fmt::Display for DetailMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::struct_field_names)]
+#[allow(clippy::struct_excessive_bools, clippy::struct_field_names)]
 pub struct Fts5Config {
     secure_delete: bool,
     content_mode: ContentMode,
     contentless_delete: bool,
+    contentless_unindexed: bool,
     columnsize: bool,
     detail: DetailMode,
+    insttoken: bool,
+    locale: bool,
+    tokendata: bool,
+}
+
+const FTS5_CONFIG_VERSION: i64 = 4;
+const FTS5_CONFIG_VERSION_SECURE_DELETE: i64 = 5;
+const FTS5_DEFAULT_PAGE_SIZE: i64 = 4050;
+const FTS5_MAX_PAGE_SIZE: i64 = 64 * 1024;
+const FTS5_DEFAULT_AUTOMERGE: i64 = 4;
+const FTS5_DEFAULT_USERMERGE: i64 = 4;
+const FTS5_DEFAULT_CRISISMERGE: i64 = 16;
+const FTS5_MAX_SEGMENT: i64 = 2000;
+const FTS5_MAX_SEGMENT_U64: u64 = 2000;
+const FTS5_DEFAULT_HASHSIZE: i64 = 1024 * 1024;
+const FTS5_DEFAULT_DELETE_AUTOMERGE: i64 = 10;
+pub const FTS5_AVERAGES_ROWID: i64 = 1;
+pub const FTS5_STRUCTURE_ROWID: i64 = 10;
+const FTS5_STRUCTURE_V2_MARKER: [u8; 4] = [0xFF, 0x00, 0x00, 0x01];
+const FTS5_DATA_ID_BITS: u64 = 16;
+const FTS5_DATA_DLI_BITS: u64 = 1;
+const FTS5_DATA_HEIGHT_BITS: u64 = 5;
+const FTS5_DATA_PAGE_BITS: u64 = 31;
+const FTS5_DATA_PAGE_MASK: u64 = (1 << FTS5_DATA_PAGE_BITS) - 1;
+const FTS5_DATA_HEIGHT_MASK: u64 = (1 << FTS5_DATA_HEIGHT_BITS) - 1;
+const FTS5_DATA_DLI_MASK: u64 = (1 << FTS5_DATA_DLI_BITS) - 1;
+const FTS5_DATA_ID_LIMIT: u64 = 1 << FTS5_DATA_ID_BITS;
+const FTS5_IDX_MAX_BTREE_PAGE: u32 = (1 << FTS5_DATA_PAGE_BITS) - 1;
+const FTS5_MAIN_PREFIX_BYTE: u8 = b'0';
+const FTS5_SEGMENT_CHECKSUM_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FTS5_SEGMENT_CHECKSUM_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fts5ConfigRecord {
+    pub key: String,
+    pub value: SqliteValue,
+}
+
+impl Fts5ConfigRecord {
+    #[must_use]
+    pub fn integer(key: impl Into<String>, value: i64) -> Self {
+        Self {
+            key: key.into(),
+            value: SqliteValue::Integer(value),
+        }
+    }
+
+    #[must_use]
+    pub fn text(key: impl Into<String>, value: impl Into<String> + AsRef<str>) -> Self {
+        Self {
+            key: key.into(),
+            value: SqliteValue::Text(SmallText::from_string(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5ContentRow {
+    pub rowid: i64,
+    pub values: Vec<String>,
+}
+
+impl Fts5ContentRow {
+    #[must_use]
+    pub fn new(rowid: i64, values: Vec<String>) -> Self {
+        Self { rowid, values }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5DocsizeRow {
+    pub rowid: i64,
+    pub column_token_counts: Vec<u32>,
+}
+
+impl Fts5DocsizeRow {
+    #[must_use]
+    pub fn new(rowid: i64, column_token_counts: Vec<u32>) -> Self {
+        Self {
+            rowid,
+            column_token_counts,
+        }
+    }
+
+    #[must_use]
+    pub fn total_tokens(&self) -> u32 {
+        self.column_token_counts.iter().copied().sum()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5DataRow {
+    pub id: i64,
+    pub block: Vec<u8>,
+}
+
+impl Fts5DataRow {
+    #[must_use]
+    pub fn new(id: i64, block: Vec<u8>) -> Self {
+        Self { id, block }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5AveragesRecord {
+    pub total_rows: u64,
+    pub column_token_totals: Vec<u64>,
+}
+
+impl Fts5AveragesRecord {
+    #[must_use]
+    pub fn new(total_rows: u64, column_token_totals: Vec<u64>) -> Self {
+        Self {
+            total_rows,
+            column_token_totals,
+        }
+    }
+
+    #[must_use]
+    pub fn from_docsize_rows(
+        total_rows: u64,
+        column_count: usize,
+        rows: &[Fts5DocsizeRow],
+    ) -> Self {
+        let mut column_token_totals = vec![0; column_count];
+        for row in rows {
+            for (column, count) in row
+                .column_token_counts
+                .iter()
+                .copied()
+                .take(column_count)
+                .enumerate()
+            {
+                column_token_totals[column] += u64::from(count);
+            }
+        }
+        Self {
+            total_rows,
+            column_token_totals,
+        }
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        if self.total_rows == 0 && self.column_token_totals.iter().all(|total| *total == 0) {
+            return Vec::new();
+        }
+
+        let mut block = Vec::with_capacity((self.column_token_totals.len() + 1) * 9);
+        fts5_push_varint(&mut block, self.total_rows);
+        for total in &self.column_token_totals {
+            fts5_push_varint(&mut block, *total);
+        }
+        block
+    }
+
+    pub fn decode(block: &[u8], column_count: usize) -> Result<Self> {
+        if block.is_empty() {
+            return Ok(Self {
+                total_rows: 0,
+                column_token_totals: vec![0; column_count],
+            });
+        }
+
+        let mut offset = 0;
+        let total_rows = fts5_read_varint(block, &mut offset, "averages row count")?;
+        let mut column_token_totals = vec![0; column_count];
+        for total in &mut column_token_totals {
+            if offset == block.len() {
+                break;
+            }
+            *total = fts5_read_varint(block, &mut offset, "averages column total")?;
+        }
+        if offset != block.len() {
+            return Err(fts5_data_error(
+                "trailing bytes after averages column totals",
+            ));
+        }
+
+        Ok(Self {
+            total_rows,
+            column_token_totals,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5StructureSegment {
+    pub segid: u32,
+    pub pgno_first: u32,
+    pub pgno_last: u32,
+    pub origin_lower: u64,
+    pub origin_upper: u64,
+    pub tombstone_page_count: u32,
+    pub tombstone_entry_count: u64,
+    pub entry_count: u64,
+}
+
+impl Fts5StructureSegment {
+    #[must_use]
+    pub const fn new(segid: u32, pgno_first: u32, pgno_last: u32) -> Self {
+        Self {
+            segid,
+            pgno_first,
+            pgno_last,
+            origin_lower: 0,
+            origin_upper: 0,
+            tombstone_page_count: 0,
+            tombstone_entry_count: 0,
+            entry_count: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_origin_tracking(
+        mut self,
+        origin_lower: u64,
+        origin_upper: u64,
+        tombstone_page_count: u32,
+        tombstone_entry_count: u64,
+        entry_count: u64,
+    ) -> Self {
+        self.origin_lower = origin_lower;
+        self.origin_upper = origin_upper;
+        self.tombstone_page_count = tombstone_page_count;
+        self.tombstone_entry_count = tombstone_entry_count;
+        self.entry_count = entry_count;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5StructureLevel {
+    pub merge_inputs: u32,
+    pub segments: Vec<Fts5StructureSegment>,
+}
+
+impl Fts5StructureLevel {
+    #[must_use]
+    pub fn new(merge_inputs: u32, segments: Vec<Fts5StructureSegment>) -> Self {
+        Self {
+            merge_inputs,
+            segments,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5StructureRecord {
+    pub cookie: u32,
+    pub write_counter: u64,
+    pub origin_counter: u64,
+    pub levels: Vec<Fts5StructureLevel>,
+}
+
+impl Fts5StructureRecord {
+    #[must_use]
+    pub fn empty_legacy(cookie: u32) -> Self {
+        Self {
+            cookie,
+            write_counter: 0,
+            origin_counter: 0,
+            levels: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn empty_with_origin_tracking(cookie: u32) -> Self {
+        Self {
+            cookie,
+            write_counter: 0,
+            origin_counter: 1,
+            levels: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn segment_count(&self) -> usize {
+        self.levels.iter().map(|level| level.segments.len()).sum()
+    }
+
+    #[must_use]
+    pub fn uses_origin_tracking(&self) -> bool {
+        self.origin_counter > 0
+            || self.levels.iter().any(|level| {
+                level.segments.iter().any(|segment| {
+                    segment.origin_lower != 0
+                        || segment.origin_upper != 0
+                        || segment.tombstone_page_count != 0
+                        || segment.tombstone_entry_count != 0
+                        || segment.entry_count != 0
+                })
+            })
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let use_origin_tracking = self.uses_origin_tracking();
+        let segment_count = self.segment_count();
+        let mut block = Vec::with_capacity(4 + usize::from(use_origin_tracking) * 4 + 27);
+
+        block.extend_from_slice(&self.cookie.to_be_bytes());
+        if use_origin_tracking {
+            block.extend_from_slice(&FTS5_STRUCTURE_V2_MARKER);
+        }
+        fts5_push_varint(
+            &mut block,
+            u64::try_from(self.levels.len()).unwrap_or(u64::MAX),
+        );
+        fts5_push_varint(&mut block, u64::try_from(segment_count).unwrap_or(u64::MAX));
+        fts5_push_varint(&mut block, self.write_counter);
+
+        for level in &self.levels {
+            fts5_push_varint(&mut block, u64::from(level.merge_inputs));
+            fts5_push_varint(&mut block, level.segments.len() as u64);
+            for segment in &level.segments {
+                fts5_push_varint(&mut block, u64::from(segment.segid));
+                fts5_push_varint(&mut block, u64::from(segment.pgno_first));
+                fts5_push_varint(&mut block, u64::from(segment.pgno_last));
+                if use_origin_tracking {
+                    fts5_push_varint(&mut block, segment.origin_lower);
+                    fts5_push_varint(&mut block, segment.origin_upper);
+                    fts5_push_varint(&mut block, u64::from(segment.tombstone_page_count));
+                    fts5_push_varint(&mut block, segment.tombstone_entry_count);
+                    fts5_push_varint(&mut block, segment.entry_count);
+                }
+            }
+        }
+
+        block
+    }
+
+    pub fn decode(block: &[u8]) -> Result<Self> {
+        if block.len() < 4 {
+            return Err(fts5_data_error("structure record missing cookie"));
+        }
+
+        let cookie = u32::from_be_bytes([block[0], block[1], block[2], block[3]]);
+        let mut offset = 4;
+        let use_origin_tracking = block
+            .get(offset..)
+            .is_some_and(|tail| tail.starts_with(&FTS5_STRUCTURE_V2_MARKER));
+        if use_origin_tracking {
+            offset += FTS5_STRUCTURE_V2_MARKER.len();
+        }
+
+        let level_count = fts5_read_bounded_usize(block, &mut offset, "structure level count")?;
+        let mut remaining_segments =
+            fts5_read_bounded_usize(block, &mut offset, "structure segment count")?;
+        let write_counter = fts5_read_varint(block, &mut offset, "structure write counter")?;
+        let mut levels = Vec::with_capacity(level_count);
+        let mut previous_level_merge_inputs = 0;
+        let mut max_origin_upper = 0;
+
+        for level_index in 0..level_count {
+            let merge_inputs = fts5_read_u32(block, &mut offset, "structure merge count")?;
+            let segment_total = fts5_read_bounded_usize(block, &mut offset, "level segment count")?;
+            let merge_inputs_usize = usize::try_from(merge_inputs).unwrap_or(usize::MAX);
+            if segment_total < merge_inputs_usize {
+                return Err(fts5_data_error("level merge count exceeds segment count"));
+            }
+            if remaining_segments < segment_total {
+                return Err(fts5_data_error("structure segment count underflow"));
+            }
+            remaining_segments -= segment_total;
+
+            let mut segments = Vec::with_capacity(segment_total);
+            for _ in 0..segment_total {
+                let segid = fts5_read_u32(block, &mut offset, "segment id")?;
+                let pgno_first = fts5_read_u32(block, &mut offset, "segment first page")?;
+                let pgno_last = fts5_read_u32(block, &mut offset, "segment last page")?;
+                if segid == 0 {
+                    return Err(fts5_data_error("segment id must be non-zero"));
+                }
+                if pgno_first == 0 {
+                    return Err(fts5_data_error("segment first page must be non-zero"));
+                }
+                if pgno_last < pgno_first {
+                    return Err(fts5_data_error("segment last page precedes first page"));
+                }
+
+                let mut segment = Fts5StructureSegment::new(segid, pgno_first, pgno_last);
+                if use_origin_tracking {
+                    segment.origin_lower =
+                        fts5_read_varint(block, &mut offset, "segment origin lower")?;
+                    segment.origin_upper =
+                        fts5_read_varint(block, &mut offset, "segment origin upper")?;
+                    segment.tombstone_page_count =
+                        fts5_read_u32(block, &mut offset, "segment tombstone pages")?;
+                    segment.tombstone_entry_count =
+                        fts5_read_varint(block, &mut offset, "segment tombstone entries")?;
+                    segment.entry_count =
+                        fts5_read_varint(block, &mut offset, "segment entry count")?;
+                    max_origin_upper = max_origin_upper.max(segment.origin_upper);
+                }
+                segments.push(segment);
+            }
+
+            if level_index > 0 && previous_level_merge_inputs > 0 && segments.is_empty() {
+                return Err(fts5_data_error(
+                    "merge level must be followed by a non-empty level",
+                ));
+            }
+            if level_index + 1 == level_count && merge_inputs > 0 {
+                return Err(fts5_data_error("top level cannot have an active merge"));
+            }
+            previous_level_merge_inputs = merge_inputs;
+            levels.push(Fts5StructureLevel {
+                merge_inputs,
+                segments,
+            });
+        }
+
+        if remaining_segments != 0 {
+            return Err(fts5_data_error("structure segment count mismatch"));
+        }
+        if offset != block.len() {
+            return Err(fts5_data_error("trailing bytes after structure record"));
+        }
+
+        Ok(Self {
+            cookie,
+            write_counter,
+            origin_counter: if use_origin_tracking {
+                max_origin_upper.saturating_add(1)
+            } else {
+                0
+            },
+            levels,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5DataMetadata {
+    pub averages: Option<Fts5AveragesRecord>,
+    pub structure: Option<Fts5StructureRecord>,
+}
+
+impl Fts5DataMetadata {
+    pub fn decode_rows(rows: &[Fts5DataRow], column_count: usize) -> Result<Self> {
+        let mut averages = None;
+        let mut structure = None;
+
+        for row in rows {
+            match row.id {
+                FTS5_AVERAGES_ROWID => {
+                    if averages.is_some() {
+                        return Err(fts5_data_error("duplicate averages row"));
+                    }
+                    averages = Some(Fts5AveragesRecord::decode(&row.block, column_count)?);
+                }
+                FTS5_STRUCTURE_ROWID => {
+                    if structure.is_some() {
+                        return Err(fts5_data_error("duplicate structure row"));
+                    }
+                    structure = Some(Fts5StructureRecord::decode(&row.block)?);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            averages,
+            structure,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fts5DataRowid {
+    Averages,
+    Structure,
+    SegmentLeaf { segid: u32, pgno: u32 },
+    DoclistIndex { segid: u32, height: u8, pgno: u32 },
+    Tombstone { segid: u32, hash_pgno: u32 },
+}
+
+impl Fts5DataRowid {
+    pub fn encode(self) -> Result<i64> {
+        match self {
+            Self::Averages => Ok(FTS5_AVERAGES_ROWID),
+            Self::Structure => Ok(FTS5_STRUCTURE_ROWID),
+            Self::SegmentLeaf { segid, pgno } => {
+                fts5_data_rowid(segid, false, 0, pgno, "segment leaf")
+            }
+            Self::DoclistIndex {
+                segid,
+                height,
+                pgno,
+            } => fts5_data_rowid(segid, true, height, pgno, "doclist index"),
+            Self::Tombstone { segid, hash_pgno } => {
+                let tombstone_segid = u64::from(segid) + FTS5_DATA_ID_LIMIT;
+                fts5_data_rowid_from_parts(tombstone_segid, false, 0, hash_pgno)
+            }
+        }
+    }
+
+    pub fn decode(rowid: i64) -> Result<Self> {
+        match rowid {
+            FTS5_AVERAGES_ROWID => return Ok(Self::Averages),
+            FTS5_STRUCTURE_ROWID => return Ok(Self::Structure),
+            _ => {}
+        }
+
+        let raw = u64::try_from(rowid)
+            .map_err(|_| fts5_data_error("negative segment rowid in %_data"))?;
+        let pgno = u32::try_from(raw & FTS5_DATA_PAGE_MASK)
+            .map_err(|_| fts5_data_error("page number exceeds u32"))?;
+        let height = u8::try_from((raw >> FTS5_DATA_PAGE_BITS) & FTS5_DATA_HEIGHT_MASK)
+            .map_err(|_| fts5_data_error("dlidx height exceeds u8"))?;
+        let dlidx =
+            ((raw >> (FTS5_DATA_PAGE_BITS + FTS5_DATA_HEIGHT_BITS)) & FTS5_DATA_DLI_MASK) != 0;
+        let segid_raw = raw >> (FTS5_DATA_PAGE_BITS + FTS5_DATA_HEIGHT_BITS + FTS5_DATA_DLI_BITS);
+
+        if dlidx {
+            let segid =
+                u32::try_from(segid_raw).map_err(|_| fts5_data_error("dlidx segid overflow"))?;
+            return Ok(Self::DoclistIndex {
+                segid,
+                height,
+                pgno,
+            });
+        }
+
+        if segid_raw >= FTS5_DATA_ID_LIMIT {
+            let segid = u32::try_from(segid_raw - FTS5_DATA_ID_LIMIT)
+                .map_err(|_| fts5_data_error("tombstone segid overflow"))?;
+            return Ok(Self::Tombstone {
+                segid,
+                hash_pgno: pgno,
+            });
+        }
+
+        let segid =
+            u32::try_from(segid_raw).map_err(|_| fts5_data_error("segment segid overflow"))?;
+        Ok(Self::SegmentLeaf { segid, pgno })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5IdxRow {
+    pub segid: u32,
+    pub term: Vec<u8>,
+    pub btree_page: u32,
+    pub has_doclist_index: bool,
+}
+
+impl Fts5IdxRow {
+    #[must_use]
+    pub fn new(
+        segid: u32,
+        term: impl Into<Vec<u8>>,
+        btree_page: u32,
+        has_doclist_index: bool,
+    ) -> Self {
+        Self {
+            segid,
+            term: term.into(),
+            btree_page,
+            has_doclist_index,
+        }
+    }
+
+    pub fn encoded_pgno(&self) -> Result<i64> {
+        if self.btree_page > FTS5_IDX_MAX_BTREE_PAGE {
+            return Err(fts5_data_error("%_idx btree page exceeds 31-bit limit"));
+        }
+        Ok((i64::from(self.btree_page) << 1) | i64::from(self.has_doclist_index))
+    }
+
+    pub fn from_encoded_pgno(
+        segid: u32,
+        term: impl Into<Vec<u8>>,
+        encoded_pgno: i64,
+    ) -> Result<Self> {
+        if encoded_pgno < 0 {
+            return Err(fts5_data_error("negative %_idx pgno"));
+        }
+        let encoded =
+            u64::try_from(encoded_pgno).map_err(|_| fts5_data_error("%_idx pgno overflow"))?;
+        let btree_page = u32::try_from(encoded >> 1)
+            .map_err(|_| fts5_data_error("%_idx btree page overflow"))?;
+        if btree_page > FTS5_IDX_MAX_BTREE_PAGE {
+            return Err(fts5_data_error("%_idx btree page exceeds 31-bit limit"));
+        }
+        Ok(Self {
+            segid,
+            term: term.into(),
+            btree_page,
+            has_doclist_index: (encoded & 1) != 0,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5ColumnPositions {
+    pub column: u32,
+    pub offsets: Vec<u32>,
+}
+
+impl Fts5ColumnPositions {
+    #[must_use]
+    pub fn new(column: u32, offsets: Vec<u32>) -> Self {
+        Self { column, offsets }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5Poslist {
+    pub delete: bool,
+    pub columns: Vec<Fts5ColumnPositions>,
+}
+
+impl Fts5Poslist {
+    #[must_use]
+    pub fn new(delete: bool, columns: Vec<Fts5ColumnPositions>) -> Self {
+        Self { delete, columns }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        let mut columns = self.columns.clone();
+        columns.sort_unstable_by_key(|column| column.column);
+
+        for column in columns {
+            if column.column != 0 || !body.is_empty() {
+                body.push(0x01);
+                fts5_push_varint(&mut body, u64::from(column.column));
+            }
+            let mut previous_offset = 0_u32;
+            let mut offsets = column.offsets;
+            offsets.sort_unstable();
+            for offset in offsets {
+                if offset < previous_offset {
+                    return Err(fts5_data_error("poslist offsets are not monotonic"));
+                }
+                fts5_push_varint(&mut body, u64::from(offset - previous_offset + 2));
+                previous_offset = offset;
+            }
+        }
+
+        let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        let header = body_len
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(u64::from(self.delete)))
+            .ok_or_else(|| fts5_data_error("poslist too large"))?;
+        let mut encoded = Vec::with_capacity(body.len() + 9);
+        fts5_push_varint(&mut encoded, header);
+        encoded.extend_from_slice(&body);
+        Ok(encoded)
+    }
+
+    pub fn decode(block: &[u8], offset: &mut usize) -> Result<Self> {
+        let header = fts5_read_varint(block, offset, "poslist size")?;
+        let body_len =
+            usize::try_from(header >> 1).map_err(|_| fts5_data_error("poslist body too large"))?;
+        let delete = (header & 1) != 0;
+        let end = offset
+            .checked_add(body_len)
+            .ok_or_else(|| fts5_data_error("poslist length overflow"))?;
+        if end > block.len() {
+            return Err(fts5_data_error("truncated poslist body"));
+        }
+
+        let mut columns = Vec::new();
+        let mut current_column = 0;
+        while *offset < end {
+            if block[*offset] == 0x01 {
+                *offset += 1;
+                current_column = fts5_read_u32(block, offset, "poslist column")?;
+                if *offset >= end {
+                    return Err(fts5_data_error("poslist column has no offsets"));
+                }
+            }
+
+            let mut offsets = Vec::new();
+            let mut previous_offset = 0_u32;
+            while *offset < end && block[*offset] != 0x01 {
+                let delta = fts5_read_u32(block, offset, "poslist offset delta")?;
+                if delta < 2 {
+                    return Err(fts5_data_error("poslist offset delta below 2"));
+                }
+                let offset_value = previous_offset
+                    .checked_add(delta - 2)
+                    .ok_or_else(|| fts5_data_error("poslist offset overflow"))?;
+                offsets.push(offset_value);
+                previous_offset = offset_value;
+            }
+            if offsets.is_empty() {
+                return Err(fts5_data_error("poslist column has no offsets"));
+            }
+            columns.push(Fts5ColumnPositions {
+                column: current_column,
+                offsets,
+            });
+        }
+
+        Ok(Self { delete, columns })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5DoclistEntry {
+    pub rowid: u64,
+    pub poslist: Fts5Poslist,
+}
+
+impl Fts5DoclistEntry {
+    #[must_use]
+    pub fn new(rowid: u64, poslist: Fts5Poslist) -> Self {
+        Self { rowid, poslist }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5Doclist {
+    pub entries: Vec<Fts5DoclistEntry>,
+}
+
+impl Fts5Doclist {
+    #[must_use]
+    pub fn new(entries: Vec<Fts5DoclistEntry>) -> Self {
+        Self { entries }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoded = Vec::new();
+        let mut previous_rowid = 0_u64;
+        for (index, entry) in self.entries.iter().enumerate() {
+            if index == 0 {
+                fts5_push_varint(&mut encoded, entry.rowid);
+            } else {
+                if entry.rowid <= previous_rowid {
+                    return Err(fts5_data_error(
+                        "doclist rowids must be strictly increasing",
+                    ));
+                }
+                fts5_push_varint(&mut encoded, entry.rowid - previous_rowid);
+            }
+            encoded.extend_from_slice(&entry.poslist.encode()?);
+            previous_rowid = entry.rowid;
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode(block: &[u8]) -> Result<Self> {
+        let mut offset = 0;
+        let mut entries = Vec::new();
+        let mut previous_rowid = 0_u64;
+        while offset < block.len() {
+            let raw_rowid = fts5_read_varint(block, &mut offset, "doclist rowid")?;
+            let rowid = if entries.is_empty() {
+                raw_rowid
+            } else {
+                if raw_rowid == 0 {
+                    return Err(fts5_data_error("doclist rowid delta must be positive"));
+                }
+                previous_rowid
+                    .checked_add(raw_rowid)
+                    .ok_or_else(|| fts5_data_error("doclist rowid overflow"))?
+            };
+            let poslist = Fts5Poslist::decode(block, &mut offset)?;
+            entries.push(Fts5DoclistEntry { rowid, poslist });
+            previous_rowid = rowid;
+        }
+        Ok(Self { entries })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5SegmentTerm {
+    pub term: Vec<u8>,
+    pub doclist: Fts5Doclist,
+}
+
+impl Fts5SegmentTerm {
+    #[must_use]
+    pub fn new(term: impl Into<Vec<u8>>, doclist: Fts5Doclist) -> Self {
+        Self {
+            term: term.into(),
+            doclist,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5SegmentLeaf {
+    pub first_rowid_offset: u16,
+    pub terms: Vec<Fts5SegmentTerm>,
+}
+
+impl Fts5SegmentLeaf {
+    #[must_use]
+    pub fn new(terms: Vec<Fts5SegmentTerm>) -> Self {
+        Self {
+            first_rowid_offset: 0,
+            terms,
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut page = vec![0, 0, 0, 0];
+        let mut term_offsets = Vec::with_capacity(self.terms.len());
+        let mut previous_term: &[u8] = &[];
+        let mut first_rowid_offset = 0;
+
+        for (index, entry) in self.terms.iter().enumerate() {
+            if index > 0 && entry.term.as_slice() <= previous_term {
+                return Err(fts5_data_error("segment terms must be strictly increasing"));
+            }
+            let term_offset = u16::try_from(page.len())
+                .map_err(|_| fts5_data_error("segment leaf term offset exceeds u16"))?;
+            term_offsets.push(term_offset);
+
+            if index == 0 {
+                fts5_push_varint(
+                    &mut page,
+                    u64::try_from(entry.term.len()).unwrap_or(u64::MAX),
+                );
+                page.extend_from_slice(&entry.term);
+            } else {
+                let prefix_len = common_prefix_len(previous_term, &entry.term);
+                fts5_push_varint(&mut page, u64::try_from(prefix_len).unwrap_or(u64::MAX));
+                fts5_push_varint(
+                    &mut page,
+                    u64::try_from(entry.term.len() - prefix_len).unwrap_or(u64::MAX),
+                );
+                page.extend_from_slice(&entry.term[prefix_len..]);
+            }
+
+            if index == 0 {
+                first_rowid_offset = u16::try_from(page.len())
+                    .map_err(|_| fts5_data_error("segment leaf rowid offset exceeds u16"))?;
+            }
+            page.extend_from_slice(&entry.doclist.encode()?);
+            previous_term = &entry.term;
+        }
+
+        let footer_offset = u16::try_from(page.len())
+            .map_err(|_| fts5_data_error("segment leaf footer offset exceeds u16"))?;
+        let mut previous_offset = 0;
+        for offset in term_offsets {
+            let delta = offset
+                .checked_sub(previous_offset)
+                .ok_or_else(|| fts5_data_error("segment footer offset underflow"))?;
+            fts5_push_varint(&mut page, u64::from(delta));
+            previous_offset = offset;
+        }
+
+        write_be_u16(&mut page[0..2], first_rowid_offset);
+        write_be_u16(&mut page[2..4], footer_offset);
+        Ok(page)
+    }
+
+    pub fn decode(page: &[u8]) -> Result<Self> {
+        if page.len() < 4 {
+            return Err(fts5_data_error("segment leaf missing header"));
+        }
+        let first_rowid_offset = read_be_u16(&page[0..2]);
+        let footer_offset = usize::from(read_be_u16(&page[2..4]));
+        if !(4..=page.len()).contains(&footer_offset) {
+            return Err(fts5_data_error("segment leaf footer offset out of range"));
+        }
+
+        let mut footer_cursor = footer_offset;
+        let mut term_offsets = Vec::new();
+        let mut previous_term_offset = 0_u16;
+        while footer_cursor < page.len() {
+            let delta = fts5_read_u32(page, &mut footer_cursor, "segment footer offset delta")?;
+            let next_offset = u32::from(previous_term_offset)
+                .checked_add(delta)
+                .ok_or_else(|| fts5_data_error("segment footer offset overflow"))?;
+            let next_offset = u16::try_from(next_offset)
+                .map_err(|_| fts5_data_error("segment footer offset exceeds u16"))?;
+            let next_offset_usize = usize::from(next_offset);
+            if next_offset_usize < 4 || next_offset_usize >= footer_offset {
+                return Err(fts5_data_error("segment term offset out of range"));
+            }
+            term_offsets.push(next_offset);
+            previous_term_offset = next_offset;
+        }
+
+        let mut terms = Vec::with_capacity(term_offsets.len());
+        let mut previous_term = Vec::new();
+        for (index, term_offset) in term_offsets.iter().copied().enumerate() {
+            let entry_end = term_offsets
+                .get(index + 1)
+                .map_or(footer_offset, |offset| usize::from(*offset));
+            let mut cursor = usize::from(term_offset);
+
+            let term = if index == 0 {
+                let term_len = fts5_read_usize(page, &mut cursor, "segment first term")?;
+                let end = cursor
+                    .checked_add(term_len)
+                    .ok_or_else(|| fts5_data_error("segment first term length overflow"))?;
+                if end > entry_end {
+                    return Err(fts5_data_error("segment first term extends past entry"));
+                }
+                let term = page[cursor..end].to_vec();
+                cursor = end;
+                term
+            } else {
+                let prefix_len = fts5_read_usize(page, &mut cursor, "segment term prefix")?;
+                let suffix_len = fts5_read_usize(page, &mut cursor, "segment term suffix")?;
+                if prefix_len > previous_term.len() {
+                    return Err(fts5_data_error("segment term prefix exceeds previous term"));
+                }
+                let suffix_end = cursor
+                    .checked_add(suffix_len)
+                    .ok_or_else(|| fts5_data_error("segment term suffix length overflow"))?;
+                if suffix_end > entry_end {
+                    return Err(fts5_data_error("segment term suffix extends past entry"));
+                }
+                let mut term = previous_term[..prefix_len].to_vec();
+                term.extend_from_slice(&page[cursor..suffix_end]);
+                cursor = suffix_end;
+                term
+            };
+
+            let doclist = Fts5Doclist::decode(&page[cursor..entry_end])?;
+            previous_term = term.clone();
+            terms.push(Fts5SegmentTerm { term, doclist });
+        }
+
+        Ok(Self {
+            first_rowid_offset,
+            terms,
+        })
+    }
+
+    pub fn to_data_row(&self, segid: u32, pgno: u32) -> Result<Fts5DataRow> {
+        Ok(Fts5DataRow::new(
+            Fts5DataRowid::SegmentLeaf { segid, pgno }.encode()?,
+            self.encode()?,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5DlidxPage {
+    pub flags: u8,
+    pub leaf_pgno: u32,
+    pub first_rowid: u64,
+    pub rowid_deltas: Vec<Option<u64>>,
+}
+
+impl Fts5DlidxPage {
+    #[must_use]
+    pub fn new(
+        flags: u8,
+        leaf_pgno: u32,
+        first_rowid: u64,
+        rowid_deltas: Vec<Option<u64>>,
+    ) -> Self {
+        Self {
+            flags,
+            leaf_pgno,
+            first_rowid,
+            rowid_deltas,
+        }
+    }
+
+    #[must_use]
+    pub fn is_root(&self) -> bool {
+        (self.flags & 0x01) == 0
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut page = Vec::with_capacity(1 + 18 + self.rowid_deltas.len() * 9);
+        page.push(self.flags);
+        fts5_push_varint(&mut page, u64::from(self.leaf_pgno));
+        fts5_push_varint(&mut page, self.first_rowid);
+        for delta in &self.rowid_deltas {
+            fts5_push_varint(&mut page, delta.unwrap_or(0));
+        }
+        page
+    }
+
+    pub fn decode(page: &[u8]) -> Result<Self> {
+        if page.is_empty() {
+            return Err(fts5_data_error("dlidx page missing flags"));
+        }
+        let flags = page[0];
+        let mut offset = 1;
+        let leaf_pgno = fts5_read_u32(page, &mut offset, "dlidx leaf page")?;
+        let first_rowid = fts5_read_varint(page, &mut offset, "dlidx first rowid")?;
+        let mut rowid_deltas = Vec::new();
+        while offset < page.len() {
+            let delta = fts5_read_varint(page, &mut offset, "dlidx rowid delta")?;
+            rowid_deltas.push((delta != 0).then_some(delta));
+        }
+
+        Ok(Self {
+            flags,
+            leaf_pgno,
+            first_rowid,
+            rowid_deltas,
+        })
+    }
+
+    pub fn to_data_row(&self, segid: u32, height: u8, pgno: u32) -> Result<Fts5DataRow> {
+        Ok(Fts5DataRow::new(
+            Fts5DataRowid::DoclistIndex {
+                segid,
+                height,
+                pgno,
+            }
+            .encode()?,
+            self.encode(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5TombstonePage {
+    pub key_size: u8,
+    pub rowid_zero: bool,
+    pub slots: Vec<Option<u64>>,
+}
+
+impl Fts5TombstonePage {
+    #[must_use]
+    pub fn new(key_size: u8, rowid_zero: bool, slots: Vec<Option<u64>>) -> Self {
+        Self {
+            key_size,
+            rowid_zero,
+            slots,
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        if self.key_size != 4 && self.key_size != 8 {
+            return Err(fts5_data_error("tombstone key size must be 4 or 8"));
+        }
+        let key_size = usize::from(self.key_size);
+        let mut page = vec![0; 8 + self.slots.len() * key_size];
+        page[0] = self.key_size;
+        page[1] = u8::from(self.rowid_zero);
+        let entry_count = self.slots.iter().filter(|slot| slot.is_some()).count();
+        let entry_count = u32::try_from(entry_count)
+            .map_err(|_| fts5_data_error("tombstone entry count exceeds u32"))?;
+        write_be_u32(&mut page[4..8], entry_count);
+
+        for (index, slot) in self.slots.iter().enumerate() {
+            let Some(rowid) = slot else {
+                continue;
+            };
+            let offset = 8 + index * key_size;
+            if self.key_size == 4 {
+                let rowid = u32::try_from(*rowid)
+                    .map_err(|_| fts5_data_error("rowid exceeds 4-byte tombstone slot"))?;
+                write_be_u32(&mut page[offset..offset + 4], rowid);
+            } else {
+                write_be_u64(&mut page[offset..offset + 8], *rowid);
+            }
+        }
+
+        Ok(page)
+    }
+
+    pub fn decode(page: &[u8]) -> Result<Self> {
+        if page.len() < 8 {
+            return Err(fts5_data_error("tombstone page missing header"));
+        }
+        let key_size = if page[0] == 4 { 4 } else { 8 };
+        let key_size_usize = usize::from(key_size);
+        let payload_len = page.len() - 8;
+        if payload_len % key_size_usize != 0 {
+            return Err(fts5_data_error("tombstone slot area is misaligned"));
+        }
+        let declared_entries = read_be_u32(&page[4..8]);
+        let mut slots = Vec::with_capacity(payload_len / key_size_usize);
+        let mut actual_entries = 0_u32;
+        for slot in page[8..].chunks_exact(key_size_usize) {
+            let value = if key_size == 4 {
+                u64::from(read_be_u32(slot))
+            } else {
+                read_be_u64(slot)
+            };
+            if value == 0 {
+                slots.push(None);
+            } else {
+                actual_entries = actual_entries
+                    .checked_add(1)
+                    .ok_or_else(|| fts5_data_error("tombstone entry count overflow"))?;
+                slots.push(Some(value));
+            }
+        }
+        if actual_entries != declared_entries {
+            return Err(fts5_data_error("tombstone entry count mismatch"));
+        }
+
+        Ok(Self {
+            key_size,
+            rowid_zero: page[1] != 0,
+            slots,
+        })
+    }
+
+    #[must_use]
+    pub fn contains_rowid(&self, hash_page_count: u32, rowid: u64) -> bool {
+        if rowid == 0 {
+            return self.rowid_zero;
+        }
+        if hash_page_count == 0 || self.slots.is_empty() {
+            return false;
+        }
+        let hash_page_count = u64::from(hash_page_count);
+        let slot_count = u64::try_from(self.slots.len()).unwrap_or(u64::MAX);
+        let mut slot = usize::try_from((rowid / hash_page_count) % slot_count).unwrap_or(0);
+        for _ in 0..self.slots.len() {
+            match self.slots[slot] {
+                Some(value) if value == rowid => return true,
+                None => return false,
+                _ => slot = (slot + 1) % self.slots.len(),
+            }
+        }
+        false
+    }
+
+    pub fn to_data_row(&self, segid: u32, hash_pgno: u32) -> Result<Fts5DataRow> {
+        Ok(Fts5DataRow::new(
+            Fts5DataRowid::Tombstone { segid, hash_pgno }.encode()?,
+            self.encode()?,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fts5PendingIndex {
+    Main,
+    Prefix { ordinal: u8, length: usize },
+}
+
+impl Fts5PendingIndex {
+    #[must_use]
+    pub const fn marker(self) -> u8 {
+        match self {
+            Self::Main => FTS5_MAIN_PREFIX_BYTE,
+            Self::Prefix { ordinal, .. } => FTS5_MAIN_PREFIX_BYTE + ordinal + 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Fts5PendingTermKey(Vec<u8>);
+
+impl Fts5PendingTermKey {
+    #[must_use]
+    pub fn new(index: Fts5PendingIndex, term: &str) -> Self {
+        let mut key = Vec::with_capacity(term.len() + 1);
+        key.push(index.marker());
+        key.extend_from_slice(term.as_bytes());
+        Self(key)
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Fts5PendingDoc {
+    delete: bool,
+    columns: BTreeMap<u32, Vec<u32>>,
+}
+
+impl Fts5PendingDoc {
+    fn push_position(&mut self, column: u32, position: u32) {
+        self.columns.entry(column).or_default().push(position);
+    }
+
+    fn to_poslist(&self) -> Fts5Poslist {
+        Fts5Poslist::new(
+            self.delete,
+            self.columns
+                .iter()
+                .map(|(column, offsets)| Fts5ColumnPositions::new(*column, offsets.clone()))
+                .collect(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5PendingHash {
+    terms: BTreeMap<Fts5PendingTermKey, BTreeMap<u64, Fts5PendingDoc>>,
+    prefix_lengths: Vec<usize>,
+    detail: DetailMode,
+    tokendata: bool,
+    pending_bytes: usize,
+    row_count: usize,
+}
+
+impl Fts5PendingHash {
+    #[must_use]
+    pub fn new(prefix_lengths: &[usize], detail: DetailMode, tokendata: bool) -> Self {
+        let mut prefix_lengths = prefix_lengths.to_vec();
+        prefix_lengths.sort_unstable();
+        prefix_lengths.dedup();
+        Self {
+            terms: BTreeMap::new(),
+            prefix_lengths,
+            detail,
+            tokendata,
+            pending_bytes: 0,
+            row_count: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+
+    #[must_use]
+    pub const fn pending_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+
+    #[must_use]
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    #[must_use]
+    pub fn term_count(&self) -> usize {
+        self.terms.len()
+    }
+
+    #[must_use]
+    pub fn should_flush(&self, metadata: &Fts5ConfigMetadata) -> bool {
+        usize::try_from(metadata.hash_size).is_ok_and(|limit| self.pending_bytes >= limit)
+    }
+
+    pub fn add_document(
+        &mut self,
+        rowid: i64,
+        column_values: &[String],
+        indexed_columns: &[bool],
+        tokenizer: &dyn Fts5Tokenizer,
+    ) -> Result<()> {
+        let rowid =
+            u64::try_from(rowid).map_err(|_| fts5_data_error("pending rowid is negative"))?;
+        let prefix_lengths = self.prefix_lengths.clone();
+        let detail = self.detail;
+        let tokendata = self.tokendata;
+        self.row_count = self.row_count.saturating_add(1);
+
+        for (column, value) in column_values.iter().enumerate() {
+            if matches!(indexed_columns.get(column), Some(false)) {
+                continue;
+            }
+            let column = u32::try_from(column)
+                .map_err(|_| fts5_data_error("pending column index exceeds u32"))?;
+            let stored_column = if detail == DetailMode::None {
+                0
+            } else {
+                column
+            };
+            let mut position = 0_u32;
+            tokenizer.visit_tokens(value, &mut |term, _start, _end, colocated| {
+                let stored_position = if detail == DetailMode::Full {
+                    position
+                } else {
+                    0
+                };
+                let term = if tokendata {
+                    tokendata_query_key(term)
+                } else {
+                    term
+                };
+                self.push_occurrence(
+                    Fts5PendingTermKey::new(Fts5PendingIndex::Main, term),
+                    rowid,
+                    stored_column,
+                    stored_position,
+                );
+                for (ordinal, prefix_length) in prefix_lengths.iter().copied().enumerate() {
+                    if let Some(prefix) = prefix_slice(term, prefix_length)
+                        && let Ok(ordinal) = u8::try_from(ordinal)
+                    {
+                        self.push_occurrence(
+                            Fts5PendingTermKey::new(
+                                Fts5PendingIndex::Prefix {
+                                    ordinal,
+                                    length: prefix_length,
+                                },
+                                prefix,
+                            ),
+                            rowid,
+                            stored_column,
+                            stored_position,
+                        );
+                    }
+                }
+                if !colocated {
+                    position = position.saturating_add(1);
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    fn push_occurrence(&mut self, key: Fts5PendingTermKey, rowid: u64, column: u32, position: u32) {
+        self.pending_bytes = self
+            .pending_bytes
+            .saturating_add(key.as_bytes().len())
+            .saturating_add(24);
+        self.terms
+            .entry(key)
+            .or_default()
+            .entry(rowid)
+            .or_default()
+            .push_position(column, position);
+    }
+
+    pub fn flush_to_segment(
+        &self,
+        segid: u32,
+        mut structure: Fts5StructureRecord,
+    ) -> Result<Fts5PendingFlush> {
+        if self.is_empty() {
+            return Err(fts5_data_error("cannot flush an empty pending hash"));
+        }
+        let leaf = Fts5SegmentLeaf::decode(&self.to_segment_leaf().encode()?)?;
+        let data_row = leaf.to_data_row(segid, 1)?;
+        let segment = if structure.uses_origin_tracking() {
+            Fts5StructureSegment::new(segid, 1, 1).with_origin_tracking(
+                structure.origin_counter,
+                structure.origin_counter,
+                0,
+                0,
+                u64::try_from(self.row_count).unwrap_or(u64::MAX),
+            )
+        } else {
+            Fts5StructureSegment::new(segid, 1, 1)
+        };
+
+        if structure.levels.is_empty() {
+            structure
+                .levels
+                .push(Fts5StructureLevel::new(0, vec![segment]));
+        } else {
+            structure.levels[0].segments.push(segment);
+        }
+        structure.write_counter = structure.write_counter.saturating_add(1);
+        if structure.uses_origin_tracking() {
+            structure.origin_counter = structure.origin_counter.saturating_add(1);
+        }
+
+        let structure_row = Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode());
+        Ok(Fts5PendingFlush {
+            data_rows: vec![data_row, structure_row],
+            idx_rows: Vec::new(),
+            leaf,
+            structure,
+            pending_bytes: self.pending_bytes,
+        })
+    }
+
+    fn to_segment_leaf(&self) -> Fts5SegmentLeaf {
+        Fts5SegmentLeaf::new(
+            self.terms
+                .iter()
+                .map(|(term, docs)| {
+                    Fts5SegmentTerm::new(
+                        term.as_bytes().to_vec(),
+                        Fts5Doclist::new(
+                            docs.iter()
+                                .map(|(rowid, doc)| Fts5DoclistEntry::new(*rowid, doc.to_poslist()))
+                                .collect(),
+                        ),
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5PendingFlush {
+    pub data_rows: Vec<Fts5DataRow>,
+    pub idx_rows: Vec<Fts5IdxRow>,
+    pub leaf: Fts5SegmentLeaf,
+    pub structure: Fts5StructureRecord,
+    pub pending_bytes: usize,
+}
+
+impl Fts5PendingFlush {
+    pub fn hotspot_profile(&self) -> Result<Fts5ShadowWriteHotspotProfile> {
+        Fts5ShadowWriteHotspotProfile::from_rows(&self.data_rows, &self.idx_rows)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fts5ShadowWriteMitigation {
+    NoWrites,
+    AppendOnlyRowsBeforeSingleMetadataCommit,
+    AppendOnlyRowsBeforeBatchedHotWrites,
+    RequiresMergeBatching,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Fts5ShadowWriteClass {
+    SegmentLeaf { segid: u32, pgno: u32 },
+    DoclistIndex { segid: u32, height: u8, pgno: u32 },
+    Tombstone { segid: u32, hash_pgno: u32 },
+    IdxPage { segid: u32, btree_page: u32 },
+    AveragesRecord,
+    StructureRecord,
+}
+
+impl Fts5ShadowWriteClass {
+    #[must_use]
+    pub const fn is_append_only_data(self) -> bool {
+        matches!(
+            self,
+            Self::SegmentLeaf { .. } | Self::DoclistIndex { .. } | Self::Tombstone { .. }
+        )
+    }
+
+    #[must_use]
+    pub const fn is_hot_write(self) -> bool {
+        matches!(
+            self,
+            Self::IdxPage { .. } | Self::AveragesRecord | Self::StructureRecord
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5ShadowWriteHotspotProfile {
+    pub data_row_writes: usize,
+    pub idx_row_writes: usize,
+    pub append_only_data_writes: usize,
+    pub segment_leaf_writes: usize,
+    pub doclist_index_writes: usize,
+    pub tombstone_writes: usize,
+    pub averages_record_writes: usize,
+    pub structure_record_writes: usize,
+    pub hot_write_count: usize,
+    pub append_only_rows_precede_hot_rows: bool,
+    pub unique_segment_pages: Vec<(u32, u32)>,
+    pub unique_doclist_index_pages: Vec<(u32, u8, u32)>,
+    pub unique_tombstone_pages: Vec<(u32, u32)>,
+    pub unique_idx_pages: Vec<(u32, u32)>,
+    pub publication_order: Vec<Fts5ShadowWriteClass>,
+    pub mitigation: Fts5ShadowWriteMitigation,
+}
+
+impl Fts5ShadowWriteHotspotProfile {
+    pub fn from_rows(data_rows: &[Fts5DataRow], idx_rows: &[Fts5IdxRow]) -> Result<Self> {
+        let mut segment_pages = BTreeSet::new();
+        let mut doclist_index_pages = BTreeSet::new();
+        let mut tombstone_pages = BTreeSet::new();
+        let mut idx_pages = BTreeSet::new();
+        let mut publication_order = Vec::with_capacity(data_rows.len() + idx_rows.len());
+
+        let mut segment_leaf_writes = 0;
+        let mut doclist_index_writes = 0;
+        let mut tombstone_writes = 0;
+        let mut averages_record_writes = 0;
+        let mut structure_record_writes = 0;
+
+        for row in data_rows {
+            let write_class = match Fts5DataRowid::decode(row.id)? {
+                Fts5DataRowid::Averages => {
+                    averages_record_writes += 1;
+                    Fts5ShadowWriteClass::AveragesRecord
+                }
+                Fts5DataRowid::Structure => {
+                    structure_record_writes += 1;
+                    Fts5ShadowWriteClass::StructureRecord
+                }
+                Fts5DataRowid::SegmentLeaf { segid, pgno } => {
+                    segment_leaf_writes += 1;
+                    segment_pages.insert((segid, pgno));
+                    Fts5ShadowWriteClass::SegmentLeaf { segid, pgno }
+                }
+                Fts5DataRowid::DoclistIndex {
+                    segid,
+                    height,
+                    pgno,
+                } => {
+                    doclist_index_writes += 1;
+                    doclist_index_pages.insert((segid, height, pgno));
+                    Fts5ShadowWriteClass::DoclistIndex {
+                        segid,
+                        height,
+                        pgno,
+                    }
+                }
+                Fts5DataRowid::Tombstone { segid, hash_pgno } => {
+                    tombstone_writes += 1;
+                    tombstone_pages.insert((segid, hash_pgno));
+                    Fts5ShadowWriteClass::Tombstone { segid, hash_pgno }
+                }
+            };
+            publication_order.push(write_class);
+        }
+
+        for row in idx_rows {
+            idx_pages.insert((row.segid, row.btree_page));
+            publication_order.push(Fts5ShadowWriteClass::IdxPage {
+                segid: row.segid,
+                btree_page: row.btree_page,
+            });
+        }
+
+        let idx_row_writes = idx_rows.len();
+        let append_only_data_writes = segment_leaf_writes + doclist_index_writes + tombstone_writes;
+        let metadata_writes = averages_record_writes + structure_record_writes;
+        let hot_write_count = metadata_writes + idx_row_writes;
+        let append_only_rows_precede_hot_rows =
+            Self::append_only_rows_precede_hot_rows(&publication_order);
+        let mitigation = Self::mitigation(
+            data_rows.len() + idx_row_writes,
+            hot_write_count,
+            append_only_rows_precede_hot_rows,
+            metadata_writes,
+        );
+
+        Ok(Self {
+            data_row_writes: data_rows.len(),
+            idx_row_writes,
+            append_only_data_writes,
+            segment_leaf_writes,
+            doclist_index_writes,
+            tombstone_writes,
+            averages_record_writes,
+            structure_record_writes,
+            hot_write_count,
+            append_only_rows_precede_hot_rows,
+            unique_segment_pages: segment_pages.into_iter().collect(),
+            unique_doclist_index_pages: doclist_index_pages.into_iter().collect(),
+            unique_tombstone_pages: tombstone_pages.into_iter().collect(),
+            unique_idx_pages: idx_pages.into_iter().collect(),
+            publication_order,
+            mitigation,
+        })
+    }
+
+    fn append_only_rows_precede_hot_rows(publication_order: &[Fts5ShadowWriteClass]) -> bool {
+        let mut seen_hot_write = false;
+        for write_class in publication_order {
+            if write_class.is_hot_write() {
+                seen_hot_write = true;
+            } else if seen_hot_write && write_class.is_append_only_data() {
+                return false;
+            }
+        }
+        true
+    }
+
+    const fn mitigation(
+        write_count: usize,
+        hot_write_count: usize,
+        append_only_rows_precede_hot_rows: bool,
+        metadata_writes: usize,
+    ) -> Fts5ShadowWriteMitigation {
+        if write_count == 0 {
+            return Fts5ShadowWriteMitigation::NoWrites;
+        }
+        if append_only_rows_precede_hot_rows && hot_write_count <= 1 && metadata_writes <= 1 {
+            return Fts5ShadowWriteMitigation::AppendOnlyRowsBeforeSingleMetadataCommit;
+        }
+        if append_only_rows_precede_hot_rows && metadata_writes <= 2 {
+            return Fts5ShadowWriteMitigation::AppendOnlyRowsBeforeBatchedHotWrites;
+        }
+        Fts5ShadowWriteMitigation::RequiresMergeBatching
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fts5MergeKind {
+    Auto,
+    Crisis,
+    Optimize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fts5MergePlan {
+    pub kind: Fts5MergeKind,
+    pub level: usize,
+    pub segment_count: usize,
+    pub merge_inputs: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fts5MergeScheduler {
+    pub automerge: usize,
+    pub usermerge: usize,
+    pub crisismerge: usize,
+}
+
+impl Fts5MergeScheduler {
+    #[must_use]
+    pub fn from_metadata(metadata: &Fts5ConfigMetadata) -> Self {
+        Self {
+            automerge: usize::try_from(metadata.automerge.max(0)).unwrap_or(0),
+            usermerge: usize::try_from(metadata.usermerge.max(0)).unwrap_or(0),
+            crisismerge: usize::try_from(metadata.crisismerge.max(0)).unwrap_or(0),
+        }
+    }
+
+    #[must_use]
+    pub fn next_plan(&self, structure: &Fts5StructureRecord) -> Option<Fts5MergePlan> {
+        for (level, level_record) in structure.levels.iter().enumerate() {
+            let segment_count = level_record.segments.len();
+            if self.crisismerge > 0 && segment_count >= self.crisismerge {
+                return Some(Fts5MergePlan {
+                    kind: Fts5MergeKind::Crisis,
+                    level,
+                    segment_count,
+                    merge_inputs: u32::try_from(segment_count).unwrap_or(u32::MAX),
+                });
+            }
+        }
+
+        for (level, level_record) in structure.levels.iter().enumerate() {
+            let segment_count = level_record.segments.len();
+            if self.automerge > 0 && segment_count >= self.automerge {
+                return Some(Fts5MergePlan {
+                    kind: Fts5MergeKind::Auto,
+                    level,
+                    segment_count,
+                    merge_inputs: u32::try_from(self.usermerge.min(segment_count))
+                        .unwrap_or(u32::MAX),
+                });
+            }
+        }
+
+        None
+    }
+
+    #[must_use]
+    pub fn optimize_plan(&self, structure: &Fts5StructureRecord) -> Option<Fts5MergePlan> {
+        structure
+            .levels
+            .iter()
+            .enumerate()
+            .max_by_key(|(_level, level_record)| level_record.segments.len())
+            .and_then(|(level, level_record)| {
+                let segment_count = level_record.segments.len();
+                (segment_count > 1).then(|| Fts5MergePlan {
+                    kind: Fts5MergeKind::Optimize,
+                    level,
+                    segment_count,
+                    merge_inputs: u32::try_from(segment_count).unwrap_or(u32::MAX),
+                })
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5LazyPostings {
+    pub entries: Vec<Fts5DoclistEntry>,
+}
+
+impl Fts5LazyPostings {
+    #[must_use]
+    pub fn new(entries: Vec<Fts5DoclistEntry>) -> Self {
+        Self { entries }
+    }
+
+    #[must_use]
+    pub fn rowids(&self) -> Vec<u64> {
+        self.entries.iter().map(|entry| entry.rowid).collect()
+    }
+
+    #[must_use]
+    pub fn union_rowids(&self, other: &Self) -> Vec<u64> {
+        self.entries
+            .iter()
+            .chain(&other.entries)
+            .map(|entry| entry.rowid)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn intersect_rowids(&self, other: &Self) -> Vec<u64> {
+        let right: BTreeSet<_> = other.entries.iter().map(|entry| entry.rowid).collect();
+        self.entries
+            .iter()
+            .map(|entry| entry.rowid)
+            .filter(|rowid| right.contains(rowid))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn phrase_rowids(&self, next: &Self) -> Vec<u64> {
+        self.rowids_with_position_match(next, |left, right| right == left.saturating_add(1))
+    }
+
+    #[must_use]
+    pub fn near_rowids(&self, other: &Self, distance: u32) -> Vec<u64> {
+        self.rowids_with_position_match(other, |left, right| left.abs_diff(right) <= distance)
+    }
+
+    fn rowids_with_position_match(
+        &self,
+        other: &Self,
+        matches_positions: impl Fn(u32, u32) -> bool,
+    ) -> Vec<u64> {
+        let mut right_by_rowid: BTreeMap<u64, &Fts5DoclistEntry> = BTreeMap::new();
+        for entry in &other.entries {
+            right_by_rowid.insert(entry.rowid, entry);
+        }
+
+        let mut rowids = Vec::new();
+        for left in &self.entries {
+            let Some(right) = right_by_rowid.get(&left.rowid) else {
+                continue;
+            };
+            if postings_have_position_match(left, right, &matches_positions) {
+                rowids.push(left.rowid);
+            }
+        }
+        rowids
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5LazyTermMatch {
+    pub term: Vec<u8>,
+    pub postings: Fts5LazyPostings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5SegmentIntegrityReport {
+    pub segment_count: usize,
+    pub leaf_page_count: usize,
+    pub idx_row_count: usize,
+    pub term_count: usize,
+    pub checksum: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Fts5SegmentRowSet<'a> {
+    data_rows: &'a [Fts5DataRow],
+    idx_rows: &'a [Fts5IdxRow],
+}
+
+impl<'a> Fts5SegmentRowSet<'a> {
+    #[must_use]
+    pub const fn new(data_rows: &'a [Fts5DataRow], idx_rows: &'a [Fts5IdxRow]) -> Self {
+        Self {
+            data_rows,
+            idx_rows,
+        }
+    }
+
+    #[must_use]
+    pub fn reader(&self, segment: &'a Fts5StructureSegment) -> Fts5SegmentReader<'a> {
+        Fts5SegmentReader {
+            segment,
+            data_rows: self.data_rows,
+            idx_rows: self.idx_rows,
+        }
+    }
+
+    pub fn integrity_report(
+        &self,
+        structure: &Fts5StructureRecord,
+    ) -> Result<Fts5SegmentIntegrityReport> {
+        let mut seen_segids = BTreeSet::new();
+        let mut known_segids = BTreeSet::new();
+        let mut leaf_page_count = 0;
+        let mut term_count = 0;
+        let mut checksum = FTS5_SEGMENT_CHECKSUM_OFFSET;
+
+        for level in &structure.levels {
+            for segment in &level.segments {
+                if !seen_segids.insert(segment.segid) {
+                    return Err(fts5_data_error("duplicate segment id in structure"));
+                }
+                known_segids.insert(segment.segid);
+                let reader = self.reader(segment);
+                for pgno in segment.pgno_first..=segment.pgno_last {
+                    let row = reader
+                        .data_row(pgno)
+                        .ok_or_else(|| fts5_data_error("missing segment leaf page"))?;
+                    checksum = fts5_checksum_i64(checksum, row.id);
+                    checksum = fts5_checksum_bytes(checksum, &row.block);
+                    let leaf = Fts5SegmentLeaf::decode(&row.block)?;
+                    term_count += leaf.terms.len();
+                    leaf_page_count += 1;
+                }
+            }
+        }
+
+        let mut idx_row_count = 0;
+        for row in self.idx_rows {
+            if !known_segids.contains(&row.segid) {
+                return Err(fts5_data_error("%_idx row references unknown segment"));
+            }
+            checksum = fts5_checksum_u32(checksum, row.segid);
+            checksum = fts5_checksum_bytes(checksum, &row.term);
+            checksum = fts5_checksum_u32(checksum, row.btree_page);
+            checksum = fts5_checksum_u8(checksum, u8::from(row.has_doclist_index));
+            idx_row_count += 1;
+        }
+
+        for row in self.data_rows {
+            match Fts5DataRowid::decode(row.id)? {
+                Fts5DataRowid::SegmentLeaf { segid, .. }
+                | Fts5DataRowid::DoclistIndex { segid, .. }
+                | Fts5DataRowid::Tombstone { segid, .. } => {
+                    if !known_segids.contains(&segid) {
+                        return Err(fts5_data_error("%_data row references unknown segment"));
+                    }
+                }
+                Fts5DataRowid::Averages | Fts5DataRowid::Structure => {}
+            }
+        }
+
+        Ok(Fts5SegmentIntegrityReport {
+            segment_count: seen_segids.len(),
+            leaf_page_count,
+            idx_row_count,
+            term_count,
+            checksum,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Fts5SegmentReader<'a> {
+    segment: &'a Fts5StructureSegment,
+    data_rows: &'a [Fts5DataRow],
+    idx_rows: &'a [Fts5IdxRow],
+}
+
+impl<'a> Fts5SegmentReader<'a> {
+    #[must_use]
+    pub const fn segment(&self) -> &'a Fts5StructureSegment {
+        self.segment
+    }
+
+    pub fn leaf(&self, pgno: u32) -> Result<Option<Fts5SegmentLeaf>> {
+        if pgno < self.segment.pgno_first || pgno > self.segment.pgno_last {
+            return Err(fts5_data_error("segment leaf page outside structure range"));
+        }
+        self.data_row(pgno)
+            .map(|row| Fts5SegmentLeaf::decode(&row.block))
+            .transpose()
+    }
+
+    #[must_use]
+    pub fn term_cursor(&self) -> Fts5SegmentTermCursor<'a> {
+        self.term_cursor_from(self.segment.pgno_first)
+    }
+
+    #[must_use]
+    pub fn term_cursor_from(&self, pgno: u32) -> Fts5SegmentTermCursor<'a> {
+        Fts5SegmentTermCursor {
+            reader: *self,
+            next_pgno: pgno,
+            current_terms: Vec::new().into_iter(),
+        }
+    }
+
+    pub fn exact_postings(&self, term: &[u8]) -> Result<Option<Fts5LazyPostings>> {
+        let mut cursor = self.term_cursor_from(self.candidate_page(term));
+        for entry in &mut cursor {
+            let entry = entry?;
+            match entry.term.as_slice().cmp(term) {
+                std::cmp::Ordering::Equal => {
+                    return Ok(Some(Fts5LazyPostings::new(entry.doclist.entries)));
+                }
+                std::cmp::Ordering::Greater => return Ok(None),
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn prefix_matches(&self, prefix: &[u8]) -> Result<Vec<Fts5LazyTermMatch>> {
+        let mut matches = Vec::new();
+        let mut cursor = self.term_cursor_from(self.candidate_page(prefix));
+        for entry in &mut cursor {
+            let entry = entry?;
+            if entry.term.starts_with(prefix) {
+                matches.push(Fts5LazyTermMatch {
+                    term: entry.term,
+                    postings: Fts5LazyPostings::new(entry.doclist.entries),
+                });
+                continue;
+            }
+            if !matches.is_empty() || entry.term.as_slice() > prefix {
+                break;
+            }
+        }
+        Ok(matches)
+    }
+
+    fn candidate_page(&self, term: &[u8]) -> u32 {
+        self.idx_rows
+            .iter()
+            .filter(|row| row.segid == self.segment.segid && row.term.as_slice() <= term)
+            .max_by(|left, right| left.term.cmp(&right.term))
+            .map_or(self.segment.pgno_first, |row| {
+                row.btree_page
+                    .clamp(self.segment.pgno_first, self.segment.pgno_last)
+            })
+    }
+
+    fn data_row(&self, pgno: u32) -> Option<&'a Fts5DataRow> {
+        self.data_rows.iter().find(|row| {
+            matches!(
+                Fts5DataRowid::decode(row.id),
+                Ok(Fts5DataRowid::SegmentLeaf { segid, pgno: row_pgno })
+                    if segid == self.segment.segid && row_pgno == pgno
+            )
+        })
+    }
+}
+
+pub struct Fts5SegmentTermCursor<'a> {
+    reader: Fts5SegmentReader<'a>,
+    next_pgno: u32,
+    current_terms: std::vec::IntoIter<Fts5SegmentTerm>,
+}
+
+impl Iterator for Fts5SegmentTermCursor<'_> {
+    type Item = Result<Fts5SegmentTerm>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(term) = self.current_terms.next() {
+                return Some(Ok(term));
+            }
+            if self.next_pgno > self.reader.segment.pgno_last {
+                return None;
+            }
+
+            match self.reader.leaf(self.next_pgno) {
+                Ok(Some(leaf)) => {
+                    self.next_pgno = self.next_pgno.saturating_add(1);
+                    self.current_terms = leaf.terms.into_iter();
+                }
+                Ok(None) => {
+                    return Some(Err(fts5_data_error("missing segment leaf page")));
+                }
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fts5ShadowRows {
+    pub data: Vec<Fts5DataRow>,
+    pub idx: Vec<Fts5IdxRow>,
+    pub config: Vec<Fts5ConfigRecord>,
+    pub content: Vec<Fts5ContentRow>,
+    pub docsize: Vec<Fts5DocsizeRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fts5ShadowOpenReport {
+    pub metadata: Fts5ConfigMetadata,
+    pub averages: Option<Fts5AveragesRecord>,
+    pub structure: Option<Fts5StructureRecord>,
+    pub integrity: Option<Fts5SegmentIntegrityReport>,
+    pub content_row_count: usize,
+    pub docsize_row_count: usize,
+    pub max_seen_rowid: Option<i64>,
+    pub bound_without_rebuild: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Fts5ShadowOpen {
+    pub table: Fts5Table,
+    pub report: Fts5ShadowOpenReport,
+}
+
+impl Fts5ShadowRows {
+    pub fn validate_for_open(&self, column_count: usize) -> Result<Fts5ShadowOpenReport> {
+        let metadata = Fts5ConfigMetadata::decode_rows(&self.config)?;
+        let data = Fts5DataMetadata::decode_rows(&self.data, column_count)?;
+
+        for row in &self.content {
+            if row.values.len() != column_count {
+                return Err(fts5_data_error("content row column count mismatch"));
+            }
+        }
+        for row in &self.docsize {
+            if row.column_token_counts.len() != column_count {
+                return Err(fts5_data_error("docsize row column count mismatch"));
+            }
+        }
+
+        let integrity = if let Some(structure) = data.structure.as_ref()
+            && structure.segment_count() > 0
+        {
+            Some(Fts5SegmentRowSet::new(&self.data, &self.idx).integrity_report(structure)?)
+        } else {
+            None
+        };
+
+        let max_seen_rowid = self
+            .content
+            .iter()
+            .map(|row| row.rowid)
+            .chain(self.docsize.iter().map(|row| row.rowid))
+            .max();
+
+        Ok(Fts5ShadowOpenReport {
+            metadata,
+            averages: data.averages,
+            structure: data.structure,
+            integrity,
+            content_row_count: self.content.len(),
+            docsize_row_count: self.docsize.len(),
+            max_seen_rowid,
+            bound_without_rebuild: true,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5ConfigMetadata {
+    pub format_version: i64,
+    pub page_size: i64,
+    pub automerge: i64,
+    pub usermerge: i64,
+    pub crisismerge: i64,
+    pub hash_size: i64,
+    pub delete_merge: i64,
+    pub rank: Option<String>,
+    pub secure_delete: bool,
+    pub insttoken: bool,
+}
+
+impl Default for Fts5ConfigMetadata {
+    fn default() -> Self {
+        Self {
+            format_version: FTS5_CONFIG_VERSION,
+            page_size: FTS5_DEFAULT_PAGE_SIZE,
+            automerge: FTS5_DEFAULT_AUTOMERGE,
+            usermerge: FTS5_DEFAULT_USERMERGE,
+            crisismerge: FTS5_DEFAULT_CRISISMERGE,
+            hash_size: FTS5_DEFAULT_HASHSIZE,
+            delete_merge: FTS5_DEFAULT_DELETE_AUTOMERGE,
+            rank: None,
+            secure_delete: false,
+            insttoken: false,
+        }
+    }
+}
+
+impl Fts5ConfigMetadata {
+    #[must_use]
+    pub fn from_runtime_config(config: Fts5Config) -> Self {
+        Self {
+            secure_delete: config.secure_delete,
+            insttoken: config.insttoken,
+            ..Self::default()
+        }
+    }
+
+    pub fn apply_to_runtime_config(&self, config: &mut Fts5Config) {
+        config.secure_delete = self.secure_delete;
+        config.insttoken = self.insttoken;
+    }
+
+    #[must_use]
+    pub fn encode_rows(&self) -> Vec<Fts5ConfigRecord> {
+        let mut rows = Vec::with_capacity(10);
+
+        push_non_default_integer(
+            &mut rows,
+            "automerge",
+            self.automerge,
+            FTS5_DEFAULT_AUTOMERGE,
+        );
+        push_non_default_integer(
+            &mut rows,
+            "crisismerge",
+            self.crisismerge,
+            FTS5_DEFAULT_CRISISMERGE,
+        );
+        push_non_default_integer(
+            &mut rows,
+            "deletemerge",
+            self.delete_merge,
+            FTS5_DEFAULT_DELETE_AUTOMERGE,
+        );
+        push_non_default_integer(&mut rows, "hashsize", self.hash_size, FTS5_DEFAULT_HASHSIZE);
+        if self.insttoken {
+            rows.push(Fts5ConfigRecord::integer("insttoken", 1));
+        }
+        push_non_default_integer(&mut rows, "pgsz", self.page_size, FTS5_DEFAULT_PAGE_SIZE);
+        if let Some(rank) = self.rank.as_ref() {
+            rows.push(Fts5ConfigRecord::text("rank", rank.clone()));
+        }
+        if self.secure_delete {
+            rows.push(Fts5ConfigRecord::integer("secure-delete", 1));
+        }
+        push_non_default_integer(
+            &mut rows,
+            "usermerge",
+            self.usermerge,
+            FTS5_DEFAULT_USERMERGE,
+        );
+        rows.push(Fts5ConfigRecord::integer("version", self.format_version));
+        rows.sort_by(|left, right| left.key.cmp(&right.key));
+        rows
+    }
+
+    pub fn decode_rows(rows: &[Fts5ConfigRecord]) -> Result<Self> {
+        let mut metadata = Self::default();
+        let mut seen_version = None;
+
+        for row in rows {
+            let key = row.key.trim();
+            if key.eq_ignore_ascii_case("version") {
+                seen_version = config_integer_value(&row.value);
+                continue;
+            }
+            apply_config_metadata_row(&mut metadata, key, &row.value);
+        }
+
+        let Some(version) = seen_version else {
+            return Err(FrankenError::function_error(
+                "fts5: missing version row in %_config",
+            ));
+        };
+        if version != FTS5_CONFIG_VERSION && version != FTS5_CONFIG_VERSION_SECURE_DELETE {
+            return Err(FrankenError::function_error(format!(
+                "invalid fts5 file format (found {version}, expected {FTS5_CONFIG_VERSION} or {FTS5_CONFIG_VERSION_SECURE_DELETE}) - run 'rebuild'"
+            )));
+        }
+
+        metadata.format_version = version;
+        Ok(metadata)
+    }
+}
+
+fn push_non_default_integer(
+    rows: &mut Vec<Fts5ConfigRecord>,
+    key: &'static str,
+    value: i64,
+    default: i64,
+) {
+    if value != default {
+        rows.push(Fts5ConfigRecord::integer(key, value));
+    }
+}
+
+fn config_integer_value(value: &SqliteValue) -> Option<i64> {
+    match value {
+        SqliteValue::Integer(value) => Some(*value),
+        SqliteValue::Text(text) => text.as_str().trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn apply_config_metadata_row(metadata: &mut Fts5ConfigMetadata, key: &str, value: &SqliteValue) {
+    match key.to_ascii_lowercase().as_str() {
+        "pgsz" => {
+            if let Some(page_size) = config_integer_value(value)
+                && (32..=FTS5_MAX_PAGE_SIZE).contains(&page_size)
+            {
+                metadata.page_size = page_size;
+            }
+        }
+        "hashsize" => {
+            if let Some(hash_size) = config_integer_value(value)
+                && hash_size > 0
+            {
+                metadata.hash_size = hash_size;
+            }
+        }
+        "automerge" => {
+            if let Some(mut automerge) = config_integer_value(value)
+                && (0..=64).contains(&automerge)
+            {
+                if automerge == 1 {
+                    automerge = FTS5_DEFAULT_AUTOMERGE;
+                }
+                metadata.automerge = automerge;
+            }
+        }
+        "usermerge" => {
+            if let Some(usermerge) = config_integer_value(value)
+                && (2..=16).contains(&usermerge)
+            {
+                metadata.usermerge = usermerge;
+            }
+        }
+        "crisismerge" => {
+            if let Some(mut crisismerge) = config_integer_value(value)
+                && crisismerge >= 0
+            {
+                if crisismerge <= 1 {
+                    crisismerge = FTS5_DEFAULT_CRISISMERGE;
+                }
+                if crisismerge >= FTS5_MAX_SEGMENT {
+                    crisismerge = FTS5_MAX_SEGMENT - 1;
+                }
+                metadata.crisismerge = crisismerge;
+            }
+        }
+        "deletemerge" => {
+            if let Some(mut delete_merge) = config_integer_value(value) {
+                if delete_merge < 0 {
+                    delete_merge = FTS5_DEFAULT_DELETE_AUTOMERGE;
+                }
+                if delete_merge > 100 {
+                    delete_merge = 0;
+                }
+                metadata.delete_merge = delete_merge;
+            }
+        }
+        "rank" => {
+            metadata.rank = Some(value.to_text());
+        }
+        "secure-delete" => {
+            if let Some(value) = config_integer_value(value)
+                && value >= 0
+            {
+                metadata.secure_delete = value != 0;
+            }
+        }
+        "insttoken" => {
+            if let Some(value) = config_integer_value(value)
+                && value >= 0
+            {
+                metadata.insttoken = value != 0;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn fts5_data_error(detail: impl Into<String>) -> FrankenError {
+    FrankenError::function_error(format!("fts5: corrupt %_data record: {}", detail.into()))
+}
+
+fn fts5_push_varint(block: &mut Vec<u8>, value: u64) {
+    let mut buf = [0; 9];
+    let len = write_varint(&mut buf, value);
+    block.extend_from_slice(&buf[..len]);
+}
+
+fn fts5_read_varint(block: &[u8], offset: &mut usize, field: &str) -> Result<u64> {
+    if *offset >= block.len() {
+        return Err(fts5_data_error(format!("missing {field}")));
+    }
+    let (value, len) = read_varint(&block[*offset..])
+        .ok_or_else(|| fts5_data_error(format!("truncated varint for {field}")))?;
+    *offset += len;
+    Ok(value)
+}
+
+fn fts5_read_usize(block: &[u8], offset: &mut usize, field: &str) -> Result<usize> {
+    let value = fts5_read_varint(block, offset, field)?;
+    usize::try_from(value).map_err(|_| fts5_data_error(format!("{field} exceeds usize")))
+}
+
+fn fts5_read_bounded_usize(block: &[u8], offset: &mut usize, field: &str) -> Result<usize> {
+    let value = fts5_read_varint(block, offset, field)?;
+    if value > FTS5_MAX_SEGMENT_U64 {
+        return Err(fts5_data_error(format!("{field} exceeds FTS5 maximum")));
+    }
+    usize::try_from(value).map_err(|_| fts5_data_error(format!("{field} exceeds usize")))
+}
+
+fn fts5_read_u32(block: &[u8], offset: &mut usize, field: &str) -> Result<u32> {
+    let value = fts5_read_varint(block, offset, field)?;
+    u32::try_from(value).map_err(|_| fts5_data_error(format!("{field} exceeds u32")))
+}
+
+fn fts5_data_rowid(segid: u32, dlidx: bool, height: u8, pgno: u32, kind: &str) -> Result<i64> {
+    if segid == 0 {
+        return Err(fts5_data_error(format!("{kind} segid must be non-zero")));
+    }
+    if u64::from(segid) >= FTS5_DATA_ID_LIMIT {
+        return Err(fts5_data_error(format!(
+            "{kind} segid exceeds 16-bit limit"
+        )));
+    }
+    fts5_data_rowid_from_parts(u64::from(segid), dlidx, height, pgno)
+}
+
+fn fts5_data_rowid_from_parts(segid: u64, dlidx: bool, height: u8, pgno: u32) -> Result<i64> {
+    if u64::from(height) > FTS5_DATA_HEIGHT_MASK {
+        return Err(fts5_data_error("dlidx height exceeds 5-bit limit"));
+    }
+    if u64::from(pgno) > FTS5_DATA_PAGE_MASK {
+        return Err(fts5_data_error("page number exceeds 31-bit limit"));
+    }
+
+    let rowid = (segid << (FTS5_DATA_PAGE_BITS + FTS5_DATA_HEIGHT_BITS + FTS5_DATA_DLI_BITS))
+        | (u64::from(dlidx) << (FTS5_DATA_PAGE_BITS + FTS5_DATA_HEIGHT_BITS))
+        | (u64::from(height) << FTS5_DATA_PAGE_BITS)
+        | u64::from(pgno);
+    i64::try_from(rowid).map_err(|_| fts5_data_error("segment rowid exceeds i64"))
+}
+
+fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn read_be_u16(bytes: &[u8]) -> u16 {
+    u16::from_be_bytes([bytes[0], bytes[1]])
+}
+
+fn write_be_u16(bytes: &mut [u8], value: u16) {
+    bytes[..2].copy_from_slice(&value.to_be_bytes());
+}
+
+fn read_be_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn write_be_u32(bytes: &mut [u8], value: u32) {
+    bytes[..4].copy_from_slice(&value.to_be_bytes());
+}
+
+fn read_be_u64(bytes: &[u8]) -> u64 {
+    u64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
+fn write_be_u64(bytes: &mut [u8], value: u64) {
+    bytes[..8].copy_from_slice(&value.to_be_bytes());
+}
+
+fn fts5_checksum_u8(checksum: u64, value: u8) -> u64 {
+    (checksum ^ u64::from(value)).wrapping_mul(FTS5_SEGMENT_CHECKSUM_PRIME)
+}
+
+fn fts5_checksum_bytes(mut checksum: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        checksum = fts5_checksum_u8(checksum, *byte);
+    }
+    checksum
+}
+
+fn fts5_checksum_u32(checksum: u64, value: u32) -> u64 {
+    fts5_checksum_bytes(checksum, &value.to_be_bytes())
+}
+
+fn fts5_checksum_i64(checksum: u64, value: i64) -> u64 {
+    fts5_checksum_bytes(checksum, &value.to_be_bytes())
+}
+
+fn postings_have_position_match(
+    left: &Fts5DoclistEntry,
+    right: &Fts5DoclistEntry,
+    matches_positions: &impl Fn(u32, u32) -> bool,
+) -> bool {
+    for left_column in &left.poslist.columns {
+        let Some(right_column) = right
+            .poslist
+            .columns
+            .iter()
+            .find(|column| column.column == left_column.column)
+        else {
+            continue;
+        };
+        for left_offset in &left_column.offsets {
+            if right_column
+                .offsets
+                .iter()
+                .any(|right_offset| matches_positions(*left_offset, *right_offset))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 impl Fts5Config {
@@ -77,8 +2468,12 @@ impl Fts5Config {
             secure_delete: false,
             content_mode,
             contentless_delete: false,
+            contentless_unindexed: false,
             columnsize: true,
             detail: DetailMode::Full,
+            insttoken: false,
+            locale: false,
+            tokendata: false,
         }
     }
 
@@ -93,6 +2488,11 @@ impl Fts5Config {
     }
 
     #[must_use]
+    pub const fn contentless_unindexed_enabled(self) -> bool {
+        self.contentless_unindexed
+    }
+
+    #[must_use]
     pub const fn columnsize_enabled(self) -> bool {
         self.columnsize
     }
@@ -100,6 +2500,21 @@ impl Fts5Config {
     #[must_use]
     pub const fn detail_mode(self) -> DetailMode {
         self.detail
+    }
+
+    #[must_use]
+    pub const fn insttoken_enabled(self) -> bool {
+        self.insttoken
+    }
+
+    #[must_use]
+    pub const fn locale_enabled(self) -> bool {
+        self.locale
+    }
+
+    #[must_use]
+    pub const fn tokendata_enabled(self) -> bool {
+        self.tokendata
     }
 
     #[must_use]
@@ -149,9 +2564,48 @@ impl Fts5Config {
                 self.contentless_delete = value;
                 true
             }
+            "insttoken" => {
+                self.insttoken = value;
+                true
+            }
             _ => false,
         }
     }
+
+    #[must_use]
+    pub fn config_metadata(self) -> Fts5ConfigMetadata {
+        Fts5ConfigMetadata::from_runtime_config(self)
+    }
+
+    #[must_use]
+    pub fn encode_config_rows(self) -> Vec<Fts5ConfigRecord> {
+        self.config_metadata().encode_rows()
+    }
+
+    pub fn apply_config_rows(&mut self, rows: &[Fts5ConfigRecord]) -> Result<Fts5ConfigMetadata> {
+        let metadata = Fts5ConfigMetadata::decode_rows(rows)?;
+        metadata.apply_to_runtime_config(self);
+        Ok(metadata)
+    }
+}
+
+fn validate_contentless_options(config: Fts5Config) -> Result<()> {
+    if config.contentless_delete && config.content_mode != ContentMode::Contentless {
+        return Err(FrankenError::function_error(
+            "contentless_delete=1 requires a contentless table",
+        ));
+    }
+    if config.contentless_delete && !config.columnsize {
+        return Err(FrankenError::function_error(
+            "contentless_delete=1 is incompatible with columnsize=0",
+        ));
+    }
+    if config.contentless_unindexed && config.content_mode != ContentMode::Contentless {
+        return Err(FrankenError::function_error(
+            "contentless_unindexed=1 requires a contentless table",
+        ));
+    }
+    Ok(())
 }
 
 impl Default for Fts5Config {
@@ -177,11 +2631,28 @@ fn parse_columnsize_option(value: &str) -> Option<bool> {
 }
 
 fn parse_detail_option(value: &str) -> Option<DetailMode> {
-    match value.trim() {
-        "full" => Some(DetailMode::Full),
-        "column" => Some(DetailMode::Column),
-        "none" => Some(DetailMode::None),
-        _ => None,
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("full") {
+        Some(DetailMode::Full)
+    } else if value.eq_ignore_ascii_case("column") {
+        Some(DetailMode::Column)
+    } else if value.eq_ignore_ascii_case("none") {
+        Some(DetailMode::None)
+    } else {
+        None
+    }
+}
+
+fn tokendata_query_key(term: &str) -> &str {
+    match term.as_bytes().iter().position(|byte| *byte == 0) {
+        Some(nul_pos) => {
+            if let Some(query_key) = term.get(..nul_pos) {
+                query_key
+            } else {
+                term
+            }
+        }
+        None => term,
     }
 }
 
@@ -204,18 +2675,96 @@ fn parse_option_assignment(input: &str) -> Option<(&str, &str)> {
 
 fn unquote_fts_arg(value: &str) -> &str {
     let trimmed = value.trim();
-    if trimmed.len() >= 2 {
-        let bytes = trimmed.as_bytes();
-        let first = bytes[0];
-        let last = bytes[trimmed.len() - 1];
-        if (first == b'\'' && last == b'\'')
-            || (first == b'"' && last == b'"')
-            || (first == b'`' && last == b'`')
-        {
-            return &trimmed[1..trimmed.len() - 1];
+    for quote in ['\'', '"', '`'] {
+        if let Some(unquoted) = strip_fts_quote_pair(trimmed, quote) {
+            return unquoted;
         }
     }
     trimmed
+}
+
+fn strip_fts_quote_pair(value: &str, quote: char) -> Option<&str> {
+    value.strip_prefix(quote)?.strip_suffix(quote)
+}
+
+fn unquote_fts_identifier(value: &str) -> &str {
+    value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '[' | ']'))
+}
+
+fn parse_column_declaration(input: &str) -> Result<Option<(String, bool)>> {
+    let mut segments = input.split_whitespace();
+    let Some(raw_column) = segments.next() else {
+        return Ok(None);
+    };
+
+    let column = unquote_fts_identifier(raw_column);
+    if column.is_empty() {
+        return Ok(None);
+    }
+
+    let mut indexed = true;
+    let mut expect_collation_name = false;
+    for segment in segments {
+        if expect_collation_name {
+            expect_collation_name = false;
+            continue;
+        }
+
+        match segment.to_ascii_lowercase().as_str() {
+            "unindexed" => indexed = false,
+            "collate" => expect_collation_name = true,
+            _ => {
+                return Err(FrankenError::function_error(format!(
+                    "fts5: unsupported column option '{segment}'"
+                )));
+            }
+        }
+    }
+
+    if expect_collation_name {
+        return Err(FrankenError::function_error(
+            "fts5: COLLATE column option requires a collation name",
+        ));
+    }
+
+    Ok(Some((column.to_owned(), indexed)))
+}
+
+fn validate_column_names(table_name: &str, columns: &[String]) -> Result<()> {
+    let normalized_table_name = table_name.to_ascii_lowercase();
+    let mut seen = HashSet::with_capacity(columns.len());
+
+    for column in columns {
+        let normalized = column.to_ascii_lowercase();
+        match normalized.as_str() {
+            "rowid" => {
+                return Err(FrankenError::function_error(
+                    "fts5: column name 'rowid' is reserved",
+                ));
+            }
+            "rank" => {
+                return Err(FrankenError::function_error(
+                    "fts5: column name 'rank' is reserved",
+                ));
+            }
+            _ if !normalized_table_name.is_empty() && normalized == normalized_table_name => {
+                return Err(FrankenError::function_error(format!(
+                    "fts5: column name '{column}' conflicts with table name"
+                )));
+            }
+            _ => {}
+        }
+
+        if !seen.insert(normalized) {
+            return Err(FrankenError::function_error(format!(
+                "fts5: duplicate column name '{column}'"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +2809,7 @@ pub trait Fts5Tokenizer: Send + Sync {
 }
 
 /// Unicode61 tokenizer: splits on non-alphanumeric characters, lowercases.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Unicode61Tokenizer {
     /// Characters to treat as separators (empty = default Unicode categories).
     pub separators: String,
@@ -270,20 +2819,48 @@ pub struct Unicode61Tokenizer {
     pub remove_diacritics: u8,
 }
 
+impl Default for Unicode61Tokenizer {
+    fn default() -> Self {
+        Self {
+            separators: String::new(),
+            token_chars: String::new(),
+            remove_diacritics: 1,
+        }
+    }
+}
+
 impl Unicode61Tokenizer {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[inline]
+    fn option_contains(option_chars: &str, ch: char) -> bool {
+        if ch.is_ascii() {
+            let mut encoded = [0; 4];
+            let needle = ch.encode_utf8(&mut encoded).as_bytes()[0];
+            option_chars.as_bytes().contains(&needle)
+        } else {
+            option_chars.contains(ch)
+        }
+    }
+
     fn is_token_char(&self, ch: char) -> bool {
-        if !self.token_chars.is_empty() && self.token_chars.contains(ch) {
+        if !self.token_chars.is_empty() && Self::option_contains(&self.token_chars, ch) {
             return true;
         }
-        if !self.separators.is_empty() && self.separators.contains(ch) {
+        if !self.separators.is_empty() && Self::option_contains(&self.separators, ch) {
             return false;
         }
         ch.is_alphanumeric()
+    }
+
+    fn normalized_char(&self, ch: char) -> char {
+        if self.remove_diacritics == 0 {
+            return ch;
+        }
+        latin_diacritic_base(ch).unwrap_or(ch)
     }
 }
 
@@ -313,7 +2890,7 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
                         current_term.push_str(&text[start..byte_idx]);
                     }
                 }
-                for lc in ch.to_lowercase() {
+                for lc in self.normalized_char(ch).to_lowercase() {
                     current_term.push(lc);
                 }
             } else if let Some(start) = token_start.take() {
@@ -337,9 +2914,25 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
     }
 }
 
-/// ASCII tokenizer: like unicode61 but only ASCII alphanumeric characters.
+/// ASCII tokenizer: folds ASCII letters and treats all non-ASCII codepoints as
+/// token characters.
 #[derive(Debug, Default)]
 pub struct AsciiTokenizer;
+
+impl AsciiTokenizer {
+    #[inline]
+    fn normalized_token_char(ch: char) -> Option<char> {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            Some(ch)
+        } else if ch.is_ascii_uppercase() {
+            Some(ch.to_ascii_lowercase())
+        } else if ch.is_ascii() {
+            None
+        } else {
+            Some(ch)
+        }
+    }
+}
 
 impl Fts5Tokenizer for AsciiTokenizer {
     fn name(&self) -> &'static str {
@@ -348,41 +2941,42 @@ impl Fts5Tokenizer for AsciiTokenizer {
 
     fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
         let mut token_start = None;
-        let mut current_term = String::new();
-        let mut borrowed_ascii_token = false;
+        let mut token_buf: Option<String> = None;
 
         for (byte_idx, ch) in text.char_indices() {
-            if ch.is_ascii_alphanumeric() {
-                if token_start.is_none() {
+            if let Some(term_ch) = Self::normalized_token_char(ch) {
+                let start = if let Some(start) = token_start {
+                    start
+                } else {
                     token_start = Some(byte_idx);
-                    current_term.clear();
-                    borrowed_ascii_token = true;
+                    token_buf = None;
+                    byte_idx
+                };
+
+                if term_ch != ch {
+                    let buf = token_buf.get_or_insert_with(|| {
+                        let mut folded = String::new();
+                        folded.push_str(&text[start..byte_idx]);
+                        folded
+                    });
+                    buf.push(term_ch);
+                } else if let Some(buf) = token_buf.as_mut() {
+                    buf.push(term_ch);
                 }
-                if borrowed_ascii_token {
-                    if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
-                        continue;
-                    }
-                    borrowed_ascii_token = false;
-                    if let Some(start) = token_start {
-                        current_term.push_str(&text[start..byte_idx]);
-                    }
-                }
-                current_term.push(ch.to_ascii_lowercase());
             } else if let Some(start) = token_start.take() {
-                if borrowed_ascii_token {
+                if let Some(buf) = token_buf.take() {
+                    sink(buf.as_str(), start, byte_idx, false);
+                } else {
                     sink(&text[start..byte_idx], start, byte_idx, false);
-                } else if !current_term.is_empty() {
-                    sink(current_term.as_str(), start, byte_idx, false);
-                    current_term.clear();
                 }
             }
         }
 
         if let Some(start) = token_start {
-            if borrowed_ascii_token {
+            if let Some(buf) = token_buf {
+                sink(buf.as_str(), start, text.len(), false);
+            } else {
                 sink(&text[start..], start, text.len(), false);
-            } else if !current_term.is_empty() {
-                sink(current_term.as_str(), start, text.len(), false);
             }
         }
     }
@@ -468,7 +3062,22 @@ fn porter_stem(word: &str) -> String {
 }
 
 fn contains_vowel(s: &str) -> bool {
-    s.chars().any(|c| matches!(c, 'a' | 'e' | 'i' | 'o' | 'u'))
+    let mut has_previous = false;
+    let mut previous_was_vowel = false;
+
+    for ch in s.chars() {
+        let is_vowel = porter_is_vowel(ch, has_previous, previous_was_vowel);
+        if is_vowel {
+            return true;
+        }
+        has_previous = true;
+        previous_was_vowel = is_vowel;
+    }
+    false
+}
+
+fn porter_is_vowel(ch: char, has_previous: bool, previous_was_vowel: bool) -> bool {
+    matches!(ch, 'a' | 'e' | 'i' | 'o' | 'u') || (ch == 'y' && has_previous && !previous_was_vowel)
 }
 
 fn step1b_fixup(s: &mut String) {
@@ -536,15 +3145,19 @@ fn apply_step3(s: &mut String) {
 fn measure(s: &str) -> u32 {
     let mut m = 0u32;
     let mut in_vowel_seq = false;
+    let mut has_previous = false;
+    let mut previous_was_vowel = false;
 
     for ch in s.chars() {
-        let is_vowel = matches!(ch, 'a' | 'e' | 'i' | 'o' | 'u');
+        let is_vowel = porter_is_vowel(ch, has_previous, previous_was_vowel);
         if is_vowel {
             in_vowel_seq = true;
         } else if in_vowel_seq {
             m += 1;
             in_vowel_seq = false;
         }
+        has_previous = true;
+        previous_was_vowel = is_vowel;
     }
 
     m
@@ -553,8 +3166,10 @@ fn measure(s: &str) -> u32 {
 /// Trigram tokenizer: generates all 3-character substrings of the input.
 #[derive(Debug, Default)]
 pub struct TrigramTokenizer {
-    /// Whether to also remove diacritics before generating trigrams.
+    /// Whether matching is case-sensitive.
     pub case_sensitive: bool,
+    /// Whether to remove common Latin diacritics before generating trigrams.
+    pub remove_diacritics: bool,
 }
 
 impl Fts5Tokenizer for TrigramTokenizer {
@@ -563,23 +3178,78 @@ impl Fts5Tokenizer for TrigramTokenizer {
     }
 
     fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
-        let chars: Vec<(usize, char)> = text.char_indices().collect();
-        if chars.len() < 3 {
-            return;
-        }
-
-        for window in chars.windows(3) {
+        let mut window = SmallVec::<[(usize, char); 3]>::new();
+        let mut term = String::new();
+        for item in text.char_indices() {
+            if window.len() == 3 {
+                let _ = window.remove(0);
+            }
+            window.push(item);
+            if window.len() < 3 {
+                continue;
+            }
             let start = window[0].0;
             let end_char = window[2];
             let end = end_char.0 + end_char.1.len_utf8();
-            let term: String = if self.case_sensitive {
-                window.iter().map(|(_, c)| *c).collect()
-            } else {
-                window.iter().flat_map(|(_, c)| c.to_lowercase()).collect()
-            };
+            term.clear();
+            for (_, ch) in &window {
+                push_trigram_char(&mut term, *ch, self.case_sensitive, self.remove_diacritics);
+            }
             sink(term.as_str(), start, end, false);
         }
     }
+}
+
+fn push_trigram_char(term: &mut String, ch: char, case_sensitive: bool, remove_diacritics: bool) {
+    let ch = if remove_diacritics {
+        latin_diacritic_base(ch).unwrap_or(ch)
+    } else {
+        ch
+    };
+
+    if case_sensitive {
+        term.push(ch);
+    } else {
+        push_case_folded_trigram_char(term, ch);
+    }
+}
+
+fn push_case_folded_trigram_char(term: &mut String, ch: char) {
+    if ch.is_ascii() {
+        term.push(ch.to_ascii_lowercase());
+    } else {
+        term.extend(ch.to_lowercase());
+    }
+}
+
+fn latin_diacritic_base(ch: char) -> Option<char> {
+    Some(match ch {
+        'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' | 'Ā' | 'Ă' | 'Ą' | 'à' | 'á' | 'â' | 'ã' | 'ä' | 'å'
+        | 'ā' | 'ă' | 'ą' => 'a',
+        'Ç' | 'Ć' | 'Ĉ' | 'Ċ' | 'Č' | 'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => 'c',
+        'Ð' | 'Ď' | 'Đ' | 'ð' | 'ď' | 'đ' => 'd',
+        'È' | 'É' | 'Ê' | 'Ë' | 'Ē' | 'Ĕ' | 'Ė' | 'Ę' | 'Ě' | 'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ'
+        | 'ė' | 'ę' | 'ě' => 'e',
+        'Ĝ' | 'Ğ' | 'Ġ' | 'Ģ' | 'ĝ' | 'ğ' | 'ġ' | 'ģ' => 'g',
+        'Ĥ' | 'Ħ' | 'ĥ' | 'ħ' => 'h',
+        'Ì' | 'Í' | 'Î' | 'Ï' | 'Ĩ' | 'Ī' | 'Ĭ' | 'Į' | 'İ' | 'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī'
+        | 'ĭ' | 'į' | 'ı' => 'i',
+        'Ĵ' | 'ĵ' => 'j',
+        'Ķ' | 'ķ' => 'k',
+        'Ĺ' | 'Ļ' | 'Ľ' | 'Ŀ' | 'Ł' | 'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => 'l',
+        'Ñ' | 'Ń' | 'Ņ' | 'Ň' | 'ñ' | 'ń' | 'ņ' | 'ň' => 'n',
+        'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'Ø' | 'Ō' | 'Ŏ' | 'Ő' | 'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø'
+        | 'ō' | 'ŏ' | 'ő' => 'o',
+        'Ŕ' | 'Ŗ' | 'Ř' | 'ŕ' | 'ŗ' | 'ř' => 'r',
+        'Ś' | 'Ŝ' | 'Ş' | 'Š' | 'ś' | 'ŝ' | 'ş' | 'š' => 's',
+        'Ţ' | 'Ť' | 'Ŧ' | 'ţ' | 'ť' | 'ŧ' => 't',
+        'Ù' | 'Ú' | 'Û' | 'Ü' | 'Ũ' | 'Ū' | 'Ŭ' | 'Ů' | 'Ű' | 'Ų' | 'ù' | 'ú' | 'û' | 'ü' | 'ũ'
+        | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => 'u',
+        'Ŵ' | 'ŵ' => 'w',
+        'Ý' | 'Ŷ' | 'Ÿ' | 'ý' | 'ÿ' | 'ŷ' => 'y',
+        'Ź' | 'Ż' | 'Ž' | 'ź' | 'ż' | 'ž' => 'z',
+        _ => return None,
+    })
 }
 
 fn split_fts5_tokenizer_spec(spec: &str) -> Vec<String> {
@@ -630,22 +3300,50 @@ fn take_tokenizer_option<'a>(parts: &'a [String], index: &mut usize) -> Option<(
     Some((raw.as_str(), value.as_str()))
 }
 
-fn unicode61_tokenizer_from_args(args: &[String]) -> Unicode61Tokenizer {
+fn unicode61_tokenizer_from_args(args: &[String]) -> Option<Unicode61Tokenizer> {
     let mut tokenizer = Unicode61Tokenizer::new();
     let mut index = 0;
 
-    while let Some((key, value)) = take_tokenizer_option(args, &mut index) {
+    while index < args.len() {
+        let (key, value) = take_tokenizer_option(args, &mut index)?;
         match key.to_ascii_lowercase().as_str() {
             "tokenchars" | "token_chars" => value.clone_into(&mut tokenizer.token_chars),
             "separators" => value.clone_into(&mut tokenizer.separators),
             "remove_diacritics" => {
-                tokenizer.remove_diacritics = value.parse().unwrap_or(tokenizer.remove_diacritics);
+                let remove_diacritics = value.parse::<u8>().ok()?;
+                if remove_diacritics > 2 {
+                    return None;
+                }
+                tokenizer.remove_diacritics = remove_diacritics;
             }
-            _ => {}
+            _ => return None,
         }
     }
 
-    tokenizer
+    Some(tokenizer)
+}
+
+fn trigram_tokenizer_from_args(args: &[String]) -> Option<TrigramTokenizer> {
+    let mut tokenizer = TrigramTokenizer::default();
+    let mut index = 0;
+
+    while let Some((key, value)) = take_tokenizer_option(args, &mut index) {
+        match key.to_ascii_lowercase().as_str() {
+            "case_sensitive" => {
+                tokenizer.case_sensitive = parse_columnsize_option(value)?;
+            }
+            "remove_diacritics" => {
+                tokenizer.remove_diacritics = parse_columnsize_option(value)?;
+            }
+            _ => return None,
+        }
+    }
+
+    if tokenizer.case_sensitive && tokenizer.remove_diacritics {
+        return None;
+    }
+
+    Some(tokenizer)
 }
 
 fn create_tokenizer_from_parts(parts: &[String]) -> Option<Box<dyn Fts5Tokenizer>> {
@@ -653,7 +3351,7 @@ fn create_tokenizer_from_parts(parts: &[String]) -> Option<Box<dyn Fts5Tokenizer
     let args = &parts[1..];
 
     match name.as_str() {
-        "unicode61" => Some(Box::new(unicode61_tokenizer_from_args(args))),
+        "unicode61" => Some(Box::new(unicode61_tokenizer_from_args(args)?)),
         "ascii" => Some(Box::new(AsciiTokenizer)),
         "porter" => {
             let inner = if args.is_empty() {
@@ -663,7 +3361,7 @@ fn create_tokenizer_from_parts(parts: &[String]) -> Option<Box<dyn Fts5Tokenizer
             };
             Some(Box::new(PorterTokenizer::new(inner)))
         }
-        "trigram" => Some(Box::new(TrigramTokenizer::default())),
+        "trigram" => Some(Box::new(trigram_tokenizer_from_args(args)?)),
         _ => None,
     }
 }
@@ -673,6 +3371,233 @@ fn create_tokenizer_from_parts(parts: &[String]) -> Option<Box<dyn Fts5Tokenizer
 pub fn create_tokenizer(name: &str) -> Option<Box<dyn Fts5Tokenizer>> {
     let parts = split_fts5_tokenizer_spec(name);
     create_tokenizer_from_parts(&parts)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fts5TokenizeReason {
+    Document,
+    Query,
+    Prefix,
+    Auxiliary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fts5TokenizeRequest<'a> {
+    pub text: &'a str,
+    pub reason: Fts5TokenizeReason,
+    pub locale: Option<&'a str>,
+}
+
+impl<'a> Fts5TokenizeRequest<'a> {
+    #[must_use]
+    pub const fn new(text: &'a str, reason: Fts5TokenizeReason) -> Self {
+        Self {
+            text,
+            reason,
+            locale: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_locale(mut self, locale: &'a str) -> Self {
+        self.locale = Some(locale);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5ExtensionContext<'a> {
+    pub table_name: &'a str,
+    pub columns: &'a [String],
+    pub query_terms: &'a [String],
+    pub rowid: Option<i64>,
+    pub row: Option<&'a [String]>,
+    pub locale: Option<&'a str>,
+}
+
+impl<'a> Fts5ExtensionContext<'a> {
+    #[must_use]
+    pub const fn new(table_name: &'a str, columns: &'a [String]) -> Self {
+        Self {
+            table_name,
+            columns,
+            query_terms: &[],
+            rowid: None,
+            row: None,
+            locale: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_query_terms(mut self, query_terms: &'a [String]) -> Self {
+        self.query_terms = query_terms;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_row(mut self, rowid: i64, row: &'a [String]) -> Self {
+        self.rowid = Some(rowid);
+        self.row = Some(row);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_locale(mut self, locale: &'a str) -> Self {
+        self.locale = Some(locale);
+        self
+    }
+}
+
+type Fts5TokenizerFactory = Arc<dyn Fn(&[String]) -> Option<Box<dyn Fts5Tokenizer>> + Send + Sync>;
+type Fts5AuxiliaryFunction =
+    Arc<dyn Fn(&Fts5ExtensionContext<'_>, &[SqliteValue]) -> Result<SqliteValue> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct Fts5ExtensionApi {
+    tokenizers: BTreeMap<String, Fts5TokenizerFactory>,
+    auxiliaries: BTreeMap<String, Fts5AuxiliaryFunction>,
+}
+
+impl std::fmt::Debug for Fts5ExtensionApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fts5ExtensionApi")
+            .field("tokenizers", &self.tokenizer_names())
+            .field("auxiliaries", &self.auxiliary_names())
+            .finish()
+    }
+}
+
+impl Default for Fts5ExtensionApi {
+    fn default() -> Self {
+        Self::with_builtins()
+    }
+}
+
+impl Fts5ExtensionApi {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            tokenizers: BTreeMap::new(),
+            auxiliaries: BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_builtins() -> Self {
+        let mut api = Self::new();
+        let _ = api.register_tokenizer("unicode61", |args| {
+            Some(Box::new(unicode61_tokenizer_from_args(args)?))
+        });
+        let _ = api.register_tokenizer("ascii", |args| {
+            args.is_empty()
+                .then_some(Box::new(AsciiTokenizer) as Box<dyn Fts5Tokenizer>)
+        });
+        let _ = api.register_tokenizer("porter", |args| {
+            let inner = if args.is_empty() {
+                Box::new(Unicode61Tokenizer::new()) as Box<dyn Fts5Tokenizer>
+            } else {
+                create_tokenizer_from_parts(args)?
+            };
+            Some(Box::new(PorterTokenizer::new(inner)))
+        });
+        let _ = api.register_tokenizer("trigram", |args| {
+            Some(Box::new(trigram_tokenizer_from_args(args)?))
+        });
+        let _ = api.register_auxiliary("rowid", |ctx, _args| {
+            Ok(ctx.rowid.map_or(SqliteValue::Null, SqliteValue::Integer))
+        });
+        let _ = api.register_auxiliary("column_count", |ctx, _args| {
+            Ok(SqliteValue::Integer(
+                i64::try_from(ctx.columns.len()).unwrap_or(i64::MAX),
+            ))
+        });
+        api
+    }
+
+    pub fn register_tokenizer<F>(
+        &mut self,
+        name: impl AsRef<str>,
+        factory: F,
+    ) -> Option<Fts5TokenizerFactory>
+    where
+        F: Fn(&[String]) -> Option<Box<dyn Fts5Tokenizer>> + Send + Sync + 'static,
+    {
+        self.tokenizers
+            .insert(canonical_fts5_api_name(name.as_ref()), Arc::new(factory))
+    }
+
+    #[must_use]
+    pub fn find_tokenizer(&self, name: &str) -> Option<Fts5TokenizerFactory> {
+        self.tokenizers
+            .get(&canonical_fts5_api_name(name))
+            .map(Arc::clone)
+    }
+
+    #[must_use]
+    pub fn create_tokenizer(&self, spec: &str) -> Option<Box<dyn Fts5Tokenizer>> {
+        let parts = split_fts5_tokenizer_spec(spec);
+        let name = parts.first()?;
+        self.find_tokenizer(name)?.as_ref()(&parts[1..])
+    }
+
+    pub fn tokenize(&self, spec: &str, request: Fts5TokenizeRequest<'_>) -> Result<Vec<Fts5Token>> {
+        let tokenizer = self.create_tokenizer(spec).ok_or_else(|| {
+            FrankenError::function_error(format!("fts5: unknown tokenizer '{spec}'"))
+        })?;
+        let mut tokens = tokenizer.tokenize(request.text);
+        if request.reason == Fts5TokenizeReason::Prefix {
+            tokens.retain(|token| !token.term.is_empty());
+        }
+        Ok(tokens)
+    }
+
+    pub fn register_auxiliary<F>(
+        &mut self,
+        name: impl AsRef<str>,
+        function: F,
+    ) -> Option<Fts5AuxiliaryFunction>
+    where
+        F: Fn(&Fts5ExtensionContext<'_>, &[SqliteValue]) -> Result<SqliteValue>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.auxiliaries
+            .insert(canonical_fts5_api_name(name.as_ref()), Arc::new(function))
+    }
+
+    #[must_use]
+    pub fn find_auxiliary(&self, name: &str) -> Option<Fts5AuxiliaryFunction> {
+        self.auxiliaries
+            .get(&canonical_fts5_api_name(name))
+            .map(Arc::clone)
+    }
+
+    pub fn invoke_auxiliary(
+        &self,
+        name: &str,
+        context: &Fts5ExtensionContext<'_>,
+        args: &[SqliteValue],
+    ) -> Result<SqliteValue> {
+        let function = self.find_auxiliary(name).ok_or_else(|| {
+            FrankenError::function_error(format!("fts5: unknown auxiliary function '{name}'"))
+        })?;
+        function(context, args)
+    }
+
+    #[must_use]
+    pub fn tokenizer_names(&self) -> Vec<String> {
+        self.tokenizers.keys().cloned().collect()
+    }
+
+    #[must_use]
+    pub fn auxiliary_names(&self) -> Vec<String> {
+        self.auxiliaries.keys().cloned().collect()
+    }
+}
+
+fn canonical_fts5_api_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
 }
 
 // ---------------------------------------------------------------------------
@@ -688,6 +3613,7 @@ pub enum Fts5QueryTokenKind {
     Or,
     Not,
     Near,
+    Plus,
     LParen,
     RParen,
     ColumnFilter,
@@ -711,6 +3637,8 @@ pub enum Fts5QueryError {
     UnaryNotForbidden,
     InvalidColumnFilter(String),
     InvalidNearSyntax,
+    InvalidPhraseSyntax,
+    ShadowStorage(String),
     UnsupportedByDetailMode {
         detail: DetailMode,
         feature: &'static str,
@@ -728,6 +3656,8 @@ impl std::fmt::Display for Fts5QueryError {
             }
             Self::InvalidColumnFilter(col) => write!(f, "invalid column filter: {col}"),
             Self::InvalidNearSyntax => write!(f, "invalid NEAR syntax"),
+            Self::InvalidPhraseSyntax => write!(f, "invalid phrase syntax"),
+            Self::ShadowStorage(detail) => write!(f, "FTS5 shadow storage error: {detail}"),
             Self::UnsupportedByDetailMode { detail, feature } => {
                 write!(f, "detail={detail} does not support {feature}")
             }
@@ -747,7 +3677,8 @@ pub fn parse_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>,
 }
 
 fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, Fts5QueryError> {
-    let mut chars = query.chars().peekable();
+    let normalized_query = normalize_column_filter_syntax(query);
+    let mut chars = normalized_query.chars().peekable();
     let mut tokens = Vec::new();
 
     while let Some(ch) = chars.peek().copied() {
@@ -770,6 +3701,15 @@ fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, 
             tokens.push(Fts5QueryToken {
                 kind: Fts5QueryTokenKind::RParen,
                 lexeme: ")".to_owned(),
+            });
+            continue;
+        }
+
+        if ch == '+' {
+            let _ = chars.next();
+            tokens.push(Fts5QueryToken {
+                kind: Fts5QueryTokenKind::Plus,
+                lexeme: "+".to_owned(),
             });
             continue;
         }
@@ -818,7 +3758,7 @@ fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, 
         // Read a word.
         let mut word = String::new();
         while let Some(word_ch) = chars.peek().copied() {
-            if word_ch.is_ascii_whitespace() || matches!(word_ch, '(' | ')' | '"' | '^') {
+            if word_ch.is_ascii_whitespace() || matches!(word_ch, '(' | ')' | '"' | '+' | '^') {
                 break;
             }
             let _ = chars.next();
@@ -836,6 +3776,102 @@ fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, 
         return Err(Fts5QueryError::EmptyQuery);
     }
     Ok(tokens)
+}
+
+fn normalize_column_filter_syntax(query: &str) -> Cow<'_, str> {
+    if !query.as_bytes().contains(&b':') {
+        return Cow::Borrowed(query);
+    }
+
+    let chars: Vec<char> = query.chars().collect();
+    let mut normalized = String::with_capacity(query.len());
+    let mut idx = 0;
+
+    while idx < chars.len() {
+        if chars[idx] == '-' {
+            let filter_start = skip_query_whitespace(&chars, idx + 1);
+            if let Some((filter, next_idx)) = read_column_filter_at(&chars, filter_start) {
+                normalized.push('-');
+                normalized.push_str(&filter);
+                idx = next_idx;
+                continue;
+            }
+        }
+
+        if let Some((filter, next_idx)) = read_column_filter_at(&chars, idx) {
+            normalized.push_str(&filter);
+            idx = next_idx;
+            continue;
+        }
+
+        normalized.push(chars[idx]);
+        idx += 1;
+    }
+
+    Cow::Owned(normalized)
+}
+
+fn skip_query_whitespace(chars: &[char], mut idx: usize) -> usize {
+    while idx < chars.len() && chars[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    idx
+}
+
+fn read_column_filter_at(chars: &[char], idx: usize) -> Option<(String, usize)> {
+    if chars.get(idx) == Some(&'{') {
+        return read_braced_column_filter_at(chars, idx);
+    }
+
+    read_single_column_filter_at(chars, idx)
+}
+
+fn read_braced_column_filter_at(chars: &[char], idx: usize) -> Option<(String, usize)> {
+    let mut end = idx + 1;
+    while end < chars.len() && chars[end] != '}' {
+        end += 1;
+    }
+    if end >= chars.len() {
+        return None;
+    }
+
+    let colon_idx = skip_query_whitespace(chars, end + 1);
+    if chars.get(colon_idx) != Some(&':') {
+        return None;
+    }
+
+    let inner: String = chars[idx + 1..end].iter().collect();
+    let columns = inner
+        .split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .filter(|column| !column.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    if columns.is_empty() {
+        return None;
+    }
+
+    Some((format!("{{{columns}}}:"), colon_idx + 1))
+}
+
+fn read_single_column_filter_at(chars: &[char], idx: usize) -> Option<(String, usize)> {
+    let mut end = idx;
+    while end < chars.len()
+        && !chars[end].is_ascii_whitespace()
+        && !matches!(chars[end], ':' | '(' | ')' | '"' | '^')
+    {
+        end += 1;
+    }
+    if end == idx {
+        return None;
+    }
+
+    let colon_idx = skip_query_whitespace(chars, end);
+    if chars.get(colon_idx) != Some(&':') {
+        return None;
+    }
+
+    let column: String = chars[idx..end].iter().collect();
+    Some((format!("{column}:"), colon_idx + 1))
 }
 
 fn push_query_word_tokens(word: &str, tokens: &mut Vec<Fts5QueryToken>) {
@@ -979,17 +4015,164 @@ pub enum Fts5Expr {
     Term(String),
     Prefix(String),
     Phrase(Vec<String>),
+    PhrasePrefix(Vec<String>, String),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
     Not(Box<Self>, Box<Self>),
-    Near(Vec<String>, u32),
+    Near(Vec<Fts5NearOperand>, u32),
     ColumnFilter(String, Box<Self>),
     InitialToken(Box<Self>),
 }
 
+/// A phrase-like operand inside an FTS5 NEAR group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fts5NearOperand {
+    Term(String),
+    Prefix(String),
+    Phrase(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fts5ColumnFilterSpec {
+    exclude: bool,
+    columns: SmallVec<[String; 4]>,
+}
+
+fn parse_column_filter_spec(raw: &str) -> Option<Fts5ColumnFilterSpec> {
+    let trimmed = raw.trim();
+    let (exclude, body) = if let Some(rest) = trimmed.strip_prefix('-') {
+        (true, rest.trim())
+    } else {
+        (false, trimmed)
+    };
+
+    if body.is_empty() {
+        return None;
+    }
+
+    let mut columns = SmallVec::new();
+    if let Some(inner) = body
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+    {
+        for column in inner.split(|ch: char| ch == ',' || ch.is_ascii_whitespace()) {
+            let column = unquote_fts_identifier(column);
+            if !column.is_empty() {
+                columns.push(column.to_owned());
+            }
+        }
+    } else {
+        let column = unquote_fts_identifier(body);
+        if !column.is_empty() {
+            columns.push(column.to_owned());
+        }
+    }
+
+    (!columns.is_empty()).then_some(Fts5ColumnFilterSpec { exclude, columns })
+}
+
+fn near_operand_from_token(token: &Fts5QueryToken) -> Option<Fts5NearOperand> {
+    match token.kind {
+        Fts5QueryTokenKind::Term if !token.lexeme.trim().is_empty() => {
+            Some(Fts5NearOperand::Term(token.lexeme.trim().to_owned()))
+        }
+        Fts5QueryTokenKind::Prefix if !token.lexeme.trim().is_empty() => {
+            Some(Fts5NearOperand::Prefix(token.lexeme.trim().to_owned()))
+        }
+        Fts5QueryTokenKind::Phrase => {
+            let terms: Vec<String> = token
+                .lexeme
+                .split_whitespace()
+                .map(str::to_lowercase)
+                .collect();
+            (!terms.is_empty()).then_some(Fts5NearOperand::Phrase(terms))
+        }
+        _ => None,
+    }
+}
+
+fn append_phrase_token(
+    token: &Fts5QueryToken,
+    words: &mut Vec<String>,
+    prefix: &mut Option<String>,
+) -> std::result::Result<(), Fts5QueryError> {
+    if prefix.is_some() {
+        return Err(Fts5QueryError::InvalidPhraseSyntax);
+    }
+
+    match token.kind {
+        Fts5QueryTokenKind::Term if !token.lexeme.trim().is_empty() => {
+            words.push(token.lexeme.trim().to_owned());
+            Ok(())
+        }
+        Fts5QueryTokenKind::Phrase => {
+            let phrase_words = token
+                .lexeme
+                .split_whitespace()
+                .map(str::to_lowercase)
+                .collect::<Vec<_>>();
+            if phrase_words.is_empty() {
+                return Err(Fts5QueryError::InvalidPhraseSyntax);
+            }
+            words.extend(phrase_words);
+            Ok(())
+        }
+        Fts5QueryTokenKind::Prefix if !token.lexeme.trim().is_empty() => {
+            *prefix = Some(token.lexeme.trim().to_owned());
+            Ok(())
+        }
+        _ => Err(Fts5QueryError::InvalidPhraseSyntax),
+    }
+}
+
+fn parse_phrase_expr(
+    tokens: &[Fts5QueryToken],
+) -> std::result::Result<(Fts5Expr, &[Fts5QueryToken]), Fts5QueryError> {
+    let Some(first) = tokens.first() else {
+        return Err(Fts5QueryError::EmptyQuery);
+    };
+
+    let mut words = Vec::new();
+    let mut prefix = None;
+    append_phrase_token(first, &mut words, &mut prefix)?;
+    let mut rest = &tokens[1..];
+    let mut saw_plus = false;
+
+    while rest
+        .first()
+        .is_some_and(|token| token.kind == Fts5QueryTokenKind::Plus)
+    {
+        saw_plus = true;
+        let Some(next) = rest.get(1) else {
+            return Err(Fts5QueryError::InvalidPhraseSyntax);
+        };
+        append_phrase_token(next, &mut words, &mut prefix)?;
+        rest = &rest[2..];
+    }
+
+    if let Some(prefix) = prefix {
+        if saw_plus {
+            return Ok((Fts5Expr::PhrasePrefix(words, prefix), rest));
+        }
+        return Ok((Fts5Expr::Prefix(prefix), rest));
+    }
+
+    if saw_plus || first.kind == Fts5QueryTokenKind::Phrase {
+        return Ok((Fts5Expr::Phrase(words), rest));
+    }
+
+    let Some(term) = words.into_iter().next() else {
+        return Err(Fts5QueryError::InvalidPhraseSyntax);
+    };
+    Ok((Fts5Expr::Term(term), rest))
+}
+
 /// Build an expression tree from parsed FTS5 query tokens.
 pub fn build_expr(tokens: &[Fts5QueryToken]) -> std::result::Result<Fts5Expr, Fts5QueryError> {
-    let (expr, _rest) = parse_or(tokens)?;
+    let (expr, rest) = parse_or(tokens)?;
+    if !rest.is_empty() {
+        return Err(Fts5QueryError::InvalidPhraseSyntax);
+    }
     Ok(expr)
 }
 
@@ -1042,15 +4225,8 @@ fn parse_primary(
     };
 
     match token.kind {
-        Fts5QueryTokenKind::Term => Ok((Fts5Expr::Term(token.lexeme.clone()), &tokens[1..])),
-        Fts5QueryTokenKind::Prefix => Ok((Fts5Expr::Prefix(token.lexeme.clone()), &tokens[1..])),
-        Fts5QueryTokenKind::Phrase => {
-            let words: Vec<String> = token
-                .lexeme
-                .split_whitespace()
-                .map(str::to_lowercase)
-                .collect();
-            Ok((Fts5Expr::Phrase(words), &tokens[1..]))
+        Fts5QueryTokenKind::Term | Fts5QueryTokenKind::Prefix | Fts5QueryTokenKind::Phrase => {
+            parse_phrase_expr(tokens)
         }
         Fts5QueryTokenKind::LParen => {
             let (expr, rest) = parse_or(&tokens[1..])?;
@@ -1071,7 +4247,6 @@ fn parse_primary(
             Ok((Fts5Expr::ColumnFilter(col, Box::new(inner)), rest))
         }
         Fts5QueryTokenKind::Near => {
-            // Supported subset: NEAR(term1 term2 ..., N) with bare term operands.
             let mut rest = &tokens[1..];
             if !rest
                 .first()
@@ -1080,7 +4255,7 @@ fn parse_primary(
                 return Err(Fts5QueryError::InvalidNearSyntax);
             }
             rest = &rest[1..]; // skip (
-            let mut terms = Vec::new();
+            let mut operands = Vec::new();
             let mut distance = 10u32; // default NEAR distance
             let mut expect_distance = false;
 
@@ -1091,23 +4266,21 @@ fn parse_primary(
                 }
 
                 if t.kind == Fts5QueryTokenKind::RParen {
-                    if expect_distance || terms.len() < 2 {
+                    if expect_distance || operands.len() < 2 {
                         return Err(Fts5QueryError::InvalidNearSyntax);
                     }
                     rest = &rest[1..];
                     break;
                 }
 
-                if t.kind != Fts5QueryTokenKind::Term {
-                    return Err(Fts5QueryError::InvalidNearSyntax);
-                }
-
-                let lexeme = t.lexeme.trim();
-                if lexeme.is_empty() {
-                    return Err(Fts5QueryError::InvalidNearSyntax);
-                }
-
                 if expect_distance {
+                    if t.kind != Fts5QueryTokenKind::Term {
+                        return Err(Fts5QueryError::InvalidNearSyntax);
+                    }
+                    let lexeme = t.lexeme.trim();
+                    if lexeme.is_empty() {
+                        return Err(Fts5QueryError::InvalidNearSyntax);
+                    }
                     let raw_distance = lexeme.strip_prefix(',').unwrap_or(lexeme);
                     distance = raw_distance
                         .parse::<u32>()
@@ -1117,49 +4290,59 @@ fn parse_primary(
                     continue;
                 }
 
-                if lexeme == "," {
-                    if terms.len() < 2 {
+                if t.kind == Fts5QueryTokenKind::Term {
+                    let lexeme = t.lexeme.trim();
+                    if lexeme.is_empty() {
                         return Err(Fts5QueryError::InvalidNearSyntax);
                     }
-                    expect_distance = true;
-                    rest = &rest[1..];
-                    continue;
-                }
 
-                if let Some((raw_term, raw_distance)) = lexeme.split_once(',') {
-                    let term = raw_term.trim();
-                    let trailing = raw_distance.trim();
-
-                    if term.is_empty() {
-                        if terms.len() < 2 || trailing.is_empty() {
+                    if lexeme == "," {
+                        if operands.len() < 2 {
                             return Err(Fts5QueryError::InvalidNearSyntax);
                         }
-                        distance = trailing
-                            .parse::<u32>()
-                            .map_err(|_| Fts5QueryError::InvalidNearSyntax)?;
-                    } else {
-                        terms.push(term.to_owned());
-                        if trailing.is_empty() {
-                            expect_distance = true;
-                        } else {
+                        expect_distance = true;
+                        rest = &rest[1..];
+                        continue;
+                    }
+
+                    if let Some((raw_term, raw_distance)) = lexeme.split_once(',') {
+                        let term = raw_term.trim();
+                        let trailing = raw_distance.trim();
+
+                        if term.is_empty() {
+                            if operands.len() < 2 || trailing.is_empty() {
+                                return Err(Fts5QueryError::InvalidNearSyntax);
+                            }
                             distance = trailing
                                 .parse::<u32>()
                                 .map_err(|_| Fts5QueryError::InvalidNearSyntax)?;
+                        } else {
+                            operands.push(Fts5NearOperand::Term(term.to_owned()));
+                            if trailing.is_empty() {
+                                expect_distance = true;
+                            } else {
+                                distance = trailing
+                                    .parse::<u32>()
+                                    .map_err(|_| Fts5QueryError::InvalidNearSyntax)?;
+                            }
                         }
+                        rest = &rest[1..];
+                        continue;
                     }
-                    rest = &rest[1..];
-                    continue;
                 }
 
-                terms.push(lexeme.to_owned());
+                let Some(operand) = near_operand_from_token(t) else {
+                    return Err(Fts5QueryError::InvalidNearSyntax);
+                };
+                operands.push(operand);
                 rest = &rest[1..];
             }
 
-            if expect_distance || terms.len() < 2 {
+            if expect_distance || operands.len() < 2 {
                 return Err(Fts5QueryError::InvalidNearSyntax);
             }
 
-            Ok((Fts5Expr::Near(terms, distance), rest))
+            Ok((Fts5Expr::Near(operands, distance), rest))
         }
         _ => Err(Fts5QueryError::EmptyQuery),
     }
@@ -1189,6 +4372,8 @@ pub struct InvertedIndex {
     prefix_indexes: HashMap<usize, HashMap<SmallText, PostingList>>,
     /// How much positional detail is retained for each posting.
     detail: DetailMode,
+    /// Whether terms may carry token-data suffixes after the first NUL byte.
+    tokendata: bool,
     /// Set of rowids currently present in the index.
     doc_ids: HashSet<i64>,
     /// Total token count per document (for BM25 avgdl)
@@ -1218,6 +4403,16 @@ impl InvertedIndex {
         prefix_lengths: &[usize],
         detail: DetailMode,
     ) -> Self {
+        Self::with_options_and_tokendata(track_column_sizes, prefix_lengths, detail, false)
+    }
+
+    #[must_use]
+    pub fn with_options_and_tokendata(
+        track_column_sizes: bool,
+        prefix_lengths: &[usize],
+        detail: DetailMode,
+        tokendata: bool,
+    ) -> Self {
         Self {
             index: HashMap::new(),
             prefix_indexes: prefix_lengths
@@ -1226,6 +4421,7 @@ impl InvertedIndex {
                 .map(|prefix_length| (prefix_length, HashMap::new()))
                 .collect(),
             detail,
+            tokendata,
             doc_ids: HashSet::new(),
             doc_lengths: track_column_sizes.then(HashMap::new),
         }
@@ -1246,7 +4442,21 @@ impl InvertedIndex {
         self.detail
     }
 
+    #[must_use]
+    pub const fn tokendata_enabled(&self) -> bool {
+        self.tokendata
+    }
+
+    fn index_key<'a>(&self, term: &'a str) -> &'a str {
+        if self.tokendata {
+            tokendata_query_key(term)
+        } else {
+            term
+        }
+    }
+
     fn append_position(&mut self, term: &str, docid: i64, column: u32, position: u32) {
+        let term = self.index_key(term);
         let stored_column = if self.detail == DetailMode::None {
             0
         } else {
@@ -1320,13 +4530,15 @@ impl InvertedIndex {
 
     /// Remove a document from the index.
     pub fn remove_document(&mut self, docid: i64) {
-        for postings in self.index.values_mut() {
-            postings.retain(|p| p.docid != docid);
-        }
+        self.index.retain(|_, postings| {
+            postings.retain(|posting| posting.docid != docid);
+            !postings.is_empty()
+        });
         for prefix_index in self.prefix_indexes.values_mut() {
-            for postings in prefix_index.values_mut() {
-                postings.retain(|p| p.docid != docid);
-            }
+            prefix_index.retain(|_, postings| {
+                postings.retain(|posting| posting.docid != docid);
+                !postings.is_empty()
+            });
         }
         self.doc_ids.remove(&docid);
         if let Some(doc_lengths) = self.doc_lengths.as_mut() {
@@ -1337,12 +4549,15 @@ impl InvertedIndex {
     /// Look up postings for a term.
     #[must_use]
     pub fn get_postings(&self, term: &str) -> &[Posting] {
-        self.index.get(term).map_or(&[], SmallVec::as_slice)
+        self.index
+            .get(self.index_key(term))
+            .map_or(&[], SmallVec::as_slice)
     }
 
     /// Look up postings for terms matching a prefix.
     #[must_use]
     pub fn get_prefix_postings(&self, prefix: &str) -> Vec<&Posting> {
+        let prefix = self.index_key(prefix);
         if let Some(prefix_index) = self.prefix_indexes.get(&prefix.chars().count()) {
             return prefix_index
                 .get(prefix)
@@ -1420,6 +4635,33 @@ impl InvertedIndex {
             .map(|posting| u32::try_from(posting.positions.len()).unwrap_or(u32::MAX))
             .sum()
     }
+
+    #[must_use]
+    pub fn docsize_row(&self, docid: i64, column_count: usize) -> Fts5DocsizeRow {
+        let mut counts = vec![0_u32; column_count];
+        for posting in self
+            .index
+            .values()
+            .flat_map(|postings| postings.iter())
+            .filter(|posting| posting.docid == docid)
+        {
+            let Ok(column) = usize::try_from(posting.column) else {
+                continue;
+            };
+            if let Some(count) = counts.get_mut(column) {
+                *count = count
+                    .saturating_add(u32::try_from(posting.positions.len()).unwrap_or(u32::MAX));
+            }
+        }
+        Fts5DocsizeRow::new(docid, counts)
+    }
+
+    pub fn apply_docsize_row(&mut self, row: &Fts5DocsizeRow) {
+        self.doc_ids.insert(row.rowid);
+        if let Some(doc_lengths) = self.doc_lengths.as_mut() {
+            doc_lengths.insert(row.rowid, row.total_tokens());
+        }
+    }
 }
 
 fn append_position_to_postings(postings: &mut PostingList, docid: i64, column: u32, position: u32) {
@@ -1461,6 +4703,7 @@ fn prefix_slice(term: &str, prefix_length: usize) -> Option<&str> {
 /// Standard BM25 parameters.
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
+const BM25_IDF_FLOOR: f64 = 1.0e-6;
 
 /// Compute BM25 score for a document against a set of query terms.
 ///
@@ -1487,26 +4730,33 @@ pub fn bm25_score(
         }
         let df = df_int as f64;
 
-        // IDF component
-        let idf = ((n - df + 0.5) / (df + 0.5)).ln_1p();
+        let idf = ((n - df + 0.5) / (df + 0.5)).ln().max(BM25_IDF_FLOOR);
 
-        // Get per-column frequencies for weighting
+        let mut weighted_tf = 0.0;
         let postings = index.get_postings(term);
         for posting in postings {
             if posting.docid != docid {
                 continue;
             }
             let tf = posting.positions.len() as f64;
-            let col_weight = weights.get(posting.column as usize).copied().unwrap_or(1.0);
-
-            let denom = if avgdl > 0.0 {
-                BM25_K1.mul_add(1.0 - BM25_B + BM25_B * dl / avgdl, tf)
-            } else {
-                tf + BM25_K1
-            };
-
-            score += col_weight * idf * (tf * (BM25_K1 + 1.0)) / denom;
+            let col_weight = usize::try_from(posting.column)
+                .ok()
+                .and_then(|column| weights.get(column).copied())
+                .unwrap_or(1.0);
+            weighted_tf += col_weight * tf;
         }
+
+        if weighted_tf == 0.0 {
+            continue;
+        }
+
+        let denom = if avgdl > 0.0 {
+            BM25_K1.mul_add(1.0 - BM25_B + BM25_B * dl / avgdl, weighted_tf)
+        } else {
+            weighted_tf + BM25_K1
+        };
+
+        score += idf * (weighted_tf * (BM25_K1 + 1.0)) / denom;
     }
 
     // Return negative score (lower = better, SQLite FTS5 convention).
@@ -1562,6 +4812,33 @@ fn normalize_query_phrase_terms(phrase: &[String], tokenizer: &dyn Fts5Tokenizer
     }
 }
 
+fn normalize_near_operand_with_tokenizer(
+    operand: Fts5NearOperand,
+    tokenizer: &dyn Fts5Tokenizer,
+) -> Fts5NearOperand {
+    match operand {
+        Fts5NearOperand::Term(term) => {
+            let terms = tokenize_query_leaf(tokenizer, &term);
+            match terms.as_slice() {
+                [] => Fts5NearOperand::Term(term.to_lowercase()),
+                [single] => Fts5NearOperand::Term(single.clone()),
+                _ => Fts5NearOperand::Phrase(terms),
+            }
+        }
+        Fts5NearOperand::Prefix(prefix) => {
+            let terms = tokenize_query_leaf(tokenizer, &prefix);
+            let normalized = terms
+                .first()
+                .cloned()
+                .unwrap_or_else(|| prefix.to_lowercase());
+            Fts5NearOperand::Prefix(normalized)
+        }
+        Fts5NearOperand::Phrase(words) => {
+            Fts5NearOperand::Phrase(normalize_query_phrase_terms(&words, tokenizer))
+        }
+    }
+}
+
 fn normalize_query_expr_with_tokenizer(expr: Fts5Expr, tokenizer: &dyn Fts5Tokenizer) -> Fts5Expr {
     match expr {
         Fts5Expr::Term(term) => normalize_query_term_expr(term, tokenizer),
@@ -1576,6 +4853,15 @@ fn normalize_query_expr_with_tokenizer(expr: Fts5Expr, tokenizer: &dyn Fts5Token
         Fts5Expr::Phrase(words) => {
             Fts5Expr::Phrase(normalize_query_phrase_terms(&words, tokenizer))
         }
+        Fts5Expr::PhrasePrefix(words, prefix) => {
+            let normalized_words = normalize_query_phrase_terms(&words, tokenizer);
+            let terms = tokenize_query_leaf(tokenizer, &prefix);
+            let normalized_prefix = terms
+                .first()
+                .cloned()
+                .unwrap_or_else(|| prefix.to_lowercase());
+            Fts5Expr::PhrasePrefix(normalized_words, normalized_prefix)
+        }
         Fts5Expr::And(left, right) => Fts5Expr::And(
             Box::new(normalize_query_expr_with_tokenizer(*left, tokenizer)),
             Box::new(normalize_query_expr_with_tokenizer(*right, tokenizer)),
@@ -1588,13 +4874,13 @@ fn normalize_query_expr_with_tokenizer(expr: Fts5Expr, tokenizer: &dyn Fts5Token
             Box::new(normalize_query_expr_with_tokenizer(*left, tokenizer)),
             Box::new(normalize_query_expr_with_tokenizer(*right, tokenizer)),
         ),
-        Fts5Expr::Near(terms, distance) => {
-            let normalized = terms
-                .iter()
-                .flat_map(|term| tokenize_query_leaf(tokenizer, term))
-                .collect();
-            Fts5Expr::Near(normalized, distance)
-        }
+        Fts5Expr::Near(operands, distance) => Fts5Expr::Near(
+            operands
+                .into_iter()
+                .map(|operand| normalize_near_operand_with_tokenizer(operand, tokenizer))
+                .collect(),
+            distance,
+        ),
         Fts5Expr::ColumnFilter(column_name, inner) => Fts5Expr::ColumnFilter(
             column_name,
             Box::new(normalize_query_expr_with_tokenizer(*inner, tokenizer)),
@@ -1693,9 +4979,8 @@ fn evaluate_expr_impl(
 ) -> Vec<i64> {
     match expr {
         Fts5Expr::Term(term) => {
-            let lower = term.to_lowercase();
             let mut docs: Vec<i64> = index
-                .get_postings(&lower)
+                .get_postings(term)
                 .iter()
                 .filter(|posting| posting_matches_allowed_columns(posting.column, allowed_columns))
                 .map(|p| p.docid)
@@ -1705,9 +4990,8 @@ fn evaluate_expr_impl(
             docs
         }
         Fts5Expr::Prefix(prefix) => {
-            let lower = prefix.to_lowercase();
             let mut docs: Vec<i64> = index
-                .get_prefix_postings(&lower)
+                .get_prefix_postings(prefix)
                 .iter()
                 .filter(|posting| posting_matches_allowed_columns(posting.column, allowed_columns))
                 .map(|p| p.docid)
@@ -1733,8 +5017,17 @@ fn evaluate_expr_impl(
             difference_sorted(&left_docs, &right_docs)
         }
         Fts5Expr::Near(terms, distance) => evaluate_near(index, terms, *distance, allowed_columns),
-        Fts5Expr::ColumnFilter(column_name, inner) => {
-            let resolved_columns = resolve_allowed_columns(columns, column_name);
+        Fts5Expr::PhrasePrefix(words, prefix) => {
+            evaluate_phrase_prefix(index, words, prefix, allowed_columns)
+        }
+        Fts5Expr::ColumnFilter(column_filter, inner) => {
+            let Some(filter_spec) = parse_column_filter_spec(column_filter) else {
+                return Vec::new();
+            };
+            let Some(resolved_columns) = resolve_column_filter_columns(columns, &filter_spec)
+            else {
+                return Vec::new();
+            };
             let combined_columns = combine_allowed_columns(allowed_columns, &resolved_columns);
             evaluate_expr_impl(index, inner, columns, Some(combined_columns.as_slice()))
         }
@@ -1743,9 +5036,8 @@ fn evaluate_expr_impl(
             // appears at position 0.
             match inner.as_ref() {
                 Fts5Expr::Term(term) => {
-                    let lower = term.to_lowercase();
                     let mut docs: Vec<i64> = index
-                        .get_postings(&lower)
+                        .get_postings(term)
                         .iter()
                         .filter(|posting| {
                             posting.positions.contains(&0)
@@ -1758,9 +5050,8 @@ fn evaluate_expr_impl(
                     docs
                 }
                 Fts5Expr::Prefix(prefix) => {
-                    let lower = prefix.to_lowercase();
                     let mut docs: Vec<i64> = index
-                        .get_prefix_postings(&lower)
+                        .get_prefix_postings(prefix)
                         .iter()
                         .filter(|posting| {
                             posting.positions.contains(&0)
@@ -1777,8 +5068,7 @@ fn evaluate_expr_impl(
                     if words.is_empty() {
                         return Vec::new();
                     }
-                    let first_lower = words[0].to_lowercase();
-                    let first_postings = index.get_postings(&first_lower);
+                    let first_postings = index.get_postings(&words[0]);
                     let mut result = Vec::new();
 
                     for first_p in first_postings {
@@ -1794,7 +5084,7 @@ fn evaluate_expr_impl(
                         for (offset, word) in words.iter().enumerate().skip(1) {
                             #[allow(clippy::cast_possible_truncation)]
                             let target_pos = offset as u32; // implied start_pos = 0
-                            let found = index.get_postings(&word.to_lowercase()).iter().any(|p| {
+                            let found = index.get_postings(word).iter().any(|p| {
                                 p.docid == first_p.docid
                                     && p.column == first_p.column
                                     && p.positions.contains(&target_pos)
@@ -1810,6 +5100,17 @@ fn evaluate_expr_impl(
                     }
                     result.sort_unstable();
                     result
+                }
+                Fts5Expr::PhrasePrefix(words, prefix) => {
+                    let mut docs: Vec<i64> =
+                        phrase_prefix_spans(index, words, prefix, allowed_columns)
+                            .into_iter()
+                            .filter(|span| span.start == 0)
+                            .map(|span| span.docid)
+                            .collect();
+                    docs.sort_unstable();
+                    docs.dedup();
+                    docs
                 }
                 _ => evaluate_expr_impl(index, inner, columns, allowed_columns),
             }
@@ -1838,6 +5139,37 @@ fn resolve_allowed_columns(columns: &[String], column_name: &str) -> Vec<u32> {
         .collect()
 }
 
+fn resolve_column_filter_columns(
+    columns: &[String],
+    filter_spec: &Fts5ColumnFilterSpec,
+) -> Option<Vec<u32>> {
+    let mut selected = Vec::with_capacity(filter_spec.columns.len());
+    for column_name in &filter_spec.columns {
+        let resolved = resolve_allowed_columns(columns, column_name);
+        if resolved.is_empty() {
+            return None;
+        }
+        selected.extend(resolved);
+    }
+    selected.sort_unstable();
+    selected.dedup();
+
+    if !filter_spec.exclude {
+        return Some(selected);
+    }
+
+    let mut allowed = Vec::with_capacity(columns.len().saturating_sub(selected.len()));
+    for idx in 0..columns.len() {
+        let Ok(column_id) = u32::try_from(idx) else {
+            continue;
+        };
+        if !selected.contains(&column_id) {
+            allowed.push(column_id);
+        }
+    }
+    Some(allowed)
+}
+
 fn combine_allowed_columns(existing: Option<&[u32]>, resolved: &[u32]) -> Vec<u32> {
     match existing {
         Some(existing) => existing
@@ -1858,16 +5190,23 @@ fn validate_column_filters(
             validate_column_filters(left, columns)?;
             validate_column_filters(right, columns)
         }
-        Fts5Expr::ColumnFilter(column_name, inner) => {
-            if resolve_allowed_columns(columns, column_name).is_empty() {
-                return Err(Fts5QueryError::InvalidColumnFilter(column_name.clone()));
+        Fts5Expr::ColumnFilter(column_filter, inner) => {
+            let Some(filter_spec) = parse_column_filter_spec(column_filter) else {
+                return Err(Fts5QueryError::InvalidColumnFilter(column_filter.clone()));
+            };
+            for column_name in &filter_spec.columns {
+                if resolve_allowed_columns(columns, column_name).is_empty() {
+                    return Err(Fts5QueryError::InvalidColumnFilter(column_name.clone()));
+                }
             }
             validate_column_filters(inner, columns)
         }
         Fts5Expr::InitialToken(inner) => validate_column_filters(inner, columns),
-        Fts5Expr::Term(_) | Fts5Expr::Prefix(_) | Fts5Expr::Phrase(_) | Fts5Expr::Near(_, _) => {
-            Ok(())
-        }
+        Fts5Expr::Term(_)
+        | Fts5Expr::Prefix(_)
+        | Fts5Expr::Phrase(_)
+        | Fts5Expr::PhrasePrefix(_, _)
+        | Fts5Expr::Near(_, _) => Ok(()),
     }
 }
 
@@ -1880,7 +5219,7 @@ fn validate_detail_mode(
             validate_detail_mode(left, detail)?;
             validate_detail_mode(right, detail)
         }
-        Fts5Expr::Phrase(_) => {
+        Fts5Expr::Phrase(_) | Fts5Expr::PhrasePrefix(_, _) => {
             if detail == DetailMode::Full {
                 Ok(())
             } else {
@@ -1951,7 +5290,7 @@ fn evaluate_phrase(
             for (offset, word) in words.iter().enumerate().skip(1) {
                 #[allow(clippy::cast_possible_truncation)]
                 let target_pos = start_pos + offset as u32; // implied start_pos = 0
-                let found = index.get_postings(&word.to_lowercase()).iter().any(|p| {
+                let found = index.get_postings(word).iter().any(|p| {
                     p.docid == first_p.docid
                         && p.column == first_p.column
                         && p.positions.contains(&target_pos)
@@ -1970,53 +5309,247 @@ fn evaluate_phrase(
     result
 }
 
-fn evaluate_near(
+#[derive(Debug, Clone, Copy)]
+struct Fts5NearSpan {
+    docid: i64,
+    column: u32,
+    start: u32,
+    end: u32,
+}
+
+fn phrase_prefix_spans(
     index: &InvertedIndex,
-    terms: &[String],
-    distance: u32,
+    words: &[String],
+    prefix: &str,
     allowed_columns: Option<&[u32]>,
-) -> Vec<i64> {
-    if terms.len() < 2 {
-        return Vec::new();
+) -> Vec<Fts5NearSpan> {
+    if words.is_empty() {
+        return near_operand_spans(
+            index,
+            &Fts5NearOperand::Prefix(prefix.to_owned()),
+            allowed_columns,
+        );
     }
 
-    let first_lower = terms[0].to_lowercase();
-    let first_postings = index.get_postings(&first_lower);
-    let mut result = Vec::new();
-
-    for first_p in first_postings {
+    let mut spans = Vec::new();
+    for first_p in index.get_postings(&words[0]) {
         if !posting_matches_allowed_columns(first_p.column, allowed_columns) {
             continue;
         }
-        let mut all_near = true;
 
-        for term in &terms[1..] {
-            let lower = term.to_lowercase();
-            let found = index.get_postings(&lower).iter().any(|p| {
-                if p.docid != first_p.docid || p.column != first_p.column {
-                    return false;
+        'positions: for &start_pos in &first_p.positions {
+            for (offset, word) in words.iter().enumerate().skip(1) {
+                #[allow(clippy::cast_possible_truncation)]
+                let target_pos = start_pos + offset as u32;
+                let found = index.get_postings(word).iter().any(|posting| {
+                    posting.docid == first_p.docid
+                        && posting.column == first_p.column
+                        && posting.positions.contains(&target_pos)
+                });
+                if !found {
+                    continue 'positions;
                 }
-                if !posting_matches_allowed_columns(p.column, allowed_columns) {
-                    return false;
-                }
-                // Check if any position pair is within distance.
-                first_p.positions.iter().any(|&pos1| {
-                    p.positions
-                        .iter()
-                        .any(|&pos2| pos1.abs_diff(pos2) <= distance)
-                })
-            });
-            if !found {
-                all_near = false;
-                break;
+            }
+
+            #[allow(clippy::cast_possible_truncation)]
+            let prefix_pos = start_pos + words.len() as u32;
+            let prefix_found = index
+                .get_prefix_postings(prefix)
+                .into_iter()
+                .any(|posting| {
+                    posting.docid == first_p.docid
+                        && posting.column == first_p.column
+                        && posting.positions.contains(&prefix_pos)
+                });
+            if prefix_found {
+                spans.push(Fts5NearSpan {
+                    docid: first_p.docid,
+                    column: first_p.column,
+                    start: start_pos,
+                    end: prefix_pos,
+                });
             }
         }
+    }
+    spans
+}
 
-        if all_near && !result.contains(&first_p.docid) {
-            result.push(first_p.docid);
+fn evaluate_phrase_prefix(
+    index: &InvertedIndex,
+    words: &[String],
+    prefix: &str,
+    allowed_columns: Option<&[u32]>,
+) -> Vec<i64> {
+    let mut result: Vec<i64> = phrase_prefix_spans(index, words, prefix, allowed_columns)
+        .into_iter()
+        .map(|span| span.docid)
+        .collect();
+    result.sort_unstable();
+    result.dedup();
+    result
+}
+
+fn near_operand_spans(
+    index: &InvertedIndex,
+    operand: &Fts5NearOperand,
+    allowed_columns: Option<&[u32]>,
+) -> Vec<Fts5NearSpan> {
+    match operand {
+        Fts5NearOperand::Term(term) => index
+            .get_postings(term)
+            .iter()
+            .filter(|posting| posting_matches_allowed_columns(posting.column, allowed_columns))
+            .flat_map(|posting| {
+                posting.positions.iter().map(|position| Fts5NearSpan {
+                    docid: posting.docid,
+                    column: posting.column,
+                    start: *position,
+                    end: *position,
+                })
+            })
+            .collect(),
+        Fts5NearOperand::Prefix(prefix) => index
+            .get_prefix_postings(prefix)
+            .into_iter()
+            .filter(|posting| posting_matches_allowed_columns(posting.column, allowed_columns))
+            .flat_map(|posting| {
+                posting.positions.iter().map(|position| Fts5NearSpan {
+                    docid: posting.docid,
+                    column: posting.column,
+                    start: *position,
+                    end: *position,
+                })
+            })
+            .collect(),
+        Fts5NearOperand::Phrase(words) => phrase_near_spans(index, words, allowed_columns),
+    }
+}
+
+fn phrase_near_spans(
+    index: &InvertedIndex,
+    words: &[String],
+    allowed_columns: Option<&[u32]>,
+) -> Vec<Fts5NearSpan> {
+    if words.is_empty() {
+        return Vec::new();
+    }
+
+    let mut spans = Vec::new();
+    for first_p in index.get_postings(&words[0]) {
+        if !posting_matches_allowed_columns(first_p.column, allowed_columns) {
+            continue;
+        }
+
+        'positions: for &start_pos in &first_p.positions {
+            for (offset, word) in words.iter().enumerate().skip(1) {
+                #[allow(clippy::cast_possible_truncation)]
+                let target_pos = start_pos + offset as u32;
+                let found = index.get_postings(word).iter().any(|posting| {
+                    posting.docid == first_p.docid
+                        && posting.column == first_p.column
+                        && posting.positions.contains(&target_pos)
+                });
+                if !found {
+                    continue 'positions;
+                }
+            }
+
+            #[allow(clippy::cast_possible_truncation)]
+            spans.push(Fts5NearSpan {
+                docid: first_p.docid,
+                column: first_p.column,
+                start: start_pos,
+                end: start_pos + (words.len() - 1) as u32,
+            });
+        }
+    }
+    spans
+}
+
+fn near_clump_distance(spans: &[Fts5NearSpan]) -> u32 {
+    let (Some(min_end), Some(max_start)) = (
+        spans.iter().map(|span| span.end).min(),
+        spans.iter().map(|span| span.start).max(),
+    ) else {
+        return 0;
+    };
+    max_start.saturating_sub(min_end).saturating_sub(1)
+}
+
+fn find_near_clump(
+    operand_spans: &[Vec<Fts5NearSpan>],
+    operand_order: &[usize],
+    next_order_index: usize,
+    selected: &mut SmallVec<[Fts5NearSpan; 8]>,
+    distance: u32,
+) -> bool {
+    if next_order_index == operand_order.len() {
+        return near_clump_distance(selected) <= distance;
+    }
+
+    let Some(anchor_span) = selected.first() else {
+        return false;
+    };
+    let docid = anchor_span.docid;
+    let column = anchor_span.column;
+    let next_operand = operand_order[next_order_index];
+
+    for span in operand_spans[next_operand]
+        .iter()
+        .filter(|span| span.docid == docid && span.column == column)
+    {
+        selected.push(*span);
+        let matches = near_clump_distance(selected) <= distance
+            && find_near_clump(
+                operand_spans,
+                operand_order,
+                next_order_index + 1,
+                selected,
+                distance,
+            );
+        selected.pop();
+        if matches {
+            return true;
         }
     }
 
+    false
+}
+
+fn evaluate_near(
+    index: &InvertedIndex,
+    operands: &[Fts5NearOperand],
+    distance: u32,
+    allowed_columns: Option<&[u32]>,
+) -> Vec<i64> {
+    if operands.len() < 2 {
+        return Vec::new();
+    }
+
+    let operand_spans: Vec<Vec<Fts5NearSpan>> = operands
+        .iter()
+        .map(|operand| near_operand_spans(index, operand, allowed_columns))
+        .collect();
+    if operand_spans.iter().any(Vec::is_empty) {
+        return Vec::new();
+    }
+
+    let mut operand_order: Vec<usize> = (0..operand_spans.len()).collect();
+    operand_order.sort_by_key(|&operand_index| operand_spans[operand_index].len());
+    let anchor_operand = operand_order[0];
+    let mut result = Vec::new();
+
+    for anchor_span in &operand_spans[anchor_operand] {
+        let mut selected = SmallVec::new();
+        selected.push(*anchor_span);
+        if find_near_clump(&operand_spans, &operand_order, 1, &mut selected, distance)
+            && !result.contains(&anchor_span.docid)
+        {
+            result.push(anchor_span.docid);
+        }
+    }
+
+    result.sort_unstable();
     result
 }
 
@@ -2088,6 +5621,574 @@ fn difference_sorted(a: &[i64], b: &[i64]) -> Vec<i64> {
     result
 }
 
+fn shadow_query_storage_error(error: FrankenError) -> Fts5QueryError {
+    Fts5QueryError::ShadowStorage(error.to_string())
+}
+
+fn rowid_u64_to_i64(rowid: u64) -> Option<i64> {
+    i64::try_from(rowid).ok()
+}
+
+fn shadow_entry_matches_allowed_columns(
+    entry: &Fts5DoclistEntry,
+    allowed_columns: Option<&[u32]>,
+) -> bool {
+    !entry.poslist.delete
+        && entry
+            .poslist
+            .columns
+            .iter()
+            .any(|column| posting_matches_allowed_columns(column.column, allowed_columns))
+}
+
+fn shadow_rowids_from_entries(
+    entries: &[Fts5DoclistEntry],
+    allowed_columns: Option<&[u32]>,
+) -> Vec<i64> {
+    let mut rowids: Vec<i64> = entries
+        .iter()
+        .filter(|entry| shadow_entry_matches_allowed_columns(entry, allowed_columns))
+        .filter_map(|entry| rowid_u64_to_i64(entry.rowid))
+        .collect();
+    rowids.sort_unstable();
+    rowids.dedup();
+    rowids
+}
+
+fn shadow_spans_from_entries(
+    entries: &[Fts5DoclistEntry],
+    allowed_columns: Option<&[u32]>,
+) -> Vec<Fts5NearSpan> {
+    let mut spans = Vec::new();
+    for entry in entries {
+        if entry.poslist.delete {
+            continue;
+        }
+        let Some(rowid) = rowid_u64_to_i64(entry.rowid) else {
+            continue;
+        };
+        for column in &entry.poslist.columns {
+            if !posting_matches_allowed_columns(column.column, allowed_columns) {
+                continue;
+            }
+            spans.extend(column.offsets.iter().copied().map(|offset| Fts5NearSpan {
+                docid: rowid,
+                column: column.column,
+                start: offset,
+                end: offset,
+            }));
+        }
+    }
+    spans.sort_unstable_by_key(|span| (span.docid, span.column, span.start, span.end));
+    spans.dedup_by_key(|span| (span.docid, span.column, span.start, span.end));
+    spans
+}
+
+fn shadow_rowids_from_spans(spans: Vec<Fts5NearSpan>) -> Vec<i64> {
+    let mut rowids: Vec<i64> = spans.into_iter().map(|span| span.docid).collect();
+    rowids.sort_unstable();
+    rowids.dedup();
+    rowids
+}
+
+fn shadow_content_for_rowid(rows: &Fts5ShadowRows, rowid: i64) -> Option<&[String]> {
+    rows.content
+        .iter()
+        .find(|row| row.rowid == rowid)
+        .map(|row| row.values.as_slice())
+}
+
+/// Reader-native MATCH evaluator for shadow-backed FTS5 tables.
+pub struct Fts5ShadowQuery<'a> {
+    rows: &'a Fts5ShadowRows,
+    columns: &'a [String],
+    tokenizer: &'a dyn Fts5Tokenizer,
+    detail: DetailMode,
+    structure: Option<Fts5StructureRecord>,
+    averages: Option<Fts5AveragesRecord>,
+}
+
+impl<'a> Fts5ShadowQuery<'a> {
+    pub fn new(
+        rows: &'a Fts5ShadowRows,
+        columns: &'a [String],
+        tokenizer: &'a dyn Fts5Tokenizer,
+        detail: DetailMode,
+    ) -> std::result::Result<Self, Fts5QueryError> {
+        let data = Fts5DataMetadata::decode_rows(rows.data.as_slice(), columns.len())
+            .map_err(shadow_query_storage_error)?;
+        Ok(Self {
+            rows,
+            columns,
+            tokenizer,
+            detail,
+            structure: data.structure,
+            averages: data.averages,
+        })
+    }
+
+    pub fn search(
+        &self,
+        query: &str,
+        weights: &[f64],
+    ) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
+        self.search_queries_with_weights(&[query], weights)
+    }
+
+    pub fn search_queries_with_weights(
+        &self,
+        queries: &[&str],
+        weights: &[f64],
+    ) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
+        let mut combined_docs: Option<Vec<i64>> = None;
+        let mut query_terms = Vec::new();
+
+        for query in queries {
+            let tokens = parse_fts5_query(query)?;
+            let mut expr = build_expr(&tokens)?;
+            expr = normalize_query_expr_with_tokenizer(expr, self.tokenizer);
+            validate_detail_mode(&expr, self.detail)?;
+            validate_column_filters(&expr, self.columns)?;
+            let matching_docs = self.evaluate_expr(&expr, None)?;
+            query_terms.extend(extract_query_terms(&expr));
+            combined_docs = Some(match combined_docs {
+                Some(existing) => intersect_sorted(&existing, &matching_docs),
+                None => matching_docs,
+            });
+        }
+
+        let mut results = Vec::new();
+        for rowid in combined_docs.unwrap_or_default() {
+            results.push((rowid, self.bm25_score(rowid, &query_terms, weights)?));
+        }
+        results.sort_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        Ok(results)
+    }
+
+    fn exact_entries(
+        &self,
+        term: &str,
+    ) -> std::result::Result<Vec<Fts5DoclistEntry>, Fts5QueryError> {
+        let Some(structure) = self.structure.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let mut entries = Vec::new();
+        let row_set = Fts5SegmentRowSet::new(&self.rows.data, &self.rows.idx);
+        for level in &structure.levels {
+            for segment in &level.segments {
+                if let Some(postings) = row_set
+                    .reader(segment)
+                    .exact_postings(term.as_bytes())
+                    .map_err(shadow_query_storage_error)?
+                {
+                    entries.extend(
+                        postings
+                            .entries
+                            .into_iter()
+                            .filter(|entry| !entry.poslist.delete),
+                    );
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    fn prefix_entries(
+        &self,
+        prefix: &str,
+    ) -> std::result::Result<Vec<Fts5DoclistEntry>, Fts5QueryError> {
+        let Some(structure) = self.structure.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let mut entries = Vec::new();
+        let row_set = Fts5SegmentRowSet::new(&self.rows.data, &self.rows.idx);
+        for level in &structure.levels {
+            for segment in &level.segments {
+                for term_match in row_set
+                    .reader(segment)
+                    .prefix_matches(prefix.as_bytes())
+                    .map_err(shadow_query_storage_error)?
+                {
+                    entries.extend(
+                        term_match
+                            .postings
+                            .entries
+                            .into_iter()
+                            .filter(|entry| !entry.poslist.delete),
+                    );
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    fn term_rowids(
+        &self,
+        term: &str,
+        allowed_columns: Option<&[u32]>,
+    ) -> std::result::Result<Vec<i64>, Fts5QueryError> {
+        Ok(shadow_rowids_from_entries(
+            &self.exact_entries(term)?,
+            allowed_columns,
+        ))
+    }
+
+    fn prefix_rowids(
+        &self,
+        prefix: &str,
+        allowed_columns: Option<&[u32]>,
+    ) -> std::result::Result<Vec<i64>, Fts5QueryError> {
+        Ok(shadow_rowids_from_entries(
+            &self.prefix_entries(prefix)?,
+            allowed_columns,
+        ))
+    }
+
+    fn term_spans(
+        &self,
+        term: &str,
+        allowed_columns: Option<&[u32]>,
+    ) -> std::result::Result<Vec<Fts5NearSpan>, Fts5QueryError> {
+        Ok(shadow_spans_from_entries(
+            &self.exact_entries(term)?,
+            allowed_columns,
+        ))
+    }
+
+    fn prefix_spans(
+        &self,
+        prefix: &str,
+        allowed_columns: Option<&[u32]>,
+    ) -> std::result::Result<Vec<Fts5NearSpan>, Fts5QueryError> {
+        Ok(shadow_spans_from_entries(
+            &self.prefix_entries(prefix)?,
+            allowed_columns,
+        ))
+    }
+
+    fn phrase_spans(
+        &self,
+        words: &[String],
+        allowed_columns: Option<&[u32]>,
+    ) -> std::result::Result<Vec<Fts5NearSpan>, Fts5QueryError> {
+        let Some(first) = words.first() else {
+            return Ok(Vec::new());
+        };
+
+        let mut spans = self.term_spans(first, allowed_columns)?;
+        for word in &words[1..] {
+            let next_spans = self.term_spans(word, allowed_columns)?;
+            let mut combined = Vec::new();
+            for left in &spans {
+                combined.extend(
+                    next_spans
+                        .iter()
+                        .filter(|right| {
+                            left.docid == right.docid
+                                && left.column == right.column
+                                && right.start == left.end.saturating_add(1)
+                        })
+                        .map(|right| Fts5NearSpan {
+                            docid: left.docid,
+                            column: left.column,
+                            start: left.start,
+                            end: right.end,
+                        }),
+                );
+            }
+            combined.sort_unstable_by_key(|span| (span.docid, span.column, span.start, span.end));
+            combined.dedup_by_key(|span| (span.docid, span.column, span.start, span.end));
+            spans = combined;
+            if spans.is_empty() {
+                break;
+            }
+        }
+        Ok(spans)
+    }
+
+    fn phrase_prefix_spans(
+        &self,
+        words: &[String],
+        prefix: &str,
+        allowed_columns: Option<&[u32]>,
+    ) -> std::result::Result<Vec<Fts5NearSpan>, Fts5QueryError> {
+        if words.is_empty() {
+            return self.prefix_spans(prefix, allowed_columns);
+        }
+
+        let phrase_spans = self.phrase_spans(words, allowed_columns)?;
+        let prefix_spans = self.prefix_spans(prefix, allowed_columns)?;
+        let mut combined = Vec::new();
+        for left in &phrase_spans {
+            combined.extend(
+                prefix_spans
+                    .iter()
+                    .filter(|right| {
+                        left.docid == right.docid
+                            && left.column == right.column
+                            && right.start == left.end.saturating_add(1)
+                    })
+                    .map(|right| Fts5NearSpan {
+                        docid: left.docid,
+                        column: left.column,
+                        start: left.start,
+                        end: right.end,
+                    }),
+            );
+        }
+        combined.sort_unstable_by_key(|span| (span.docid, span.column, span.start, span.end));
+        combined.dedup_by_key(|span| (span.docid, span.column, span.start, span.end));
+        Ok(combined)
+    }
+
+    fn near_operand_spans(
+        &self,
+        operand: &Fts5NearOperand,
+        allowed_columns: Option<&[u32]>,
+    ) -> std::result::Result<Vec<Fts5NearSpan>, Fts5QueryError> {
+        match operand {
+            Fts5NearOperand::Term(term) => self.term_spans(term, allowed_columns),
+            Fts5NearOperand::Prefix(prefix) => self.prefix_spans(prefix, allowed_columns),
+            Fts5NearOperand::Phrase(words) => self.phrase_spans(words, allowed_columns),
+        }
+    }
+
+    fn near_rowids(
+        &self,
+        operands: &[Fts5NearOperand],
+        distance: u32,
+        allowed_columns: Option<&[u32]>,
+    ) -> std::result::Result<Vec<i64>, Fts5QueryError> {
+        if operands.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        let operand_spans: Vec<Vec<Fts5NearSpan>> = operands
+            .iter()
+            .map(|operand| self.near_operand_spans(operand, allowed_columns))
+            .collect::<std::result::Result<_, _>>()?;
+        if operand_spans.iter().any(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
+
+        let mut operand_order: Vec<usize> = (0..operand_spans.len()).collect();
+        operand_order.sort_by_key(|&operand_index| operand_spans[operand_index].len());
+        let anchor_operand = operand_order[0];
+        let mut result = Vec::new();
+
+        for anchor_span in &operand_spans[anchor_operand] {
+            let mut selected = SmallVec::new();
+            selected.push(*anchor_span);
+            if find_near_clump(&operand_spans, &operand_order, 1, &mut selected, distance)
+                && !result.contains(&anchor_span.docid)
+            {
+                result.push(anchor_span.docid);
+            }
+        }
+
+        result.sort_unstable();
+        Ok(result)
+    }
+
+    fn evaluate_initial_expr(
+        &self,
+        expr: &Fts5Expr,
+        allowed_columns: Option<&[u32]>,
+    ) -> std::result::Result<Vec<i64>, Fts5QueryError> {
+        let spans = match expr {
+            Fts5Expr::Term(term) => self.term_spans(term, allowed_columns)?,
+            Fts5Expr::Prefix(prefix) => self.prefix_spans(prefix, allowed_columns)?,
+            Fts5Expr::Phrase(words) => self.phrase_spans(words, allowed_columns)?,
+            Fts5Expr::PhrasePrefix(words, prefix) => {
+                self.phrase_prefix_spans(words, prefix, allowed_columns)?
+            }
+            _ => return self.evaluate_expr(expr, allowed_columns),
+        };
+        Ok(shadow_rowids_from_spans(
+            spans.into_iter().filter(|span| span.start == 0).collect(),
+        ))
+    }
+
+    fn evaluate_expr(
+        &self,
+        expr: &Fts5Expr,
+        allowed_columns: Option<&[u32]>,
+    ) -> std::result::Result<Vec<i64>, Fts5QueryError> {
+        match expr {
+            Fts5Expr::Term(term) => self.term_rowids(term, allowed_columns),
+            Fts5Expr::Prefix(prefix) => self.prefix_rowids(prefix, allowed_columns),
+            Fts5Expr::Phrase(words) => Ok(shadow_rowids_from_spans(
+                self.phrase_spans(words, allowed_columns)?,
+            )),
+            Fts5Expr::PhrasePrefix(words, prefix) => Ok(shadow_rowids_from_spans(
+                self.phrase_prefix_spans(words, prefix, allowed_columns)?,
+            )),
+            Fts5Expr::And(left, right) => {
+                let left_docs = self.evaluate_expr(left, allowed_columns)?;
+                let right_docs = self.evaluate_expr(right, allowed_columns)?;
+                Ok(intersect_sorted(&left_docs, &right_docs))
+            }
+            Fts5Expr::Or(left, right) => {
+                let left_docs = self.evaluate_expr(left, allowed_columns)?;
+                let right_docs = self.evaluate_expr(right, allowed_columns)?;
+                Ok(union_sorted(&left_docs, &right_docs))
+            }
+            Fts5Expr::Not(left, right) => {
+                let left_docs = self.evaluate_expr(left, allowed_columns)?;
+                let right_docs = self.evaluate_expr(right, allowed_columns)?;
+                Ok(difference_sorted(&left_docs, &right_docs))
+            }
+            Fts5Expr::Near(operands, distance) => {
+                self.near_rowids(operands, *distance, allowed_columns)
+            }
+            Fts5Expr::ColumnFilter(column_filter, inner) => {
+                let Some(filter_spec) = parse_column_filter_spec(column_filter) else {
+                    return Ok(Vec::new());
+                };
+                let Some(resolved_columns) =
+                    resolve_column_filter_columns(self.columns, &filter_spec)
+                else {
+                    return Ok(Vec::new());
+                };
+                let combined_columns = combine_allowed_columns(allowed_columns, &resolved_columns);
+                self.evaluate_expr(inner, Some(combined_columns.as_slice()))
+            }
+            Fts5Expr::InitialToken(inner) => self.evaluate_initial_expr(inner, allowed_columns),
+        }
+    }
+
+    fn total_docs(&self) -> u64 {
+        if let Some(averages) = self.averages.as_ref()
+            && averages.total_rows > 0
+        {
+            return averages.total_rows;
+        }
+
+        self.rows
+            .content
+            .iter()
+            .map(|row| row.rowid)
+            .chain(self.rows.docsize.iter().map(|row| row.rowid))
+            .collect::<BTreeSet<_>>()
+            .len()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
+    fn avg_doc_length(&self) -> f64 {
+        if let Some(averages) = self.averages.as_ref()
+            && averages.total_rows > 0
+        {
+            let total_tokens: u64 = averages.column_token_totals.iter().sum();
+            return total_tokens as f64 / averages.total_rows as f64;
+        }
+
+        if self.rows.docsize.is_empty() {
+            return 0.0;
+        }
+        let total_tokens: u64 = self
+            .rows
+            .docsize
+            .iter()
+            .map(|row| u64::from(row.total_tokens()))
+            .sum();
+        total_tokens as f64 / self.rows.docsize.len() as f64
+    }
+
+    fn doc_length(&self, rowid: i64) -> u32 {
+        self.rows
+            .docsize
+            .iter()
+            .find(|row| row.rowid == rowid)
+            .map_or(0, Fts5DocsizeRow::total_tokens)
+    }
+
+    fn doc_frequency(&self, term: &str) -> std::result::Result<u64, Fts5QueryError> {
+        Ok(self
+            .exact_entries(term)?
+            .into_iter()
+            .filter(|entry| !entry.poslist.delete)
+            .filter_map(|entry| rowid_u64_to_i64(entry.rowid))
+            .collect::<BTreeSet<_>>()
+            .len()
+            .try_into()
+            .unwrap_or(u64::MAX))
+    }
+
+    fn term_column_frequencies(
+        &self,
+        term: &str,
+        rowid: i64,
+    ) -> std::result::Result<Vec<(u32, u32)>, Fts5QueryError> {
+        let mut frequencies = BTreeMap::new();
+        for entry in self.exact_entries(term)? {
+            if rowid_u64_to_i64(entry.rowid) != Some(rowid) || entry.poslist.delete {
+                continue;
+            }
+            for column in entry.poslist.columns {
+                let count = u32::try_from(column.offsets.len()).unwrap_or(u32::MAX);
+                *frequencies.entry(column.column).or_insert(0_u32) = frequencies
+                    .get(&column.column)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(count);
+            }
+        }
+        Ok(frequencies.into_iter().collect())
+    }
+
+    fn bm25_score(
+        &self,
+        rowid: i64,
+        query_terms: &[String],
+        weights: &[f64],
+    ) -> std::result::Result<f64, Fts5QueryError> {
+        let n = self.total_docs() as f64;
+        let avgdl = self.avg_doc_length();
+        let dl = f64::from(self.doc_length(rowid));
+        let mut score = 0.0;
+
+        for term in query_terms {
+            let df_int = self.doc_frequency(term)?;
+            if df_int == 0 {
+                continue;
+            }
+            let df = df_int as f64;
+            let idf = ((n - df + 0.5) / (df + 0.5)).ln().max(BM25_IDF_FLOOR);
+
+            let mut weighted_tf = 0.0;
+            for (column, tf_u32) in self.term_column_frequencies(term, rowid)? {
+                let tf = f64::from(tf_u32);
+                let column_weight = usize::try_from(column)
+                    .ok()
+                    .and_then(|index| weights.get(index).copied())
+                    .unwrap_or(1.0);
+                weighted_tf += column_weight * tf;
+            }
+
+            if weighted_tf == 0.0 {
+                continue;
+            }
+
+            let denom = if avgdl > 0.0 {
+                BM25_K1.mul_add(1.0 - BM25_B + BM25_B * dl / avgdl, weighted_tf)
+            } else {
+                weighted_tf + BM25_K1
+            };
+            score += idf * (weighted_tf * (BM25_K1 + 1.0)) / denom;
+        }
+
+        Ok(-score)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FTS5 Virtual Table
 // ---------------------------------------------------------------------------
@@ -2097,6 +6198,8 @@ fn difference_sorted(a: &[i64], b: &[i64]) -> Vec<i64> {
 pub struct Fts5Table {
     /// Column names.
     columns: Vec<String>,
+    /// Whether each column participates in the inverted index.
+    indexed_columns: Vec<bool>,
     /// Configuration.
     config: Fts5Config,
     /// Tokenizer.
@@ -2107,6 +6210,10 @@ pub struct Fts5Table {
     index: InvertedIndex,
     /// Stored document content: docid -> (col0, col1, ...).
     documents: HashMap<i64, Vec<String>>,
+    /// Shadow-table rows bound from an existing on-disk FTS5 table.
+    shadow_rows: Option<Fts5ShadowRows>,
+    /// Locale metadata decoded from fts5_locale() values: (docid, column) -> locale.
+    row_locales: HashMap<(i64, usize), SmallText>,
     /// Next auto-generated rowid.
     next_rowid: i64,
     /// Snapshot-backed transaction/savepoint state for live VTAB writes.
@@ -2118,22 +6225,34 @@ struct Fts5TableSnapshot {
     config: Fts5Config,
     tokenizer_name: String,
     prefix_lengths: Vec<usize>,
+    indexed_columns: Vec<bool>,
     index: InvertedIndex,
     documents: HashMap<i64, Vec<String>>,
+    shadow_rows: Option<Fts5ShadowRows>,
+    row_locales: HashMap<(i64, usize), SmallText>,
     next_rowid: i64,
+}
+
+struct DecodedColumnValues {
+    values: Vec<String>,
+    locales: Vec<(usize, SmallText)>,
 }
 
 impl Fts5Table {
     /// Create a new FTS5 table with the given column names.
     #[must_use]
     pub fn with_columns(columns: Vec<String>) -> Self {
+        let indexed_columns = vec![true; columns.len()];
         Self {
             columns,
+            indexed_columns,
             config: Fts5Config::default(),
             tokenizer_name: "unicode61".to_owned(),
             prefix_lengths: Vec::new(),
             index: InvertedIndex::with_options(true, &[], DetailMode::Full),
             documents: HashMap::new(),
+            shadow_rows: None,
+            row_locales: HashMap::new(),
             next_rowid: 1,
             txn_state: TransactionalVtabState::default(),
         }
@@ -2144,8 +6263,11 @@ impl Fts5Table {
             config: self.config,
             tokenizer_name: self.tokenizer_name.clone(),
             prefix_lengths: self.prefix_lengths.clone(),
+            indexed_columns: self.indexed_columns.clone(),
             index: self.index.clone(),
             documents: self.documents.clone(),
+            shadow_rows: self.shadow_rows.clone(),
+            row_locales: self.row_locales.clone(),
             next_rowid: self.next_rowid,
         }
     }
@@ -2154,9 +6276,21 @@ impl Fts5Table {
         self.config = snapshot.config;
         self.tokenizer_name = snapshot.tokenizer_name;
         self.prefix_lengths = snapshot.prefix_lengths;
+        self.indexed_columns = snapshot.indexed_columns;
         self.index = snapshot.index;
         self.documents = snapshot.documents;
+        self.shadow_rows = snapshot.shadow_rows;
+        self.row_locales = snapshot.row_locales;
         self.next_rowid = snapshot.next_rowid;
+    }
+
+    fn restore_transaction_snapshot(&mut self, snapshot: Option<Fts5TableSnapshot>) -> bool {
+        if let Some(snapshot) = snapshot {
+            self.restore_state(snapshot);
+            true
+        } else {
+            false
+        }
     }
 
     fn index_document_with_tokenizer(
@@ -2167,8 +6301,57 @@ impl Fts5Table {
     ) {
         #[allow(clippy::cast_possible_truncation)]
         for (col_idx, text) in column_values.iter().enumerate() {
+            if matches!(self.indexed_columns.get(col_idx), Some(false)) {
+                continue;
+            }
             self.index.add_text(rowid, col_idx as u32, tokenizer, text);
         }
+    }
+
+    fn store_document_with_tokenizer_and_locales(
+        &mut self,
+        rowid: i64,
+        column_values: Vec<String>,
+        locales: Vec<(usize, SmallText)>,
+        tokenizer: &dyn Fts5Tokenizer,
+    ) {
+        if self.documents.contains_key(&rowid) {
+            self.index.remove_document(rowid);
+        }
+        self.row_locales.retain(|(existing_rowid, _column), _| {
+            !matches!(existing_rowid.cmp(&rowid), std::cmp::Ordering::Equal)
+        });
+        self.row_locales.extend(
+            locales
+                .into_iter()
+                .map(|(column, tag)| ((rowid, column), tag)),
+        );
+        self.index_document_with_tokenizer(rowid, &column_values, tokenizer);
+        self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
+        let stored_values = self.content_values_for_storage(&column_values);
+        self.documents.insert(rowid, stored_values);
+        self.shadow_rows = None;
+        debug!(rowid, "fts5: indexed document");
+    }
+
+    fn content_values_for_storage(&self, column_values: &[String]) -> Vec<String> {
+        if self.config.content_mode != ContentMode::Contentless {
+            return column_values.to_vec();
+        }
+
+        column_values
+            .iter()
+            .enumerate()
+            .map(|(column, value)| {
+                if self.config.contentless_unindexed
+                    && matches!(self.indexed_columns.get(column), Some(false))
+                {
+                    value.clone()
+                } else {
+                    String::new()
+                }
+            })
+            .collect()
     }
 
     fn store_document_with_tokenizer(
@@ -2177,18 +6360,33 @@ impl Fts5Table {
         column_values: Vec<String>,
         tokenizer: &dyn Fts5Tokenizer,
     ) {
-        if self.documents.contains_key(&rowid) {
-            self.index.remove_document(rowid);
-        }
-        self.index_document_with_tokenizer(rowid, &column_values, tokenizer);
-        self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
-        self.documents.insert(rowid, column_values);
-        debug!(rowid, "fts5: indexed document");
+        self.store_document_with_tokenizer_and_locales(rowid, column_values, Vec::new(), tokenizer);
     }
 
     pub fn create_tokenizer_instance(&self) -> Box<dyn Fts5Tokenizer> {
         create_tokenizer(&self.tokenizer_name)
             .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()))
+    }
+
+    pub fn open_shadow_rows(
+        cx: &Cx,
+        args: &[&str],
+        rows: &Fts5ShadowRows,
+    ) -> Result<Fts5ShadowOpen> {
+        let mut table = Self::connect(cx, args)?;
+        let report = rows.validate_for_open(table.columns.len())?;
+        report.metadata.apply_to_runtime_config(&mut table.config);
+        table.index = InvertedIndex::with_options_and_tokendata(
+            table.config.columnsize_enabled(),
+            &table.prefix_lengths,
+            table.config.detail_mode(),
+            table.config.tokendata_enabled(),
+        );
+        if let Some(rowid) = report.max_seen_rowid {
+            table.next_rowid = rowid.saturating_add(1).max(1);
+        }
+        table.shadow_rows = Some(rows.clone());
+        Ok(Fts5ShadowOpen { table, report })
     }
 
     #[must_use]
@@ -2216,6 +6414,34 @@ impl Fts5Table {
         self.store_document_with_tokenizer(rowid, column_values, tokenizer.as_ref());
     }
 
+    fn decode_column_values(&self, values: &[SqliteValue]) -> Result<DecodedColumnValues> {
+        let mut column_values = Vec::with_capacity(values.len());
+        let mut locales = Vec::new();
+
+        for (column, value) in values.iter().enumerate() {
+            if let Some(blob) = value.as_blob_bytes()
+                && let Some((tag, text)) = decode_fts5_locale_blob(blob)
+            {
+                if !self.config.locale_enabled() {
+                    return Err(FrankenError::function_error(
+                        "fts5_locale() requires locale=1",
+                    ));
+                }
+                column_values.push(text.to_owned());
+                if self.indexed_columns.get(column).copied().unwrap_or(true) {
+                    locales.push((column, SmallText::new(tag)));
+                }
+                continue;
+            }
+            column_values.push(value.to_text());
+        }
+
+        Ok(DecodedColumnValues {
+            values: column_values,
+            locales,
+        })
+    }
+
     /// Insert a document into the FTS5 table.
     pub fn insert_document(&mut self, rowid: i64, column_values: &[String]) {
         self.insert_document_owned(rowid, column_values.to_vec());
@@ -2225,17 +6451,24 @@ impl Fts5Table {
     pub fn delete_document(&mut self, rowid: i64) {
         self.index.remove_document(rowid);
         self.documents.remove(&rowid);
+        self.shadow_rows = None;
+        self.row_locales.retain(|(existing_rowid, _column), _| {
+            !matches!(existing_rowid.cmp(&rowid), std::cmp::Ordering::Equal)
+        });
         debug!(rowid, "fts5: removed document");
     }
 
     /// Rebuild the in-memory index and rowid allocator from persisted rows.
     pub fn rebuild_documents(&mut self, rows: Vec<(i64, Vec<String>)>) {
-        self.index = InvertedIndex::with_options(
+        self.index = InvertedIndex::with_options_and_tokendata(
             self.config.columnsize_enabled(),
             &self.prefix_lengths,
             self.config.detail_mode(),
+            self.config.tokendata_enabled(),
         );
         self.documents = HashMap::with_capacity(rows.len());
+        self.shadow_rows = None;
+        self.row_locales.clear();
         self.next_rowid = 1;
         let tokenizer = create_tokenizer(&self.tokenizer_name)
             .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
@@ -2259,6 +6492,15 @@ impl Fts5Table {
         weights: &[f64],
     ) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
         let tokenizer = self.create_tokenizer_instance();
+        if let Some(rows) = self.shadow_rows.as_ref() {
+            return Fts5ShadowQuery::new(
+                rows,
+                &self.columns,
+                tokenizer.as_ref(),
+                self.config.detail_mode(),
+            )?
+            .search_queries_with_weights(queries, weights);
+        }
         search_docids_with_weights_from_parts(
             &self.index,
             &self.columns,
@@ -2282,6 +6524,25 @@ impl Fts5Table {
         weights: &[f64],
     ) -> std::result::Result<Vec<(i64, f64, Vec<String>)>, Fts5QueryError> {
         let tokenizer = self.create_tokenizer_instance();
+        if let Some(rows) = self.shadow_rows.as_ref() {
+            return Fts5ShadowQuery::new(
+                rows,
+                &self.columns,
+                tokenizer.as_ref(),
+                self.config.detail_mode(),
+            )?
+            .search_queries_with_weights(queries, weights)
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(|(rowid, score)| {
+                        let columns = shadow_content_for_rowid(rows, rowid)
+                            .map_or_else(Vec::new, <[String]>::to_vec);
+                        (rowid, score, columns)
+                    })
+                    .collect()
+            });
+        }
         search_rows_with_weights_from_parts(
             &self.index,
             &self.columns,
@@ -2328,6 +6589,36 @@ impl Fts5Table {
         self.documents.get(&rowid).map(Vec::as_slice)
     }
 
+    /// Get locale metadata decoded from an fts5_locale() column value.
+    #[must_use]
+    pub fn get_locale(&self, rowid: i64, column: usize) -> Option<&str> {
+        self.row_locales
+            .get(&(rowid, column))
+            .map(SmallText::as_str)
+    }
+
+    #[must_use]
+    pub fn locale_value(&self, rowid: i64, column: usize) -> SqliteValue {
+        if !self.config.locale_enabled() {
+            return SqliteValue::Null;
+        }
+        self.get_locale(rowid, column)
+            .map_or(SqliteValue::Null, |tag| {
+                SqliteValue::Text(SmallText::new(tag))
+            })
+    }
+
+    #[must_use]
+    pub fn all_locales(&self) -> Vec<(i64, usize, String)> {
+        let mut locales: Vec<(i64, usize, String)> = self
+            .row_locales
+            .iter()
+            .map(|((rowid, column), tag)| (*rowid, *column, tag.to_string()))
+            .collect();
+        locales.sort_unstable_by_key(|entry| (entry.0, entry.1));
+        locales
+    }
+
     /// Get the FTS5 config.
     #[must_use]
     pub fn config(&self) -> &Fts5Config {
@@ -2339,10 +6630,176 @@ impl Fts5Table {
         &mut self.config
     }
 
+    #[must_use]
+    pub fn config_metadata(&self) -> Fts5ConfigMetadata {
+        self.config.config_metadata()
+    }
+
+    #[must_use]
+    pub fn encode_config_rows(&self) -> Vec<Fts5ConfigRecord> {
+        self.config.encode_config_rows()
+    }
+
+    pub fn apply_config_rows(&mut self, rows: &[Fts5ConfigRecord]) -> Result<Fts5ConfigMetadata> {
+        self.config.apply_config_rows(rows)
+    }
+
+    #[must_use]
+    pub fn encode_content_rows(&self) -> Vec<Fts5ContentRow> {
+        if self.config.content_mode == ContentMode::Contentless
+            && !self.config.contentless_unindexed
+        {
+            return Vec::new();
+        }
+
+        let mut rows: Vec<Fts5ContentRow> = self
+            .documents
+            .iter()
+            .filter_map(|(rowid, values)| {
+                if self.config.content_mode == ContentMode::Contentless
+                    && values.iter().all(String::is_empty)
+                {
+                    None
+                } else {
+                    Some(Fts5ContentRow::new(*rowid, values.clone()))
+                }
+            })
+            .collect();
+        rows.sort_unstable_by_key(|row| row.rowid);
+        rows
+    }
+
+    #[must_use]
+    pub fn lookup_content_row(&self, rowid: i64) -> Option<Fts5ContentRow> {
+        self.encode_content_rows()
+            .into_iter()
+            .find(|row| row.rowid == rowid)
+    }
+
+    pub fn apply_content_rows(&mut self, rows: &[Fts5ContentRow]) {
+        let rows = rows
+            .iter()
+            .map(|row| (row.rowid, row.values.clone()))
+            .collect();
+        self.rebuild_documents(rows);
+    }
+
+    #[must_use]
+    pub fn encode_docsize_rows(&self) -> Vec<Fts5DocsizeRow> {
+        if !self.config.columnsize_enabled() {
+            return Vec::new();
+        }
+
+        let mut docids: Vec<i64> = self
+            .documents
+            .keys()
+            .copied()
+            .chain(self.index.doc_ids.iter().copied())
+            .collect();
+        docids.sort_unstable();
+        docids.dedup();
+        docids
+            .into_iter()
+            .map(|rowid| self.index.docsize_row(rowid, self.columns.len()))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn lookup_docsize_row(&self, rowid: i64) -> Option<Fts5DocsizeRow> {
+        self.encode_docsize_rows()
+            .into_iter()
+            .find(|row| row.rowid == rowid)
+    }
+
+    pub fn apply_docsize_rows(&mut self, rows: &[Fts5DocsizeRow]) {
+        if !self.config.columnsize_enabled() {
+            return;
+        }
+        if self.index.doc_lengths.is_none() {
+            self.index.doc_lengths = Some(HashMap::new());
+        }
+        for row in rows {
+            self.index.apply_docsize_row(row);
+            self.next_rowid = self.next_rowid.max(row.rowid.saturating_add(1));
+        }
+    }
+
+    #[must_use]
+    pub fn encode_data_rows(&self) -> Vec<Fts5DataRow> {
+        let docsize_rows = self.encode_docsize_rows();
+        let averages = Fts5AveragesRecord::from_docsize_rows(
+            u64::try_from(self.row_count()).unwrap_or(u64::MAX),
+            self.columns.len(),
+            &docsize_rows,
+        );
+        let structure = if self.config.contentless_delete_enabled() {
+            Fts5StructureRecord::empty_with_origin_tracking(0)
+        } else {
+            Fts5StructureRecord::empty_legacy(0)
+        };
+
+        vec![
+            Fts5DataRow::new(FTS5_AVERAGES_ROWID, averages.encode()),
+            Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()),
+        ]
+    }
+
+    pub fn decode_data_rows(&self, rows: &[Fts5DataRow]) -> Result<Fts5DataMetadata> {
+        Fts5DataMetadata::decode_rows(rows, self.columns.len())
+    }
+
+    pub fn build_pending_hash(&self) -> Result<Fts5PendingHash> {
+        let tokenizer = self.create_tokenizer_instance();
+        let mut pending = Fts5PendingHash::new(
+            &self.prefix_lengths,
+            self.config.detail_mode(),
+            self.config.tokendata_enabled(),
+        );
+        for (rowid, values) in self.all_rows() {
+            pending.add_document(rowid, &values, &self.indexed_columns, tokenizer.as_ref())?;
+        }
+        Ok(pending)
+    }
+
+    pub fn flush_pending_segment(
+        &self,
+        segid: u32,
+        structure: Fts5StructureRecord,
+    ) -> Result<Fts5PendingFlush> {
+        self.build_pending_hash()?
+            .flush_to_segment(segid, structure)
+    }
+
+    #[must_use]
+    pub fn encode_shadow_rows(&self) -> Fts5ShadowRows {
+        Fts5ShadowRows {
+            data: self.encode_data_rows(),
+            idx: Vec::new(),
+            config: self.encode_config_rows(),
+            content: self.encode_content_rows(),
+            docsize: self.encode_docsize_rows(),
+        }
+    }
+
+    pub fn apply_shadow_rows(&mut self, rows: &Fts5ShadowRows) -> Result<Fts5ConfigMetadata> {
+        self.decode_data_rows(&rows.data)?;
+        let metadata = self.apply_config_rows(&rows.config)?;
+        if self.config.content_mode() != ContentMode::Contentless || !rows.content.is_empty() {
+            self.apply_content_rows(&rows.content);
+        }
+        self.apply_docsize_rows(&rows.docsize);
+        Ok(metadata)
+    }
+
     /// Get column names.
     #[must_use]
     pub fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    #[must_use]
+    pub fn indexed_columns(&self) -> &[bool] {
+        &self.indexed_columns
     }
 
     #[must_use]
@@ -2353,18 +6810,198 @@ impl Fts5Table {
 
 /// Extract all leaf-level terms from an expression tree for BM25 scoring.
 fn extract_query_terms(expr: &Fts5Expr) -> Vec<String> {
+    fn near_operand_terms(operand: &Fts5NearOperand) -> Vec<String> {
+        match operand {
+            Fts5NearOperand::Term(term) | Fts5NearOperand::Prefix(term) => vec![term.clone()],
+            Fts5NearOperand::Phrase(terms) => terms.clone(),
+        }
+    }
+
     match expr {
-        Fts5Expr::Term(t) => vec![t.to_lowercase()],
-        Fts5Expr::Prefix(p) => vec![p.to_lowercase()],
+        Fts5Expr::Term(t) => vec![t.clone()],
+        Fts5Expr::Prefix(p) => vec![p.clone()],
         Fts5Expr::Phrase(words) => words.clone(),
-        Fts5Expr::And(l, r) | Fts5Expr::Or(l, r) | Fts5Expr::Not(l, r) => {
+        Fts5Expr::PhrasePrefix(words, prefix) => {
+            let mut terms = words.clone();
+            terms.push(prefix.clone());
+            terms
+        }
+        Fts5Expr::And(l, r) | Fts5Expr::Or(l, r) => {
             let mut terms = extract_query_terms(l);
             terms.extend(extract_query_terms(r));
             terms
         }
-        Fts5Expr::Near(terms, _) => terms.iter().map(|t| t.to_lowercase()).collect(),
+        Fts5Expr::Not(left, _) => extract_query_terms(left),
+        Fts5Expr::Near(operands, _) => operands.iter().flat_map(near_operand_terms).collect(),
         Fts5Expr::ColumnFilter(_, inner) | Fts5Expr::InitialToken(inner) => {
             extract_query_terms(inner)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fts5HighlightTerm {
+    term: String,
+    prefix: bool,
+}
+
+impl Fts5HighlightTerm {
+    fn exact(term: &str) -> Self {
+        Self {
+            term: term.to_lowercase(),
+            prefix: false,
+        }
+    }
+
+    fn prefix(term: &str) -> Self {
+        Self {
+            term: term.to_lowercase(),
+            prefix: true,
+        }
+    }
+
+    fn matches_token(&self, token: &str) -> bool {
+        if self.prefix {
+            token.starts_with(&self.term)
+        } else {
+            token.eq(self.term.as_str())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fts5HighlightPattern {
+    parts: Vec<Fts5HighlightTerm>,
+}
+
+impl Fts5HighlightPattern {
+    fn singleton(term: Fts5HighlightTerm) -> Self {
+        Self { parts: vec![term] }
+    }
+
+    fn exact_phrase(words: &[String]) -> Self {
+        Self {
+            parts: words
+                .iter()
+                .map(|word| Fts5HighlightTerm::exact(word))
+                .collect(),
+        }
+    }
+
+    fn phrase_prefix(words: &[String], prefix: &str) -> Self {
+        let mut parts = Vec::with_capacity(words.len() + 1);
+        parts.extend(words.iter().map(|word| Fts5HighlightTerm::exact(word)));
+        parts.push(Fts5HighlightTerm::prefix(prefix));
+        Self { parts }
+    }
+
+    fn token_count(&self) -> usize {
+        self.parts.len()
+    }
+
+    fn matches_at(&self, tokens: &[Fts5Token], start: usize) -> Option<usize> {
+        let end = start.checked_add(self.parts.len())?;
+        if self.parts.is_empty() || end > tokens.len() {
+            return None;
+        }
+
+        tokens
+            .get(start..end)?
+            .iter()
+            .zip(&self.parts)
+            .all(|(token, part)| part.matches_token(&token.term))
+            .then_some(end)
+    }
+}
+
+fn highlight_patterns_from_terms(terms: &[Fts5HighlightTerm]) -> Vec<Fts5HighlightPattern> {
+    let mut patterns = Vec::with_capacity(terms.len());
+    patterns.extend(terms.iter().cloned().map(Fts5HighlightPattern::singleton));
+    patterns
+}
+
+#[cfg(test)]
+fn extract_highlight_terms(expr: &Fts5Expr) -> Vec<Fts5HighlightTerm> {
+    fn near_operand_terms(operand: &Fts5NearOperand) -> Vec<Fts5HighlightTerm> {
+        match operand {
+            Fts5NearOperand::Term(term) => vec![Fts5HighlightTerm::exact(term)],
+            Fts5NearOperand::Prefix(prefix) => vec![Fts5HighlightTerm::prefix(prefix)],
+            Fts5NearOperand::Phrase(terms) => terms
+                .iter()
+                .map(|term| Fts5HighlightTerm::exact(term))
+                .collect(),
+        }
+    }
+
+    match expr {
+        Fts5Expr::Term(term) => vec![Fts5HighlightTerm::exact(term)],
+        Fts5Expr::Prefix(prefix) => vec![Fts5HighlightTerm::prefix(prefix)],
+        Fts5Expr::Phrase(words) => words
+            .iter()
+            .map(|term| Fts5HighlightTerm::exact(term))
+            .collect(),
+        Fts5Expr::PhrasePrefix(words, prefix) => {
+            let mut terms: Vec<Fts5HighlightTerm> = words
+                .iter()
+                .map(|term| Fts5HighlightTerm::exact(term))
+                .collect();
+            terms.push(Fts5HighlightTerm::prefix(prefix));
+            terms
+        }
+        Fts5Expr::And(left, right) | Fts5Expr::Or(left, right) => {
+            let mut terms = extract_highlight_terms(left);
+            terms.extend(extract_highlight_terms(right));
+            terms
+        }
+        Fts5Expr::Not(left, _) => extract_highlight_terms(left),
+        Fts5Expr::Near(operands, _) => operands.iter().flat_map(near_operand_terms).collect(),
+        Fts5Expr::ColumnFilter(_, inner) | Fts5Expr::InitialToken(inner) => {
+            extract_highlight_terms(inner)
+        }
+    }
+}
+
+fn extract_highlight_patterns(expr: &Fts5Expr) -> Vec<Fts5HighlightPattern> {
+    fn near_operand_patterns(operand: &Fts5NearOperand) -> Vec<Fts5HighlightPattern> {
+        match operand {
+            Fts5NearOperand::Term(term) => {
+                vec![Fts5HighlightPattern::singleton(Fts5HighlightTerm::exact(
+                    term,
+                ))]
+            }
+            Fts5NearOperand::Prefix(prefix) => {
+                vec![Fts5HighlightPattern::singleton(Fts5HighlightTerm::prefix(
+                    prefix,
+                ))]
+            }
+            Fts5NearOperand::Phrase(terms) => {
+                vec![Fts5HighlightPattern::exact_phrase(terms)]
+            }
+        }
+    }
+
+    match expr {
+        Fts5Expr::Term(term) => vec![Fts5HighlightPattern::singleton(Fts5HighlightTerm::exact(
+            term,
+        ))],
+        Fts5Expr::Prefix(prefix) => {
+            vec![Fts5HighlightPattern::singleton(Fts5HighlightTerm::prefix(
+                prefix,
+            ))]
+        }
+        Fts5Expr::Phrase(words) => vec![Fts5HighlightPattern::exact_phrase(words)],
+        Fts5Expr::PhrasePrefix(words, prefix) => {
+            vec![Fts5HighlightPattern::phrase_prefix(words, prefix)]
+        }
+        Fts5Expr::And(left, right) | Fts5Expr::Or(left, right) => {
+            let mut patterns = extract_highlight_patterns(left);
+            patterns.extend(extract_highlight_patterns(right));
+            patterns
+        }
+        Fts5Expr::Not(left, _) => extract_highlight_patterns(left),
+        Fts5Expr::Near(operands, _) => operands.iter().flat_map(near_operand_patterns).collect(),
+        Fts5Expr::ColumnFilter(_, inner) | Fts5Expr::InitialToken(inner) => {
+            extract_highlight_patterns(inner)
         }
     }
 }
@@ -2376,11 +7013,44 @@ fn extract_query_terms(expr: &Fts5Expr) -> Vec<String> {
 impl VirtualTable for Fts5Table {
     type Cursor = Fts5Cursor;
 
+    fn module_metadata(_args: &[&str]) -> VtabModuleMetadata
+    where
+        Self: Sized,
+    {
+        VtabModuleMetadata::shadow_owning(
+            VtabLifecyclePolicy::SeparateCreateAndConnect,
+            VtabIntegrityPolicy::ShadowAware,
+            VtabRiskLevel::innocuous(),
+        )
+    }
+
+    fn shadow_table_policy(vtab_name: &str, table_name: &str) -> ShadowTablePolicy
+    where
+        Self: Sized,
+    {
+        let lower_table_name = table_name.to_ascii_lowercase();
+        let lower_vtab_name = vtab_name.to_ascii_lowercase();
+        let Some(suffix) = lower_table_name
+            .strip_prefix(&lower_vtab_name)
+            .filter(|suffix| suffix.starts_with('_'))
+        else {
+            return ShadowTablePolicy::ordinary();
+        };
+
+        match suffix {
+            "_data" | "_idx" | "_config" | "_content" | "_docsize" => {
+                ShadowTablePolicy::owned_shadow()
+            }
+            _ => ShadowTablePolicy::ordinary(),
+        }
+    }
+
     fn connect(_cx: &Cx, args: &[&str]) -> Result<Self>
     where
         Self: Sized,
     {
         let mut columns: Vec<String> = Vec::new();
+        let mut indexed_columns: Vec<bool> = Vec::new();
         let mut config = Fts5Config::default();
         let mut tokenizer_name = "unicode61".to_owned();
         let mut prefix_lengths = Vec::new();
@@ -2398,6 +7068,11 @@ impl VirtualTable for Fts5Table {
                     let value_unquoted = value_unquoted_raw.to_ascii_lowercase();
                     match key_lower.as_str() {
                         "tokenize" => {
+                            if create_tokenizer(value_unquoted_raw).is_none() {
+                                return Err(FrankenError::function_error(
+                                    "fts5: unsupported tokenizer specification",
+                                ));
+                            }
                             value_unquoted_raw.clone_into(&mut tokenizer_name);
                         }
                         "content" => {
@@ -2407,8 +7082,33 @@ impl VirtualTable for Fts5Table {
                                 config.content_mode = ContentMode::Stored;
                             }
                         }
-                        "contentless_delete" | "secure_delete" | "secure-delete" => {
-                            let _ = config.apply_control_command(&format!("{key}={value}"));
+                        "contentless_delete" => {
+                            config.contentless_delete = parse_columnsize_option(
+                                value_unquoted.as_str(),
+                            )
+                            .ok_or_else(|| {
+                                FrankenError::function_error(
+                                    "fts5: contentless_delete must be 0 or 1",
+                                )
+                            })?;
+                        }
+                        "secure_delete" | "secure-delete" => {
+                            config.secure_delete = parse_bool_like(value_unquoted.as_str())
+                                .ok_or_else(|| {
+                                    FrankenError::function_error(
+                                        "fts5: secure_delete must be a boolean value",
+                                    )
+                                })?;
+                        }
+                        "contentless_unindexed" => {
+                            config.contentless_unindexed = parse_columnsize_option(
+                                value_unquoted.as_str(),
+                            )
+                            .ok_or_else(|| {
+                                FrankenError::function_error(
+                                    "fts5: contentless_unindexed must be 0 or 1",
+                                )
+                            })?;
                         }
                         "columnsize" => {
                             config.columnsize = parse_columnsize_option(value_unquoted.as_str())
@@ -2433,8 +7133,26 @@ impl VirtualTable for Fts5Table {
                                 })?,
                             );
                         }
-                        // Parsed for compatibility but not used in this in-memory path yet.
-                        "insttoken" => {}
+                        "insttoken" => {
+                            config.insttoken = parse_bool_like(value_unquoted.as_str())
+                                .ok_or_else(|| {
+                                    FrankenError::function_error(
+                                        "fts5: insttoken must be a boolean value",
+                                    )
+                                })?;
+                        }
+                        "locale" => {
+                            config.locale = parse_columnsize_option(value_unquoted.as_str())
+                                .ok_or_else(|| {
+                                    FrankenError::function_error("fts5: locale must be 0 or 1")
+                                })?;
+                        }
+                        "tokendata" => {
+                            config.tokendata = parse_columnsize_option(value_unquoted.as_str())
+                                .ok_or_else(|| {
+                                    FrankenError::function_error("fts5: tokendata must be 0 or 1")
+                                })?;
+                        }
                         _ => {
                             return Err(FrankenError::function_error(format!(
                                 "fts5: unsupported option '{key}'"
@@ -2444,22 +7162,20 @@ impl VirtualTable for Fts5Table {
                     continue;
                 }
 
-                // Column declarations may include `UNINDEXED` or collation hints;
-                // keep the leading identifier as the column name.
-                let column = trimmed
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or_default()
-                    .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '[' | ']'));
-                if !column.is_empty() {
-                    columns.push(column.to_owned());
+                if let Some((column, indexed)) = parse_column_declaration(trimmed)? {
+                    columns.push(column);
+                    indexed_columns.push(indexed);
                 }
             }
         }
 
+        validate_contentless_options(config)?;
+
         if columns.is_empty() {
             columns.push("content".to_owned());
+            indexed_columns.push(true);
         }
+        validate_column_names(args.get(2).copied().unwrap_or_default(), &columns)?;
         prefix_lengths.sort_unstable();
         prefix_lengths.dedup();
 
@@ -2469,19 +7185,26 @@ impl VirtualTable for Fts5Table {
             content_mode = ?config.content_mode,
             secure_delete = config.secure_delete,
             contentless_delete = config.contentless_delete,
+            contentless_unindexed = config.contentless_unindexed,
             detail = ?config.detail_mode(),
+            insttoken = config.insttoken,
+            locale = config.locale,
+            tokendata = config.tokendata,
+            indexed_columns = ?indexed_columns,
             prefix_lengths = ?prefix_lengths,
             "fts5: connecting virtual table"
         );
 
         let mut table = Self::with_columns(columns);
+        table.indexed_columns = indexed_columns;
         table.config = config;
         table.tokenizer_name = tokenizer_name;
         table.prefix_lengths = prefix_lengths;
-        table.index = InvertedIndex::with_options(
+        table.index = InvertedIndex::with_options_and_tokendata(
             table.config.columnsize_enabled(),
             &table.prefix_lengths,
             table.config.detail_mode(),
+            table.config.tokendata_enabled(),
         );
         Ok(table)
     }
@@ -2521,8 +7244,10 @@ impl VirtualTable for Fts5Table {
             position: 0,
             columns: self.columns.clone(),
             tokenizer_name: self.tokenizer_name.clone(),
+            detail: self.config.detail_mode(),
             index: self.index.clone(),
             documents: self.documents.clone(),
+            shadow_rows: self.shadow_rows.clone(),
         })
     }
 
@@ -2574,14 +7299,32 @@ impl VirtualTable for Fts5Table {
                 return Err(FrankenError::PrimaryKeyViolation);
             }
 
-            let col_values: Vec<String> = args.iter().skip(2).map(SqliteValue::to_text).collect();
-            self.insert_document_owned(rowid, col_values);
+            let column_args = match args.get(2..) {
+                Some(values) => values,
+                None => &[],
+            };
+            let DecodedColumnValues {
+                values: col_values,
+                locales,
+            } = self.decode_column_values(column_args)?;
+            let tokenizer = self.create_tokenizer_instance();
+            self.store_document_with_tokenizer_and_locales(
+                rowid,
+                col_values,
+                locales,
+                tokenizer.as_ref(),
+            );
             return Ok(Some(rowid));
         }
 
         // UPDATE: validate rowid movement before mutating so conflict failures
         // preserve the old row and its index postings.
         let old_rowid = args[0].to_integer();
+        if self.config.content_mode == ContentMode::Contentless && !self.config.contentless_delete {
+            return Err(FrankenError::function_error(
+                "fts5: cannot update contentless table without contentless_delete=1",
+            ));
+        }
         let new_rowid = if args.len() > 1 && !args[1].is_null() {
             args[1].to_integer()
         } else {
@@ -2595,10 +7338,23 @@ impl VirtualTable for Fts5Table {
                 "fts5 update referenced a missing rowid".to_owned(),
             ));
         }
-        self.delete_document(old_rowid);
 
-        let col_values: Vec<String> = args.iter().skip(2).map(SqliteValue::to_text).collect();
-        self.insert_document_owned(new_rowid, col_values);
+        let column_args = match args.get(2..) {
+            Some(values) => values,
+            None => &[],
+        };
+        let DecodedColumnValues {
+            values: col_values,
+            locales,
+        } = self.decode_column_values(column_args)?;
+        self.delete_document(old_rowid);
+        let tokenizer = self.create_tokenizer_instance();
+        self.store_document_with_tokenizer_and_locales(
+            new_rowid,
+            col_values,
+            locales,
+            tokenizer.as_ref(),
+        );
         Ok(None)
     }
 
@@ -2608,9 +7364,8 @@ impl VirtualTable for Fts5Table {
     }
 
     fn rollback(&mut self, _cx: &Cx) -> Result<()> {
-        if let Some(snapshot) = self.txn_state.rollback() {
-            self.restore_state(snapshot);
-        }
+        let snapshot = self.txn_state.rollback();
+        self.restore_transaction_snapshot(snapshot);
         Ok(())
     }
 
@@ -2625,9 +7380,8 @@ impl VirtualTable for Fts5Table {
     }
 
     fn rollback_to(&mut self, _cx: &Cx, n: i32) -> Result<()> {
-        if let Some(snapshot) = self.txn_state.rollback_to(n) {
-            self.restore_state(snapshot);
-        }
+        let snapshot = self.txn_state.rollback_to(n);
+        self.restore_transaction_snapshot(snapshot);
         Ok(())
     }
 }
@@ -2643,10 +7397,14 @@ pub struct Fts5Cursor {
     columns: Vec<String>,
     /// Tokenizer spec copied from the table at cursor-open time.
     tokenizer_name: String,
+    /// Detail mode copied from the table at cursor-open time.
+    detail: DetailMode,
     /// Snapshot of the inverted index at cursor-open time.
     index: InvertedIndex,
     /// Snapshot of stored documents at cursor-open time.
     documents: HashMap<i64, Vec<String>>,
+    /// Shadow-table rows copied from an opened stock FTS5 table.
+    shadow_rows: Option<Fts5ShadowRows>,
 }
 
 impl VirtualTableCursor for Fts5Cursor {
@@ -2669,23 +7427,35 @@ impl VirtualTableCursor for Fts5Cursor {
                 let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
                 let tokenizer = create_tokenizer(&self.tokenizer_name)
                     .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
-                self.results = search_docids_with_weights_from_parts(
-                    &self.index,
-                    &self.columns,
-                    &query_refs,
-                    &weights,
-                    Some(tokenizer.as_ref()),
-                )
+                self.results = if let Some(rows) = self.shadow_rows.as_ref() {
+                    Fts5ShadowQuery::new(rows, &self.columns, tokenizer.as_ref(), self.detail)
+                        .and_then(|query| query.search_queries_with_weights(&query_refs, &weights))
+                } else {
+                    search_docids_with_weights_from_parts(
+                        &self.index,
+                        &self.columns,
+                        &query_refs,
+                        &weights,
+                        Some(tokenizer.as_ref()),
+                    )
+                }
                 .map_err(|e| FrankenError::function_error(format!("fts5 query error: {e}")))?;
             }
         } else {
             // Full table scan (idx_num == 0): return all documents.
-            let mut rows: Vec<(i64, f64)> = self
-                .documents
-                .keys()
-                .copied()
-                .map(|rowid| (rowid, 0.0))
-                .collect();
+            let mut rows: Vec<(i64, f64)> = if let Some(shadow_rows) = self.shadow_rows.as_ref() {
+                shadow_rows
+                    .content
+                    .iter()
+                    .map(|row| (row.rowid, 0.0))
+                    .collect()
+            } else {
+                self.documents
+                    .keys()
+                    .copied()
+                    .map(|rowid| (rowid, 0.0))
+                    .collect()
+            };
             rows.sort_by_key(|(rowid, _)| *rowid);
             self.results = rows;
         }
@@ -2717,6 +7487,11 @@ impl VirtualTableCursor for Fts5Cursor {
         if is_rank_column {
             ctx.set_value(SqliteValue::Float(*score));
         } else if let Some(cols) = self.documents.get(rowid)
+            && let Some(val) = cols.get(col_idx)
+        {
+            ctx.set_value(SqliteValue::Text(SmallText::new(val.as_str())));
+        } else if let Some(rows) = self.shadow_rows.as_ref()
+            && let Some(cols) = shadow_content_for_rowid(rows, *rowid)
             && let Some(val) = cols.get(col_idx)
         {
             ctx.set_value(SqliteValue::Text(SmallText::new(val.as_str())));
@@ -2756,21 +7531,85 @@ impl Fts5Cursor {
 /// markers.
 #[must_use]
 pub fn highlight(text: &str, terms: &[String], open_tag: &str, close_tag: &str) -> String {
+    let highlight_terms: Vec<Fts5HighlightTerm> = terms
+        .iter()
+        .map(|term| Fts5HighlightTerm::exact(term))
+        .collect();
+    let patterns = highlight_patterns_from_terms(&highlight_terms);
+    highlight_with_patterns(text, &patterns, open_tag, close_tag)
+}
+
+#[cfg(test)]
+fn highlight_with_terms(
+    text: &str,
+    terms: &[Fts5HighlightTerm],
+    open_tag: &str,
+    close_tag: &str,
+) -> String {
+    let patterns = highlight_patterns_from_terms(terms);
+    highlight_with_patterns(text, &patterns, open_tag, close_tag)
+}
+
+fn highlight_spans(tokens: &[Fts5Token], patterns: &[Fts5HighlightPattern]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut token_index = 0;
+
+    while token_index < tokens.len() {
+        let best_match = patterns
+            .iter()
+            .filter(|pattern| pattern.token_count() > 0)
+            .filter_map(|pattern| {
+                pattern
+                    .matches_at(tokens, token_index)
+                    .map(|end_index| (end_index, pattern.token_count()))
+            })
+            .max_by_key(|(end_index, token_count)| (*end_index, *token_count));
+
+        if let Some((end_index, _)) = best_match {
+            if let (Some(first), Some(last)) = (
+                tokens.get(token_index),
+                tokens.get(end_index.saturating_sub(1)),
+            ) {
+                match spans.last_mut() {
+                    Some((_, previous_end)) if first.start < *previous_end => {
+                        *previous_end = (*previous_end).max(last.end);
+                    }
+                    _ => spans.push((first.start, last.end)),
+                }
+            }
+            token_index = end_index;
+        } else {
+            token_index += 1;
+        }
+    }
+
+    spans
+}
+
+fn highlight_with_patterns(
+    text: &str,
+    patterns: &[Fts5HighlightPattern],
+    open_tag: &str,
+    close_tag: &str,
+) -> String {
+    if patterns.is_empty() {
+        return text.to_owned();
+    }
+
     let tokenizer = Unicode61Tokenizer::new();
     let tokens = tokenizer.tokenize(text);
-    let lower_terms: Vec<String> = terms.iter().map(|t| t.to_lowercase()).collect();
+    let spans = highlight_spans(&tokens, patterns);
 
-    let mut result = String::new();
+    let mut result =
+        String::with_capacity(text.len() + spans.len() * (open_tag.len() + close_tag.len()));
     let mut last_end = 0;
 
-    for token in &tokens {
-        if lower_terms.contains(&token.term) {
-            result.push_str(&text[last_end..token.start]);
-            result.push_str(open_tag);
-            result.push_str(&text[token.start..token.end]);
-            result.push_str(close_tag);
-            last_end = token.end;
-        }
+    for (start, end) in spans {
+        result.push_str(&text[last_end..start]);
+        result.push_str(open_tag);
+        result.push_str(&text[start..end]);
+        result.push_str(close_tag);
+        last_end = end;
     }
 
     result.push_str(&text[last_end..]);
@@ -2788,36 +7627,139 @@ pub fn snippet(
     ellipsis: &str,
     max_tokens: usize,
 ) -> String {
+    let highlight_terms: Vec<Fts5HighlightTerm> = terms
+        .iter()
+        .map(|term| Fts5HighlightTerm::exact(term))
+        .collect();
+    let patterns = highlight_patterns_from_terms(&highlight_terms);
+    snippet_with_patterns(text, &patterns, open_tag, close_tag, ellipsis, max_tokens)
+}
+
+#[cfg(test)]
+fn snippet_with_terms(
+    text: &str,
+    terms: &[Fts5HighlightTerm],
+    open_tag: &str,
+    close_tag: &str,
+    ellipsis: &str,
+    max_tokens: usize,
+) -> String {
+    let patterns = highlight_patterns_from_terms(terms);
+    snippet_with_patterns(text, &patterns, open_tag, close_tag, ellipsis, max_tokens)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fts5SnippetWindow {
+    first: usize,
+    last_exclusive: usize,
+    distinct: u32,
+    total: u32,
+}
+
+fn score_snippet_window(
+    tokens: &[Fts5Token],
+    patterns: &[Fts5HighlightPattern],
+    first: usize,
+    last_exclusive: usize,
+) -> Fts5SnippetWindow {
+    const MAX_PATTERN_BITS: usize = 128;
+
+    let mut seen = 0_u128;
+    let mut overflow_seen = SmallVec::<[usize; 4]>::new();
+    let mut total = 0_u32;
+
+    for token_index in first..last_exclusive {
+        for (pattern_index, pattern) in patterns.iter().enumerate() {
+            if pattern
+                .matches_at(tokens, token_index)
+                .is_some_and(|match_end| match_end <= last_exclusive)
+            {
+                total = total.saturating_add(1);
+                if pattern_index < MAX_PATTERN_BITS {
+                    seen |= 1_u128 << pattern_index;
+                } else if !overflow_seen.contains(&pattern_index) {
+                    overflow_seen.push(pattern_index);
+                }
+            }
+        }
+    }
+
+    let overflow_distinct = u32::try_from(overflow_seen.len()).unwrap_or(u32::MAX);
+    Fts5SnippetWindow {
+        first,
+        last_exclusive,
+        distinct: seen.count_ones().saturating_add(overflow_distinct),
+        total,
+    }
+}
+
+fn snippet_window_is_better(candidate: Fts5SnippetWindow, best: Fts5SnippetWindow) -> bool {
+    candidate.distinct > best.distinct
+        || (candidate.distinct == best.distinct
+            && (candidate.total > best.total
+                || (candidate.total == best.total && candidate.first < best.first)))
+}
+
+fn select_snippet_window(
+    tokens: &[Fts5Token],
+    patterns: &[Fts5HighlightPattern],
+    max_tokens: usize,
+) -> Fts5SnippetWindow {
+    let token_count = max_tokens.min(tokens.len());
+    if token_count == 0 {
+        return Fts5SnippetWindow {
+            first: 0,
+            last_exclusive: 0,
+            distinct: 0,
+            total: 0,
+        };
+    }
+
+    let mut best = score_snippet_window(tokens, patterns, 0, token_count);
+    for first in 1..=tokens.len() - token_count {
+        let candidate = score_snippet_window(tokens, patterns, first, first + token_count);
+        if snippet_window_is_better(candidate, best) {
+            best = candidate;
+        }
+    }
+
+    best
+}
+
+#[allow(clippy::similar_names)]
+fn snippet_with_patterns(
+    text: &str,
+    patterns: &[Fts5HighlightPattern],
+    open_tag: &str,
+    close_tag: &str,
+    ellipsis: &str,
+    max_tokens: usize,
+) -> String {
+    if max_tokens == 0 {
+        return String::new();
+    }
+
     let tokenizer = Unicode61Tokenizer::new();
     let tokens = tokenizer.tokenize(text);
-    let lower_terms: Vec<String> = terms.iter().map(|t| t.to_lowercase()).collect();
 
-    // Find first matching token position.
-    let match_pos = tokens
-        .iter()
-        .position(|t| lower_terms.contains(&t.term))
-        .unwrap_or(0);
-
-    // Calculate window around match.
-    let half = max_tokens / 2;
-    let start = match_pos.saturating_sub(half);
-    let end = (start + max_tokens).min(tokens.len());
+    let window = select_snippet_window(&tokens, patterns, max_tokens);
 
     let mut result = String::new();
-    if start > 0 {
+    if window.first > 0 {
         result.push_str(ellipsis);
     }
 
-    let window_tokens = &tokens[start..end];
-    if let Some(first) = window_tokens.first() {
-        let last = &window_tokens[window_tokens.len() - 1];
+    let window_tokens = &tokens[window.first..window.last_exclusive];
+    if let (Some(first), Some(last)) = (window_tokens.first(), window_tokens.last()) {
         let slice = &text[first.start..last.end];
 
         // Highlight matching terms within the snippet.
-        result.push_str(&highlight(slice, terms, open_tag, close_tag));
+        result.push_str(&highlight_with_patterns(
+            slice, patterns, open_tag, close_tag,
+        ));
     }
 
-    if end < tokens.len() {
+    if window.last_exclusive < tokens.len() {
         result.push_str(ellipsis);
     }
 
@@ -2828,30 +7770,58 @@ pub fn snippet(
 // Scalar functions for FTS5
 // ---------------------------------------------------------------------------
 
-fn fallback_query_terms(query: &str) -> Vec<String> {
-    query
-        .split_whitespace()
-        .filter_map(|raw| {
-            let trimmed = raw
-                .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '(' | ')' | ','))
-                .trim_start_matches('^')
-                .trim_end_matches('*')
-                .to_ascii_lowercase();
-            if trimmed.is_empty() || matches!(trimmed.as_str(), "and" | "or" | "not" | "near") {
-                None
-            } else {
-                Some(trimmed)
-            }
-        })
-        .collect()
+fn fallback_highlight_terms(query: &str) -> Vec<Fts5HighlightTerm> {
+    let mut terms = Vec::new();
+    let mut skip_next_leaf = false;
+
+    for raw in query.split_whitespace() {
+        let trimmed = raw
+            .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '(' | ')' | ','))
+            .trim_start_matches('^')
+            .to_ascii_lowercase();
+        let prefix = trimmed.ends_with('*');
+        let term = trimmed.trim_end_matches('*');
+        if term.is_empty() || matches!(term, "and" | "or" | "near") {
+            continue;
+        }
+        if term == "not" {
+            skip_next_leaf = true;
+            continue;
+        }
+        if skip_next_leaf {
+            skip_next_leaf = false;
+            continue;
+        }
+        if prefix {
+            terms.push(Fts5HighlightTerm::prefix(term));
+        } else {
+            terms.push(Fts5HighlightTerm::exact(term));
+        }
+    }
+
+    terms
 }
 
-fn query_terms_from_query_text(query: &str) -> Vec<String> {
+fn fallback_highlight_patterns(query: &str) -> Vec<Fts5HighlightPattern> {
+    highlight_patterns_from_terms(&fallback_highlight_terms(query))
+}
+
+fn highlight_patterns_from_query_text(query: &str) -> Vec<Fts5HighlightPattern> {
     parse_fts5_query(query)
         .and_then(|tokens| build_expr(&tokens))
         .map_or_else(
-            |_| fallback_query_terms(query),
-            |expr| extract_query_terms(&expr),
+            |_| fallback_highlight_patterns(query),
+            |expr| extract_highlight_patterns(&expr),
+        )
+}
+
+#[cfg(test)]
+fn highlight_terms_from_query_text(query: &str) -> Vec<Fts5HighlightTerm> {
+    parse_fts5_query(query)
+        .and_then(|tokens| build_expr(&tokens))
+        .map_or_else(
+            |_| fallback_highlight_terms(query),
+            |expr| extract_highlight_terms(&expr),
         )
 }
 
@@ -2868,11 +7838,11 @@ impl ScalarFunction for Fts5HighlightFunc {
         let query = args[1].to_text();
         let open_tag = args[2].to_text();
         let close_tag = args[3].to_text();
-        let terms = query_terms_from_query_text(&query);
+        let patterns = highlight_patterns_from_query_text(&query);
 
-        Ok(SqliteValue::Text(SmallText::from_string(highlight(
-            &text, &terms, &open_tag, &close_tag,
-        ))))
+        Ok(SqliteValue::Text(SmallText::from_string(
+            highlight_with_patterns(&text, &patterns, &open_tag, &close_tag),
+        )))
     }
 
     fn num_args(&self) -> i32 {
@@ -2900,11 +7870,13 @@ impl ScalarFunction for Fts5SnippetFunc {
         let close_tag = args[3].to_text();
         let ellipsis = args[4].to_text();
         let max_tokens = usize::try_from(args[5].to_integer()).unwrap_or(0);
-        let terms = query_terms_from_query_text(&query);
+        let patterns = highlight_patterns_from_query_text(&query);
 
-        Ok(SqliteValue::Text(SmallText::from_string(snippet(
-            &text, &terms, &open_tag, &close_tag, &ellipsis, max_tokens,
-        ))))
+        Ok(SqliteValue::Text(SmallText::from_string(
+            snippet_with_patterns(
+                &text, &patterns, &open_tag, &close_tag, &ellipsis, max_tokens,
+            ),
+        )))
     }
 
     fn num_args(&self) -> i32 {
@@ -2935,11 +7907,106 @@ impl ScalarFunction for Fts5SourceIdFunc {
     }
 }
 
+/// fts5_insttoken(query) preserves and marks its MATCH argument.
+///
+/// `SqliteValue` does not carry SQLite subtypes yet, so this mirrors SQLite's
+/// value-preserving behavior and leaves subtype-aware planning to the VDBE
+/// boundary.
+pub struct Fts5InsttokenFunc;
+
+impl ScalarFunction for Fts5InsttokenFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        let Some(value) = args.first() else {
+            return Err(FrankenError::function_error(
+                "fts5_insttoken() expects 1 argument",
+            ));
+        };
+        Ok(value.to_owned())
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &'static str {
+        "fts5_insttoken"
+    }
+}
+
+const FTS5_LOCALE_HEADER: [u8; 4] = [0x00, 0xE0, 0xB2, 0xEB];
+
+fn sqlite_text_for_fts5_locale(value: &SqliteValue) -> Option<Cow<'_, str>> {
+    match value {
+        SqliteValue::Null => None,
+        SqliteValue::Text(text) => Some(Cow::Borrowed(text.as_str())),
+        _ => Some(Cow::Owned(value.to_text())),
+    }
+}
+
+fn encode_fts5_locale_blob(locale: &str, text: &str) -> Vec<u8> {
+    let locale_bytes = locale.as_bytes();
+    let text_bytes = text.as_bytes();
+    let mut blob =
+        Vec::with_capacity(FTS5_LOCALE_HEADER.len() + locale_bytes.len() + 1 + text_bytes.len());
+    blob.extend_from_slice(&FTS5_LOCALE_HEADER);
+    blob.extend_from_slice(locale_bytes);
+    blob.push(0);
+    blob.extend_from_slice(text_bytes);
+    blob
+}
+
+fn decode_fts5_locale_blob(blob: &[u8]) -> Option<(&str, &str)> {
+    let body = blob.strip_prefix(&FTS5_LOCALE_HEADER)?;
+    let nul_pos = body.iter().position(|byte| *byte == 0)?;
+    let tag = std::str::from_utf8(body.get(..nul_pos)?).ok()?;
+    if tag.is_empty() {
+        return None;
+    }
+    let text_start = nul_pos.checked_add(1)?;
+    let text = std::str::from_utf8(body.get(text_start..)?).ok()?;
+    Some((tag, text))
+}
+
+/// fts5_locale(locale, text) returns text or a SQLite-compatible locale blob.
+pub struct Fts5LocaleFunc;
+
+impl ScalarFunction for Fts5LocaleFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        let [locale_value, text_value] = args else {
+            return Err(FrankenError::function_error(
+                "fts5_locale() expects 2 arguments",
+            ));
+        };
+
+        let locale = sqlite_text_for_fts5_locale(locale_value);
+        let text = sqlite_text_for_fts5_locale(text_value);
+        let Some(locale) = locale.as_deref().filter(|value| !value.is_empty()) else {
+            return Ok(text.map_or(SqliteValue::Null, |value| {
+                SqliteValue::Text(SmallText::from_string(value.into_owned()))
+            }));
+        };
+
+        Ok(SqliteValue::Blob(
+            encode_fts5_locale_blob(locale, text.as_deref().unwrap_or("")).into(),
+        ))
+    }
+
+    fn num_args(&self) -> i32 {
+        2
+    }
+
+    fn name(&self) -> &'static str {
+        "fts5_locale"
+    }
+}
+
 /// Register FTS5 scalar functions into a `FunctionRegistry`.
 pub fn register_fts5_scalars(registry: &mut fsqlite_func::FunctionRegistry) {
     registry.register_scalar(Fts5HighlightFunc);
     registry.register_scalar(Fts5SnippetFunc);
     registry.register_scalar(Fts5SourceIdFunc);
+    registry.register_scalar(Fts5InsttokenFunc);
+    registry.register_scalar(Fts5LocaleFunc);
     debug!("fts5: registered scalar functions");
 }
 
@@ -2950,6 +8017,559 @@ pub fn register_fts5_scalars(registry: &mut fsqlite_func::FunctionRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5ColumnStructure {
+        name: String,
+        indexed: bool,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5PostingStructure {
+        docid: i64,
+        column: u32,
+        positions: Vec<u32>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5TermStructure {
+        term: String,
+        postings: Vec<Fts5PostingStructure>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5TableStructure {
+        columns: Vec<Fts5ColumnStructure>,
+        rows: Vec<(i64, Vec<String>)>,
+        terms: Vec<Fts5TermStructure>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5ExtensionApiStructure {
+        tokenizers: Vec<String>,
+        auxiliaries: Vec<String>,
+        document_tokens: Vec<Fts5Token>,
+        query_tokens: Vec<Fts5Token>,
+        prefix_tokens: Vec<Fts5Token>,
+        aux_value: SqliteValue,
+        missing_aux_error: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5ColumnFilterSetStructure {
+        tokens: Vec<(Fts5QueryTokenKind, String)>,
+        braced_matches: Vec<i64>,
+        negative_matches: Vec<i64>,
+        complement_matches: Vec<i64>,
+        invalid_error: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5NearPhraseStructure {
+        operands: Vec<Fts5NearOperand>,
+        distance: u32,
+        phrase_matches: Vec<i64>,
+        prefix_matches: Vec<i64>,
+        query_terms: Vec<String>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5NearDistanceStructure {
+        adjacent_terms: Vec<i64>,
+        one_gap_terms: Vec<i64>,
+        adjacent_phrases: Vec<i64>,
+        one_gap_phrases: Vec<i64>,
+        reordered_doc_example: Vec<i64>,
+        multi_phrase_doc_example: Vec<i64>,
+        too_tight_doc_example: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5PhraseConcatStructure {
+        tokens: Vec<(Fts5QueryTokenKind, String)>,
+        exact_expr: Fts5Expr,
+        prefix_expr: Fts5Expr,
+        exact_matches: Vec<i64>,
+        prefix_matches: Vec<i64>,
+        malformed_error: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5TightPhraseConcatStructure {
+        tokens: Vec<(Fts5QueryTokenKind, String)>,
+        expr: Fts5Expr,
+        adjacent_matches: Vec<i64>,
+        separated_matches: Vec<i64>,
+        column_filtered_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5InsttokenStructure {
+        config: Fts5Config,
+        columns: Vec<String>,
+        rows: Vec<(i64, Vec<String>)>,
+        terms: Vec<String>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5LocaleStructure {
+        config: Fts5Config,
+        columns: Vec<String>,
+        rows: Vec<(i64, Vec<String>)>,
+        terms: Vec<String>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5LocaleBlobStorageStructure {
+        config: Fts5Config,
+        indexed_columns: Vec<bool>,
+        rows: Vec<(i64, Vec<String>)>,
+        locales: Vec<(i64, usize, String)>,
+        matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5LocaleUnindexedDiscardStructure {
+        indexed_columns: Vec<bool>,
+        rows: Vec<(i64, Vec<String>)>,
+        locales: Vec<(i64, usize, String)>,
+        indexed_matches: Vec<i64>,
+        unindexed_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5TokendataStructure {
+        config: Fts5Config,
+        terms: Vec<String>,
+        rows: Vec<(i64, Vec<String>)>,
+        matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5ConfigMetadataStructure {
+        rows: Vec<(String, String)>,
+        decoded: Fts5ConfigMetadata,
+        runtime: Fts5Config,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5DataRowsStructure {
+        data_blocks: Vec<(i64, Vec<u8>)>,
+        averages: Fts5AveragesRecord,
+        structure: Fts5StructureRecord,
+        prefix_lengths: Vec<usize>,
+        prefix_terms_len2: Vec<String>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5SegmentCodecStructure {
+        idx_row: Fts5IdxRow,
+        idx_pgno: i64,
+        data_rowids: Vec<(i64, Fts5DataRowid)>,
+        leaf: Fts5SegmentLeaf,
+        leaf_bytes: Vec<u8>,
+        dlidx: Fts5DlidxPage,
+        tombstone: Fts5TombstonePage,
+        tombstone_hits: Vec<(u64, bool)>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5PendingFlushStructure {
+        term_count: usize,
+        pending_bytes: usize,
+        should_flush: bool,
+        data_rowids: Vec<(i64, Fts5DataRowid)>,
+        terms: Vec<Vec<u8>>,
+        structure: Fts5StructureRecord,
+        merge_plan: Option<Fts5MergePlan>,
+        optimize_plan: Option<Fts5MergePlan>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5ShadowWriteHotspotProfileStructure {
+        flush_profile: Fts5ShadowWriteHotspotProfile,
+        idx_profile: Fts5ShadowWriteHotspotProfile,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5SegmentReaderStructure {
+        cursor_terms: Vec<Vec<u8>>,
+        exact_brown_rowids: Vec<u64>,
+        prefix_ru_terms: Vec<Vec<u8>>,
+        union_brown_fox: Vec<u64>,
+        phrase_brown_fox: Vec<u64>,
+        near_brown_fox: Vec<u64>,
+        integrity: Fts5SegmentIntegrityReport,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5ShadowRowsStructure {
+        data: Vec<(i64, Vec<u8>)>,
+        idx: Vec<Fts5IdxRow>,
+        config: Vec<(String, String)>,
+        content: Vec<Fts5ContentRow>,
+        docsize: Vec<Fts5DocsizeRow>,
+        matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5ShadowOpenStructure {
+        report: Fts5ShadowOpenReport,
+        table_empty: bool,
+        next_rowid: i64,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5ShadowQueryStructure {
+        exact_matches: Vec<i64>,
+        prefix_matches: Vec<i64>,
+        phrase_matches: Vec<i64>,
+        near_matches: Vec<i64>,
+        initial_matches: Vec<i64>,
+        column_filtered_matches: Vec<i64>,
+        boolean_or_matches: Vec<i64>,
+        boolean_not_matches: Vec<i64>,
+        cursor_body_value: Option<SqliteValue>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5HighlightPrefixStructure {
+        parsed_terms: Vec<Fts5HighlightTerm>,
+        prefix_highlight: String,
+        phrase_prefix_snippet: String,
+        fallback_prefix_highlight: String,
+        exact_highlight: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5PhraseSpanStructure {
+        phrase_patterns: Vec<Fts5HighlightPattern>,
+        rendered_phrase: String,
+        rendered_prefix_snippet: String,
+        negated_rhs_rendering: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5SnippetWindowStructure {
+        scored_window: Fts5SnippetWindow,
+        rendered_snippet: String,
+        no_match_window: Fts5SnippetWindow,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5TransactionRollbackStructure {
+        savepoint_rows: Vec<(i64, Vec<String>)>,
+        savepoint_matches: Vec<i64>,
+        full_rows: Vec<(i64, Vec<String>)>,
+        full_matches: Vec<i64>,
+        full_locales: Vec<(i64, usize, String)>,
+        reused_auto_rowid: Option<i64>,
+        rows_after_auto: Vec<(i64, Vec<String>)>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5UpdateFailureCleanupStructure {
+        error: String,
+        rows_after_error: Vec<(i64, Vec<String>)>,
+        old_matches: Vec<i64>,
+        replacement_matches: Vec<i64>,
+        locales_after_error: Vec<(i64, usize, String)>,
+        committed_rows: Vec<(i64, Vec<String>)>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5ContentlessUpdateStructure {
+        reject_error: String,
+        rows_after_reject: Vec<(i64, Vec<String>)>,
+        matches_after_reject: Vec<i64>,
+        updated_rows: Vec<(i64, Vec<String>)>,
+        updated_old_matches: Vec<i64>,
+        updated_new_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5PostingPruneStructure {
+        terms_before: Vec<String>,
+        terms_after: Vec<String>,
+        prefix_terms_before: Vec<String>,
+        prefix_terms_after: Vec<String>,
+        remaining_docs_for_alpha: Vec<i64>,
+        remaining_docs_for_world: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5NotTermStructure {
+        query_terms: Vec<String>,
+        highlight_terms: Vec<Fts5HighlightTerm>,
+        search_matches: Vec<i64>,
+        positive_highlight: String,
+        fallback_highlight_terms: Vec<Fts5HighlightTerm>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5TrigramCaseSensitiveStructure {
+        tokenizer: String,
+        terms: Vec<String>,
+        rows: Vec<(i64, Vec<String>)>,
+        upper_matches: Vec<i64>,
+        lower_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5TrigramStreamingStructure {
+        tokens: Vec<(String, usize, usize)>,
+        short_input_tokens: usize,
+        accented_matches: Vec<i64>,
+        ascii_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5AsciiTokenizerStructure {
+        tokens: Vec<(String, usize, usize)>,
+        terms: Vec<String>,
+        upper_matches: Vec<i64>,
+        lower_matches: Vec<i64>,
+        numeric_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5TrigramCaseFoldStructure {
+        insensitive_tokens: Vec<(String, usize, usize)>,
+        sensitive_terms: Vec<String>,
+        diacritic_terms: Vec<String>,
+        upper_matches: Vec<i64>,
+        lower_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5PorterYVowelStructure {
+        stems: Vec<(String, String)>,
+        vowel_checks: Vec<(String, bool)>,
+        measures: Vec<(String, u32)>,
+        cry_matches: Vec<i64>,
+        fly_matches: Vec<i64>,
+        sky_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5ContentlessUnindexedStructure {
+        config: Fts5Config,
+        indexed_columns: Vec<bool>,
+        rows: Vec<(i64, Vec<String>)>,
+        indexed_matches: Vec<i64>,
+        unindexed_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5Unicode61DiacriticsStructure {
+        tokenizer: String,
+        terms: Vec<String>,
+        rows: Vec<(i64, Vec<String>)>,
+        ascii_matches: Vec<i64>,
+        accent_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5Unicode61OptionValidationStructure {
+        accepted_terms: Vec<String>,
+        rejected_specs: Vec<String>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5Unicode61CharClassStructure {
+        tokens: Vec<(String, usize, usize)>,
+        terms: Vec<String>,
+        section_matches: Vec<i64>,
+        alpha_matches: Vec<i64>,
+        cafe_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5QuotedOptionStructure {
+        unquoted: Vec<(String, String)>,
+        tokenizer: String,
+        prefix_lengths: Vec<usize>,
+        terms: Vec<String>,
+        cafe_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5DetailOptionStructure {
+        parsed: Vec<(String, Option<DetailMode>)>,
+        config_detail: DetailMode,
+        index_detail: DetailMode,
+        matches: Vec<i64>,
+        phrase_error: String,
+    }
+
+    struct TokendataTestTokenizer;
+
+    impl Fts5Tokenizer for TokendataTestTokenizer {
+        fn name(&self) -> &'static str {
+            "tokendata_test"
+        }
+
+        fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+            let mut token_with_data = String::new();
+            for token in text.split_whitespace() {
+                token_with_data.clear();
+                token_with_data.push_str(token);
+                token_with_data.push('\0');
+                token_with_data.push_str("payload");
+                sink(token_with_data.as_str(), 0, token.len(), false);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct SynonymTestTokenizer {
+        suffix: String,
+    }
+
+    impl Fts5Tokenizer for SynonymTestTokenizer {
+        fn name(&self) -> &'static str {
+            "synonym_test"
+        }
+
+        fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+            let mut synonym = String::new();
+            for token in text.split_whitespace() {
+                let start = text.find(token).unwrap_or(0);
+                let end = start + token.len();
+                let normalized = token.to_ascii_lowercase();
+                sink(normalized.as_str(), start, end, false);
+                synonym.clear();
+                synonym.push_str(&normalized);
+                synonym.push_str(&self.suffix);
+                sink(synonym.as_str(), start, end, true);
+            }
+        }
+    }
+
+    fn near_term(term: &str) -> Fts5NearOperand {
+        Fts5NearOperand::Term(term.to_owned())
+    }
+
+    fn near_phrase(terms: &[&str]) -> Fts5NearOperand {
+        Fts5NearOperand::Phrase(terms.iter().map(ToString::to_string).collect())
+    }
+
+    fn near_prefix(prefix: &str) -> Fts5NearOperand {
+        Fts5NearOperand::Prefix(prefix.to_owned())
+    }
+
+    fn search_rowids(table: &Fts5Table, query: &str) -> std::result::Result<Vec<i64>, String> {
+        Ok(table
+            .search(query)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect())
+    }
+
+    fn table_structure(table: &Fts5Table) -> Fts5TableStructure {
+        let columns = table
+            .columns
+            .iter()
+            .zip(&table.indexed_columns)
+            .map(|(name, indexed)| Fts5ColumnStructure {
+                name: name.clone(),
+                indexed: *indexed,
+            })
+            .collect();
+        let mut terms: Vec<Fts5TermStructure> = table
+            .index
+            .index
+            .iter()
+            .map(|(term, postings)| Fts5TermStructure {
+                term: term.as_str().to_owned(),
+                postings: postings
+                    .iter()
+                    .map(|posting| Fts5PostingStructure {
+                        docid: posting.docid,
+                        column: posting.column,
+                        positions: posting.positions.iter().copied().collect(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        terms.sort_by(|left, right| left.term.cmp(&right.term));
+
+        Fts5TableStructure {
+            columns,
+            rows: table.all_rows(),
+            terms,
+        }
+    }
+
+    fn sorted_small_text_terms<'a>(terms: impl Iterator<Item = &'a SmallText>) -> Vec<String> {
+        let mut terms: Vec<String> = terms.map(|term| term.as_str().to_owned()).collect();
+        terms.sort();
+        terms
+    }
+
+    fn indexed_terms(index: &InvertedIndex) -> Vec<String> {
+        sorted_small_text_terms(index.index.keys())
+    }
+
+    fn indexed_prefix_terms(index: &InvertedIndex, prefix_length: usize) -> Vec<String> {
+        index
+            .prefix_indexes
+            .get(&prefix_length)
+            .map_or_else(Vec::new, |prefix_index| {
+                sorted_small_text_terms(prefix_index.keys())
+            })
+    }
+
+    fn posting_docids(postings: &[Posting]) -> Vec<i64> {
+        let mut docids: Vec<i64> = postings.iter().map(|posting| posting.docid).collect();
+        docids.sort_unstable();
+        docids.dedup();
+        docids
+    }
 
     #[test]
     fn test_extension_name_matches_crate_suffix() {
@@ -2988,6 +8608,1910 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_config_rows_default_stock_shape() {
+        let rows = Fts5Config::default().encode_config_rows();
+        assert_eq!(rows, vec![Fts5ConfigRecord::integer("version", 4)]);
+    }
+
+    #[test]
+    fn test_fts5_config_rows_persist_runtime_toggles() {
+        let mut config = Fts5Config::default();
+        assert!(config.apply_control_command("secure-delete=1"));
+        assert!(config.apply_control_command("insttoken=1"));
+
+        assert_eq!(
+            config.encode_config_rows(),
+            vec![
+                Fts5ConfigRecord::integer("insttoken", 1),
+                Fts5ConfigRecord::integer("secure-delete", 1),
+                Fts5ConfigRecord::integer("version", 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fts5_config_metadata_decodes_stock_rows() {
+        let rows = vec![
+            Fts5ConfigRecord::integer("version", 5),
+            Fts5ConfigRecord::integer("pgsz", 64),
+            Fts5ConfigRecord::integer("hashsize", 2048),
+            Fts5ConfigRecord::integer("automerge", 8),
+            Fts5ConfigRecord::integer("usermerge", 16),
+            Fts5ConfigRecord::integer("crisismerge", 5000),
+            Fts5ConfigRecord::integer("deletemerge", 101),
+            Fts5ConfigRecord::text("rank", "bm25(10.0)"),
+            Fts5ConfigRecord::integer("secure-delete", 2),
+            Fts5ConfigRecord::integer("insttoken", 1),
+            Fts5ConfigRecord::integer("unknown", 99),
+        ];
+
+        let metadata = Fts5ConfigMetadata::decode_rows(&rows).unwrap();
+        assert_eq!(metadata.format_version, 5);
+        assert_eq!(metadata.page_size, 64);
+        assert_eq!(metadata.hash_size, 2048);
+        assert_eq!(metadata.automerge, 8);
+        assert_eq!(metadata.usermerge, 16);
+        assert_eq!(metadata.crisismerge, 1999);
+        assert_eq!(metadata.delete_merge, 0);
+        assert_eq!(metadata.rank.as_deref(), Some("bm25(10.0)"));
+        assert!(metadata.secure_delete);
+        assert!(metadata.insttoken);
+    }
+
+    #[test]
+    fn test_fts5_config_metadata_rejects_missing_or_unknown_version() {
+        let missing = Fts5ConfigMetadata::decode_rows(&[Fts5ConfigRecord::integer("pgsz", 64)])
+            .expect_err("version row is required");
+        assert!(missing.to_string().contains("missing version"));
+
+        let unknown = Fts5ConfigMetadata::decode_rows(&[Fts5ConfigRecord::integer("version", 6)])
+            .expect_err("unknown version should fail");
+        assert!(
+            unknown
+                .to_string()
+                .contains("invalid fts5 file format (found 6")
+        );
+    }
+
+    #[test]
+    fn test_fts5_table_config_row_round_trip() {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        let metadata = table
+            .apply_config_rows(&[
+                Fts5ConfigRecord::integer("secure-delete", 1),
+                Fts5ConfigRecord::integer("insttoken", 1),
+                Fts5ConfigRecord::integer("version", 5),
+            ])
+            .unwrap();
+
+        assert_eq!(metadata.format_version, 5);
+        assert!(table.config().secure_delete_enabled());
+        assert!(table.config().insttoken_enabled());
+        assert_eq!(
+            table.encode_config_rows(),
+            vec![
+                Fts5ConfigRecord::integer("insttoken", 1),
+                Fts5ConfigRecord::integer("secure-delete", 1),
+                Fts5ConfigRecord::integer("version", 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_config_metadata_codec() {
+        let rows = vec![
+            Fts5ConfigRecord::integer("automerge", 1),
+            Fts5ConfigRecord::integer("crisismerge", 0),
+            Fts5ConfigRecord::integer("deletemerge", -1),
+            Fts5ConfigRecord::integer("hashsize", 4096),
+            Fts5ConfigRecord::integer("insttoken", 1),
+            Fts5ConfigRecord::integer("pgsz", 128),
+            Fts5ConfigRecord::text("rank", "bm25(3.0, 1.0)"),
+            Fts5ConfigRecord::integer("secure-delete", 1),
+            Fts5ConfigRecord::integer("usermerge", 8),
+            Fts5ConfigRecord::integer("version", 5),
+        ];
+        let decoded = Fts5ConfigMetadata::decode_rows(&rows).unwrap();
+        let mut runtime = Fts5Config::default();
+        decoded.apply_to_runtime_config(&mut runtime);
+        let snapshot = Fts5ConfigMetadataStructure {
+            rows: decoded
+                .encode_rows()
+                .into_iter()
+                .map(|record| (record.key, record.value.to_text()))
+                .collect(),
+            decoded,
+            runtime,
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5ConfigMetadataStructure {
+    rows: [
+        (
+            "hashsize",
+            "4096",
+        ),
+        (
+            "insttoken",
+            "1",
+        ),
+        (
+            "pgsz",
+            "128",
+        ),
+        (
+            "rank",
+            "bm25(3.0, 1.0)",
+        ),
+        (
+            "secure-delete",
+            "1",
+        ),
+        (
+            "usermerge",
+            "8",
+        ),
+        (
+            "version",
+            "5",
+        ),
+    ],
+    decoded: Fts5ConfigMetadata {
+        format_version: 5,
+        page_size: 128,
+        automerge: 4,
+        usermerge: 8,
+        crisismerge: 16,
+        hash_size: 4096,
+        delete_merge: 10,
+        rank: Some(
+            "bm25(3.0, 1.0)",
+        ),
+        secure_delete: true,
+        insttoken: true,
+    },
+    runtime: Fts5Config {
+        secure_delete: true,
+        content_mode: Stored,
+        contentless_delete: false,
+        contentless_unindexed: false,
+        columnsize: true,
+        detail: Full,
+        insttoken: true,
+        locale: false,
+        tokendata: false,
+    },
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_data_averages_record_round_trip() {
+        let averages = Fts5AveragesRecord::new(2, vec![4, 5]);
+        let block = averages.encode();
+        assert_eq!(block, vec![2, 4, 5]);
+        assert_eq!(Fts5AveragesRecord::decode(&block, 2).unwrap(), averages);
+
+        let empty = Fts5AveragesRecord::new(0, vec![0, 0]);
+        assert!(empty.encode().is_empty());
+        assert_eq!(Fts5AveragesRecord::decode(&[], 2).unwrap(), empty);
+    }
+
+    #[test]
+    fn test_fts5_data_structure_record_round_trip_legacy_and_v2() {
+        let legacy = Fts5StructureRecord {
+            cookie: 0x0102_0304,
+            write_counter: 300,
+            origin_counter: 0,
+            levels: vec![
+                Fts5StructureLevel::new(0, vec![Fts5StructureSegment::new(7, 1, 3)]),
+                Fts5StructureLevel::new(0, Vec::new()),
+            ],
+        };
+        let legacy_block = legacy.encode();
+        assert_eq!(
+            legacy_block,
+            vec![1, 2, 3, 4, 2, 1, 0x82, 0x2C, 0, 1, 7, 1, 3, 0, 0]
+        );
+        assert_eq!(Fts5StructureRecord::decode(&legacy_block).unwrap(), legacy);
+
+        let v2 = Fts5StructureRecord {
+            cookie: 9,
+            write_counter: 512,
+            origin_counter: 43,
+            levels: vec![Fts5StructureLevel::new(
+                0,
+                vec![Fts5StructureSegment::new(11, 1, 8).with_origin_tracking(40, 42, 2, 3, 99)],
+            )],
+        };
+        let v2_block = v2.encode();
+        assert_eq!(&v2_block[4..8], &FTS5_STRUCTURE_V2_MARKER);
+        assert_eq!(Fts5StructureRecord::decode(&v2_block).unwrap(), v2);
+    }
+
+    #[test]
+    fn test_fts5_data_records_reject_malformed_input() {
+        let truncated_average = Fts5AveragesRecord::decode(&[1, 2, 0x80], 2)
+            .expect_err("truncated averages varint should fail");
+        assert!(truncated_average.to_string().contains("truncated"));
+
+        let trailing_average = Fts5AveragesRecord::decode(&[1, 2, 3], 1)
+            .expect_err("extra averages varint should fail");
+        assert!(trailing_average.to_string().contains("trailing"));
+
+        let truncated_structure = Fts5StructureRecord::decode(&[0, 0, 0, 0, 0x80])
+            .expect_err("truncated structure varint should fail");
+        assert!(truncated_structure.to_string().contains("truncated"));
+
+        let bad_segment_count = [0, 0, 0, 0, 1, 0, 0, 0, 1, 7, 1, 3];
+        let count_error = Fts5StructureRecord::decode(&bad_segment_count)
+            .expect_err("segment total underflow should fail");
+        assert!(count_error.to_string().contains("segment count"));
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_data_rows_codec() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "body", "prefix='2 3'"],
+        )
+        .unwrap();
+        table.insert_document(
+            11,
+            &["rust index".to_owned(), "shadow table rows".to_owned()],
+        );
+
+        let data = table.encode_data_rows();
+        let metadata = table.decode_data_rows(&data).unwrap();
+        let snapshot = Fts5DataRowsStructure {
+            data_blocks: data.iter().map(|row| (row.id, row.block.clone())).collect(),
+            averages: metadata.averages.unwrap(),
+            structure: metadata.structure.unwrap(),
+            prefix_lengths: table.prefix_lengths.clone(),
+            prefix_terms_len2: indexed_prefix_terms(&table.index, 2),
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5DataRowsStructure {
+    data_blocks: [
+        (
+            1,
+            [
+                1,
+                2,
+                3,
+            ],
+        ),
+        (
+            10,
+            [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+    ],
+    averages: Fts5AveragesRecord {
+        total_rows: 1,
+        column_token_totals: [
+            2,
+            3,
+        ],
+    },
+    structure: Fts5StructureRecord {
+        cookie: 0,
+        write_counter: 0,
+        origin_counter: 0,
+        levels: [],
+    },
+    prefix_lengths: [
+        2,
+        3,
+    ],
+    prefix_terms_len2: [
+        "in",
+        "ro",
+        "ru",
+        "sh",
+        "ta",
+    ],
+}"#
+        );
+    }
+
+    fn sample_segment_leaf() -> Fts5SegmentLeaf {
+        let mut leaf = Fts5SegmentLeaf::new(vec![
+            Fts5SegmentTerm::new(
+                b"rust".to_vec(),
+                Fts5Doclist::new(vec![
+                    Fts5DoclistEntry::new(
+                        7,
+                        Fts5Poslist::new(
+                            false,
+                            vec![
+                                Fts5ColumnPositions::new(0, vec![1, 4]),
+                                Fts5ColumnPositions::new(2, vec![9]),
+                            ],
+                        ),
+                    ),
+                    Fts5DoclistEntry::new(
+                        12,
+                        Fts5Poslist::new(true, vec![Fts5ColumnPositions::new(0, vec![2])]),
+                    ),
+                ]),
+            ),
+            Fts5SegmentTerm::new(
+                b"rusty".to_vec(),
+                Fts5Doclist::new(vec![Fts5DoclistEntry::new(
+                    20,
+                    Fts5Poslist::new(false, vec![Fts5ColumnPositions::new(1, vec![0])]),
+                )]),
+            ),
+        ]);
+        leaf.first_rowid_offset = 9;
+        leaf
+    }
+
+    fn sample_lazy_segment_rows() -> (Fts5StructureRecord, Vec<Fts5DataRow>, Vec<Fts5IdxRow>) {
+        let first_leaf = Fts5SegmentLeaf::new(vec![
+            Fts5SegmentTerm::new(
+                b"brown".to_vec(),
+                Fts5Doclist::new(vec![
+                    Fts5DoclistEntry::new(
+                        1,
+                        Fts5Poslist::new(false, vec![Fts5ColumnPositions::new(0, vec![1])]),
+                    ),
+                    Fts5DoclistEntry::new(
+                        4,
+                        Fts5Poslist::new(false, vec![Fts5ColumnPositions::new(0, vec![3])]),
+                    ),
+                ]),
+            ),
+            Fts5SegmentTerm::new(
+                b"fox".to_vec(),
+                Fts5Doclist::new(vec![
+                    Fts5DoclistEntry::new(
+                        1,
+                        Fts5Poslist::new(false, vec![Fts5ColumnPositions::new(0, vec![2])]),
+                    ),
+                    Fts5DoclistEntry::new(
+                        3,
+                        Fts5Poslist::new(false, vec![Fts5ColumnPositions::new(0, vec![0])]),
+                    ),
+                ]),
+            ),
+        ]);
+        let second_leaf = Fts5SegmentLeaf::new(vec![
+            Fts5SegmentTerm::new(
+                b"rust".to_vec(),
+                Fts5Doclist::new(vec![Fts5DoclistEntry::new(
+                    7,
+                    Fts5Poslist::new(false, vec![Fts5ColumnPositions::new(0, vec![1, 4])]),
+                )]),
+            ),
+            Fts5SegmentTerm::new(
+                b"rusty".to_vec(),
+                Fts5Doclist::new(vec![Fts5DoclistEntry::new(
+                    20,
+                    Fts5Poslist::new(false, vec![Fts5ColumnPositions::new(1, vec![0])]),
+                )]),
+            ),
+        ]);
+        let structure = Fts5StructureRecord {
+            cookie: 0,
+            write_counter: 2,
+            origin_counter: 0,
+            levels: vec![Fts5StructureLevel::new(
+                0,
+                vec![Fts5StructureSegment::new(5, 1, 2)],
+            )],
+        };
+        let data_rows = vec![
+            first_leaf.to_data_row(5, 1).unwrap(),
+            second_leaf.to_data_row(5, 2).unwrap(),
+        ];
+        let idx_rows = vec![Fts5IdxRow::new(5, b"rust".to_vec(), 2, false)];
+        (structure, data_rows, idx_rows)
+    }
+
+    fn sample_shadow_query_rows(base: &Fts5Table) -> Fts5ShadowRows {
+        let (structure, mut data_rows, idx_rows) = sample_lazy_segment_rows();
+        let docsize = vec![
+            Fts5DocsizeRow::new(1, vec![2, 1]),
+            Fts5DocsizeRow::new(3, vec![1, 1]),
+            Fts5DocsizeRow::new(4, vec![4, 1]),
+            Fts5DocsizeRow::new(7, vec![3, 1]),
+            Fts5DocsizeRow::new(20, vec![1, 1]),
+        ];
+        data_rows.insert(
+            0,
+            Fts5DataRow::new(
+                FTS5_AVERAGES_ROWID,
+                Fts5AveragesRecord::from_docsize_rows(5, base.columns().len(), &docsize).encode(),
+            ),
+        );
+        data_rows.insert(
+            1,
+            Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()),
+        );
+        Fts5ShadowRows {
+            data: data_rows,
+            idx: idx_rows,
+            config: base.encode_config_rows(),
+            content: vec![
+                Fts5ContentRow::new(1, vec!["quick brown".to_owned(), "fox".to_owned()]),
+                Fts5ContentRow::new(3, vec!["fox".to_owned(), "sly".to_owned()]),
+                Fts5ContentRow::new(4, vec!["slow brown bear".to_owned(), "plain".to_owned()]),
+                Fts5ContentRow::new(7, vec!["rust engine rust".to_owned(), "plain".to_owned()]),
+                Fts5ContentRow::new(20, vec!["plain".to_owned(), "rusty".to_owned()]),
+            ],
+            docsize,
+        }
+    }
+
+    #[test]
+    fn test_fts5_idx_and_data_rowid_codecs_round_trip() {
+        let idx = Fts5IdxRow::new(7, b"rusty".to_vec(), 3, true);
+        assert_eq!(idx.encoded_pgno().unwrap(), 7);
+        assert_eq!(
+            Fts5IdxRow::from_encoded_pgno(7, b"rusty".to_vec(), 7).unwrap(),
+            idx
+        );
+
+        let rowids = [
+            Fts5DataRowid::SegmentLeaf { segid: 7, pgno: 3 },
+            Fts5DataRowid::DoclistIndex {
+                segid: 7,
+                height: 2,
+                pgno: 3,
+            },
+            Fts5DataRowid::Tombstone {
+                segid: 7,
+                hash_pgno: 1,
+            },
+        ];
+        for rowid in rowids {
+            let encoded = rowid.encode().unwrap();
+            assert_eq!(Fts5DataRowid::decode(encoded).unwrap(), rowid);
+        }
+    }
+
+    #[test]
+    fn test_fts5_segment_leaf_dlidx_and_tombstone_round_trip() {
+        let leaf = sample_segment_leaf();
+        let encoded_leaf = leaf.encode().unwrap();
+        assert_eq!(
+            encoded_leaf,
+            vec![
+                0, 9, 0, 27, 4, 114, 117, 115, 116, 7, 10, 3, 5, 1, 2, 11, 5, 3, 4, 4, 1, 121, 20,
+                6, 1, 1, 2, 4, 15,
+            ]
+        );
+        assert_eq!(Fts5SegmentLeaf::decode(&encoded_leaf).unwrap(), leaf);
+
+        let dlidx = Fts5DlidxPage::new(0, 3, 7, vec![Some(5), None, Some(9)]);
+        assert!(dlidx.is_root());
+        assert_eq!(dlidx.encode(), vec![0, 3, 7, 5, 0, 9]);
+        assert_eq!(Fts5DlidxPage::decode(&dlidx.encode()).unwrap(), dlidx);
+
+        let tombstone = Fts5TombstonePage::new(4, true, vec![None, Some(9), None, Some(15)]);
+        assert_eq!(
+            tombstone.encode().unwrap(),
+            vec![
+                4, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 15,
+            ]
+        );
+        let decoded_tombstone = Fts5TombstonePage::decode(&tombstone.encode().unwrap()).unwrap();
+        assert_eq!(decoded_tombstone, tombstone);
+        assert!(decoded_tombstone.contains_rowid(1, 0));
+        assert!(decoded_tombstone.contains_rowid(1, 9));
+        assert!(decoded_tombstone.contains_rowid(1, 15));
+        assert!(!decoded_tombstone.contains_rowid(1, 8));
+    }
+
+    #[test]
+    fn test_fts5_segment_codecs_reject_malformed_payloads() {
+        let unsorted_doclist = Fts5Doclist::new(vec![
+            Fts5DoclistEntry::new(9, Fts5Poslist::new(false, Vec::new())),
+            Fts5DoclistEntry::new(7, Fts5Poslist::new(false, Vec::new())),
+        ]);
+        assert!(
+            unsorted_doclist
+                .encode()
+                .expect_err("doclist rowids must be ordered")
+                .to_string()
+                .contains("strictly increasing")
+        );
+
+        let mut bad_leaf = sample_segment_leaf().encode().unwrap();
+        bad_leaf[2] = 0;
+        bad_leaf[3] = 3;
+        assert!(
+            Fts5SegmentLeaf::decode(&bad_leaf)
+                .expect_err("footer before header should fail")
+                .to_string()
+                .contains("footer offset")
+        );
+
+        let bad_tombstone_count = vec![4, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 5];
+        assert!(
+            Fts5TombstonePage::decode(&bad_tombstone_count)
+                .expect_err("declared tombstone count must match slots")
+                .to_string()
+                .contains("entry count")
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_segment_codecs() {
+        let idx_row = Fts5IdxRow::new(7, b"rusty".to_vec(), 3, true);
+        let leaf = Fts5SegmentLeaf::decode(&sample_segment_leaf().encode().unwrap()).unwrap();
+        let dlidx = Fts5DlidxPage::decode(
+            &Fts5DlidxPage::new(0, 3, 7, vec![Some(5), None, Some(9)]).encode(),
+        )
+        .unwrap();
+        let tombstone = Fts5TombstonePage::decode(
+            &Fts5TombstonePage::new(4, true, vec![None, Some(9), None, Some(15)])
+                .encode()
+                .unwrap(),
+        )
+        .unwrap();
+        let data_rowids = vec![
+            Fts5DataRowid::SegmentLeaf { segid: 7, pgno: 3 },
+            Fts5DataRowid::DoclistIndex {
+                segid: 7,
+                height: 2,
+                pgno: 3,
+            },
+            Fts5DataRowid::Tombstone {
+                segid: 7,
+                hash_pgno: 1,
+            },
+        ]
+        .into_iter()
+        .map(|rowid| (rowid.encode().unwrap(), rowid))
+        .collect();
+
+        let snapshot = Fts5SegmentCodecStructure {
+            idx_pgno: idx_row.encoded_pgno().unwrap(),
+            idx_row,
+            data_rowids,
+            leaf_bytes: leaf.encode().unwrap(),
+            leaf,
+            dlidx,
+            tombstone_hits: vec![
+                (0, tombstone.contains_rowid(1, 0)),
+                (8, tombstone.contains_rowid(1, 8)),
+                (9, tombstone.contains_rowid(1, 9)),
+                (15, tombstone.contains_rowid(1, 15)),
+            ],
+            tombstone,
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5SegmentCodecStructure {
+    idx_row: Fts5IdxRow {
+        segid: 7,
+        term: [
+            114,
+            117,
+            115,
+            116,
+            121,
+        ],
+        btree_page: 3,
+        has_doclist_index: true,
+    },
+    idx_pgno: 7,
+    data_rowids: [
+        (
+            962072674307,
+            SegmentLeaf {
+                segid: 7,
+                pgno: 3,
+            },
+        ),
+        (
+            1035087118339,
+            DoclistIndex {
+                segid: 7,
+                height: 2,
+                pgno: 3,
+            },
+        ),
+        (
+            9008161327415297,
+            Tombstone {
+                segid: 7,
+                hash_pgno: 1,
+            },
+        ),
+    ],
+    leaf: Fts5SegmentLeaf {
+        first_rowid_offset: 9,
+        terms: [
+            Fts5SegmentTerm {
+                term: [
+                    114,
+                    117,
+                    115,
+                    116,
+                ],
+                doclist: Fts5Doclist {
+                    entries: [
+                        Fts5DoclistEntry {
+                            rowid: 7,
+                            poslist: Fts5Poslist {
+                                delete: false,
+                                columns: [
+                                    Fts5ColumnPositions {
+                                        column: 0,
+                                        offsets: [
+                                            1,
+                                            4,
+                                        ],
+                                    },
+                                    Fts5ColumnPositions {
+                                        column: 2,
+                                        offsets: [
+                                            9,
+                                        ],
+                                    },
+                                ],
+                            },
+                        },
+                        Fts5DoclistEntry {
+                            rowid: 12,
+                            poslist: Fts5Poslist {
+                                delete: true,
+                                columns: [
+                                    Fts5ColumnPositions {
+                                        column: 0,
+                                        offsets: [
+                                            2,
+                                        ],
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                },
+            },
+            Fts5SegmentTerm {
+                term: [
+                    114,
+                    117,
+                    115,
+                    116,
+                    121,
+                ],
+                doclist: Fts5Doclist {
+                    entries: [
+                        Fts5DoclistEntry {
+                            rowid: 20,
+                            poslist: Fts5Poslist {
+                                delete: false,
+                                columns: [
+                                    Fts5ColumnPositions {
+                                        column: 1,
+                                        offsets: [
+                                            0,
+                                        ],
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                },
+            },
+        ],
+    },
+    leaf_bytes: [
+        0,
+        9,
+        0,
+        27,
+        4,
+        114,
+        117,
+        115,
+        116,
+        7,
+        10,
+        3,
+        5,
+        1,
+        2,
+        11,
+        5,
+        3,
+        4,
+        4,
+        1,
+        121,
+        20,
+        6,
+        1,
+        1,
+        2,
+        4,
+        15,
+    ],
+    dlidx: Fts5DlidxPage {
+        flags: 0,
+        leaf_pgno: 3,
+        first_rowid: 7,
+        rowid_deltas: [
+            Some(
+                5,
+            ),
+            None,
+            Some(
+                9,
+            ),
+        ],
+    },
+    tombstone: Fts5TombstonePage {
+        key_size: 4,
+        rowid_zero: true,
+        slots: [
+            None,
+            Some(
+                9,
+            ),
+            None,
+            Some(
+                15,
+            ),
+        ],
+    },
+    tombstone_hits: [
+        (
+            0,
+            true,
+        ),
+        (
+            8,
+            false,
+        ),
+        (
+            9,
+            true,
+        ),
+        (
+            15,
+            true,
+        ),
+    ],
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_pending_hash_flush_creates_segment_and_structure_rows() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "body", "prefix='2'"],
+        )
+        .unwrap();
+        table.insert_document(7, &["rust fts".to_owned(), "rusty rust".to_owned()]);
+
+        let pending = table.build_pending_hash().unwrap();
+        assert_eq!(pending.row_count(), 1);
+        assert_eq!(pending.term_count(), 5);
+
+        let flush = pending
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
+            .unwrap();
+        assert_eq!(flush.data_rows.len(), 2);
+        assert_eq!(
+            Fts5DataRowid::decode(flush.data_rows[0].id).unwrap(),
+            Fts5DataRowid::SegmentLeaf { segid: 4, pgno: 1 }
+        );
+        assert_eq!(flush.data_rows[1].id, FTS5_STRUCTURE_ROWID);
+        assert_eq!(
+            Fts5SegmentLeaf::decode(&flush.data_rows[0].block).unwrap(),
+            flush.leaf
+        );
+        assert_eq!(flush.structure.levels[0].segments[0].segid, 4);
+        assert_eq!(flush.structure.write_counter, 1);
+    }
+
+    #[test]
+    fn test_fts5_pending_flush_hotspot_profile_keeps_single_structure_commit() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"]).unwrap();
+        table.insert_document(7, &["rust fts storage".to_owned()]);
+
+        let flush = table
+            .build_pending_hash()
+            .unwrap()
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
+            .unwrap();
+        let profile = flush.hotspot_profile().unwrap();
+
+        assert_eq!(profile.data_row_writes, 2);
+        assert_eq!(profile.segment_leaf_writes, 1);
+        assert_eq!(profile.structure_record_writes, 1);
+        assert_eq!(profile.idx_row_writes, 0);
+        assert_eq!(profile.hot_write_count, 1);
+        assert_eq!(profile.unique_segment_pages, vec![(4, 1)]);
+        assert!(profile.append_only_rows_precede_hot_rows);
+        assert_eq!(
+            profile.publication_order,
+            vec![
+                Fts5ShadowWriteClass::SegmentLeaf { segid: 4, pgno: 1 },
+                Fts5ShadowWriteClass::StructureRecord
+            ]
+        );
+        assert_eq!(
+            profile.mitigation,
+            Fts5ShadowWriteMitigation::AppendOnlyRowsBeforeSingleMetadataCommit
+        );
+    }
+
+    #[test]
+    fn test_fts5_shadow_write_hotspot_profile_classifies_idx_page_writes() {
+        let data_rows = vec![
+            Fts5DataRow::new(
+                Fts5DataRowid::SegmentLeaf { segid: 8, pgno: 1 }
+                    .encode()
+                    .unwrap(),
+                Vec::new(),
+            ),
+            Fts5DataRow::new(
+                Fts5DataRowid::DoclistIndex {
+                    segid: 8,
+                    height: 1,
+                    pgno: 3,
+                }
+                .encode()
+                .unwrap(),
+                Vec::new(),
+            ),
+            Fts5DataRow::new(FTS5_STRUCTURE_ROWID, Vec::new()),
+        ];
+        let idx_rows = vec![
+            Fts5IdxRow::new(8, b"alpha".to_vec(), 2, true),
+            Fts5IdxRow::new(8, b"beta".to_vec(), 2, false),
+        ];
+
+        let profile = Fts5ShadowWriteHotspotProfile::from_rows(&data_rows, &idx_rows).unwrap();
+
+        assert_eq!(profile.append_only_data_writes, 2);
+        assert_eq!(profile.doclist_index_writes, 1);
+        assert_eq!(profile.idx_row_writes, 2);
+        assert_eq!(profile.hot_write_count, 3);
+        assert_eq!(profile.unique_doclist_index_pages, vec![(8, 1, 3)]);
+        assert_eq!(profile.unique_idx_pages, vec![(8, 2)]);
+        assert!(profile.append_only_rows_precede_hot_rows);
+        assert_eq!(
+            profile.mitigation,
+            Fts5ShadowWriteMitigation::AppendOnlyRowsBeforeBatchedHotWrites
+        );
+    }
+
+    #[test]
+    fn test_fts5_merge_scheduler_plans_auto_crisis_and_optimize() {
+        let scheduler = Fts5MergeScheduler {
+            automerge: 4,
+            usermerge: 2,
+            crisismerge: 6,
+        };
+        let structure = Fts5StructureRecord {
+            cookie: 0,
+            write_counter: 6,
+            origin_counter: 0,
+            levels: vec![Fts5StructureLevel::new(
+                0,
+                (1..=4)
+                    .map(|segid| Fts5StructureSegment::new(segid, 1, 1))
+                    .collect(),
+            )],
+        };
+
+        assert_eq!(
+            scheduler.next_plan(&structure),
+            Some(Fts5MergePlan {
+                kind: Fts5MergeKind::Auto,
+                level: 0,
+                segment_count: 4,
+                merge_inputs: 2,
+            })
+        );
+        assert_eq!(
+            scheduler.optimize_plan(&structure),
+            Some(Fts5MergePlan {
+                kind: Fts5MergeKind::Optimize,
+                level: 0,
+                segment_count: 4,
+                merge_inputs: 4,
+            })
+        );
+
+        let crisis = Fts5StructureRecord {
+            levels: vec![Fts5StructureLevel::new(
+                0,
+                (1..=6)
+                    .map(|segid| Fts5StructureSegment::new(segid, 1, 1))
+                    .collect(),
+            )],
+            ..structure
+        };
+        assert_eq!(
+            scheduler.next_plan(&crisis).map(|plan| plan.kind),
+            Some(Fts5MergeKind::Crisis)
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_pending_flush_and_merge_scheduler() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "body", "prefix='2'"],
+        )
+        .unwrap();
+        table.insert_document(7, &["rust fts".to_owned(), "rusty rust".to_owned()]);
+
+        let pending = table.build_pending_hash().unwrap();
+        let mut metadata = Fts5ConfigMetadata::default();
+        metadata.hash_size = 64;
+        let flush = pending
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
+            .unwrap();
+        let scheduler = Fts5MergeScheduler {
+            automerge: 4,
+            usermerge: 2,
+            crisismerge: 16,
+        };
+        let merge_structure = Fts5StructureRecord {
+            cookie: 0,
+            write_counter: 4,
+            origin_counter: 0,
+            levels: vec![Fts5StructureLevel::new(
+                0,
+                (1..=4)
+                    .map(|segid| Fts5StructureSegment::new(segid, 1, 1))
+                    .collect(),
+            )],
+        };
+        let snapshot = Fts5PendingFlushStructure {
+            term_count: pending.term_count(),
+            pending_bytes: pending.pending_bytes(),
+            should_flush: pending.should_flush(&metadata),
+            data_rowids: flush
+                .data_rows
+                .iter()
+                .map(|row| (row.id, Fts5DataRowid::decode(row.id).unwrap()))
+                .collect(),
+            terms: flush
+                .leaf
+                .terms
+                .iter()
+                .map(|term| term.term.clone())
+                .collect(),
+            structure: flush.structure,
+            merge_plan: scheduler.next_plan(&merge_structure),
+            optimize_plan: scheduler.optimize_plan(&merge_structure),
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5PendingFlushStructure {
+    term_count: 5,
+    pending_bytes: 224,
+    should_flush: true,
+    data_rowids: [
+        (
+            549755813889,
+            SegmentLeaf {
+                segid: 4,
+                pgno: 1,
+            },
+        ),
+        (
+            10,
+            Structure,
+        ),
+    ],
+    terms: [
+        [
+            48,
+            102,
+            116,
+            115,
+        ],
+        [
+            48,
+            114,
+            117,
+            115,
+            116,
+        ],
+        [
+            48,
+            114,
+            117,
+            115,
+            116,
+            121,
+        ],
+        [
+            49,
+            102,
+            116,
+        ],
+        [
+            49,
+            114,
+            117,
+        ],
+    ],
+    structure: Fts5StructureRecord {
+        cookie: 0,
+        write_counter: 1,
+        origin_counter: 0,
+        levels: [
+            Fts5StructureLevel {
+                merge_inputs: 0,
+                segments: [
+                    Fts5StructureSegment {
+                        segid: 4,
+                        pgno_first: 1,
+                        pgno_last: 1,
+                        origin_lower: 0,
+                        origin_upper: 0,
+                        tombstone_page_count: 0,
+                        tombstone_entry_count: 0,
+                        entry_count: 0,
+                    },
+                ],
+            },
+        ],
+    },
+    merge_plan: Some(
+        Fts5MergePlan {
+            kind: Auto,
+            level: 0,
+            segment_count: 4,
+            merge_inputs: 2,
+        },
+    ),
+    optimize_plan: Some(
+        Fts5MergePlan {
+            kind: Optimize,
+            level: 0,
+            segment_count: 4,
+            merge_inputs: 4,
+        },
+    ),
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_shadow_write_hotspot_profile() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"]).unwrap();
+        table.insert_document(7, &["rust fts storage".to_owned()]);
+        let flush_profile = table
+            .build_pending_hash()
+            .unwrap()
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
+            .unwrap()
+            .hotspot_profile()
+            .unwrap();
+
+        let idx_data_rows = vec![
+            Fts5DataRow::new(
+                Fts5DataRowid::SegmentLeaf { segid: 8, pgno: 1 }
+                    .encode()
+                    .unwrap(),
+                Vec::new(),
+            ),
+            Fts5DataRow::new(
+                Fts5DataRowid::DoclistIndex {
+                    segid: 8,
+                    height: 1,
+                    pgno: 3,
+                }
+                .encode()
+                .unwrap(),
+                Vec::new(),
+            ),
+            Fts5DataRow::new(FTS5_STRUCTURE_ROWID, Vec::new()),
+        ];
+        let idx_rows = vec![
+            Fts5IdxRow::new(8, b"alpha".to_vec(), 2, true),
+            Fts5IdxRow::new(8, b"beta".to_vec(), 2, false),
+        ];
+        let snapshot = Fts5ShadowWriteHotspotProfileStructure {
+            flush_profile,
+            idx_profile: Fts5ShadowWriteHotspotProfile::from_rows(&idx_data_rows, &idx_rows)
+                .unwrap(),
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5ShadowWriteHotspotProfileStructure {
+    flush_profile: Fts5ShadowWriteHotspotProfile {
+        data_row_writes: 2,
+        idx_row_writes: 0,
+        append_only_data_writes: 1,
+        segment_leaf_writes: 1,
+        doclist_index_writes: 0,
+        tombstone_writes: 0,
+        averages_record_writes: 0,
+        structure_record_writes: 1,
+        hot_write_count: 1,
+        append_only_rows_precede_hot_rows: true,
+        unique_segment_pages: [
+            (
+                4,
+                1,
+            ),
+        ],
+        unique_doclist_index_pages: [],
+        unique_tombstone_pages: [],
+        unique_idx_pages: [],
+        publication_order: [
+            SegmentLeaf {
+                segid: 4,
+                pgno: 1,
+            },
+            StructureRecord,
+        ],
+        mitigation: AppendOnlyRowsBeforeSingleMetadataCommit,
+    },
+    idx_profile: Fts5ShadowWriteHotspotProfile {
+        data_row_writes: 3,
+        idx_row_writes: 2,
+        append_only_data_writes: 2,
+        segment_leaf_writes: 1,
+        doclist_index_writes: 1,
+        tombstone_writes: 0,
+        averages_record_writes: 0,
+        structure_record_writes: 1,
+        hot_write_count: 3,
+        append_only_rows_precede_hot_rows: true,
+        unique_segment_pages: [
+            (
+                8,
+                1,
+            ),
+        ],
+        unique_doclist_index_pages: [
+            (
+                8,
+                1,
+                3,
+            ),
+        ],
+        unique_tombstone_pages: [],
+        unique_idx_pages: [
+            (
+                8,
+                2,
+            ),
+        ],
+        publication_order: [
+            SegmentLeaf {
+                segid: 8,
+                pgno: 1,
+            },
+            DoclistIndex {
+                segid: 8,
+                height: 1,
+                pgno: 3,
+            },
+            StructureRecord,
+            IdxPage {
+                segid: 8,
+                btree_page: 2,
+            },
+            IdxPage {
+                segid: 8,
+                btree_page: 2,
+            },
+        ],
+        mitigation: AppendOnlyRowsBeforeBatchedHotWrites,
+    },
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_lazy_segment_reader_exact_prefix_and_merge_primitives() {
+        let (structure, data_rows, idx_rows) = sample_lazy_segment_rows();
+        let row_set = Fts5SegmentRowSet::new(&data_rows, &idx_rows);
+        let reader = row_set.reader(&structure.levels[0].segments[0]);
+
+        let terms: Vec<Vec<u8>> = reader
+            .term_cursor()
+            .map(|term| term.unwrap().term)
+            .collect();
+        assert_eq!(
+            terms,
+            vec![
+                b"brown".to_vec(),
+                b"fox".to_vec(),
+                b"rust".to_vec(),
+                b"rusty".to_vec()
+            ]
+        );
+
+        let brown = reader.exact_postings(b"brown").unwrap().unwrap();
+        let fox = reader.exact_postings(b"fox").unwrap().unwrap();
+        assert_eq!(brown.rowids(), vec![1, 4]);
+        assert_eq!(fox.rowids(), vec![1, 3]);
+        assert_eq!(brown.union_rowids(&fox), vec![1, 3, 4]);
+        assert_eq!(brown.intersect_rowids(&fox), vec![1]);
+        assert_eq!(brown.phrase_rowids(&fox), vec![1]);
+        assert_eq!(brown.near_rowids(&fox, 2), vec![1]);
+
+        let prefix_terms: Vec<Vec<u8>> = reader
+            .prefix_matches(b"ru")
+            .unwrap()
+            .into_iter()
+            .map(|term| term.term)
+            .collect();
+        assert_eq!(prefix_terms, vec![b"rust".to_vec(), b"rusty".to_vec()]);
+    }
+
+    #[test]
+    fn test_fts5_segment_integrity_rejects_missing_and_orphan_rows() {
+        let (structure, mut data_rows, idx_rows) = sample_lazy_segment_rows();
+        let row_set = Fts5SegmentRowSet::new(&data_rows[..1], &idx_rows);
+        assert!(
+            row_set
+                .integrity_report(&structure)
+                .expect_err("missing second leaf should fail")
+                .to_string()
+                .contains("missing segment leaf")
+        );
+
+        data_rows.push(Fts5SegmentLeaf::new(Vec::new()).to_data_row(6, 1).unwrap());
+        let row_set = Fts5SegmentRowSet::new(&data_rows, &idx_rows);
+        assert!(
+            row_set
+                .integrity_report(&structure)
+                .expect_err("orphan segment row should fail")
+                .to_string()
+                .contains("unknown segment")
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_lazy_segment_reader() {
+        let (structure, data_rows, idx_rows) = sample_lazy_segment_rows();
+        let row_set = Fts5SegmentRowSet::new(&data_rows, &idx_rows);
+        let reader = row_set.reader(&structure.levels[0].segments[0]);
+        let brown = reader.exact_postings(b"brown").unwrap().unwrap();
+        let fox = reader.exact_postings(b"fox").unwrap().unwrap();
+        let snapshot = Fts5SegmentReaderStructure {
+            cursor_terms: reader
+                .term_cursor()
+                .map(|term| term.unwrap().term)
+                .collect(),
+            exact_brown_rowids: brown.rowids(),
+            prefix_ru_terms: reader
+                .prefix_matches(b"ru")
+                .unwrap()
+                .into_iter()
+                .map(|term| term.term)
+                .collect(),
+            union_brown_fox: brown.union_rowids(&fox),
+            phrase_brown_fox: brown.phrase_rowids(&fox),
+            near_brown_fox: brown.near_rowids(&fox, 2),
+            integrity: row_set.integrity_report(&structure).unwrap(),
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5SegmentReaderStructure {
+    cursor_terms: [
+        [
+            98,
+            114,
+            111,
+            119,
+            110,
+        ],
+        [
+            102,
+            111,
+            120,
+        ],
+        [
+            114,
+            117,
+            115,
+            116,
+        ],
+        [
+            114,
+            117,
+            115,
+            116,
+            121,
+        ],
+    ],
+    exact_brown_rowids: [
+        1,
+        4,
+    ],
+    prefix_ru_terms: [
+        [
+            114,
+            117,
+            115,
+            116,
+        ],
+        [
+            114,
+            117,
+            115,
+            116,
+            121,
+        ],
+    ],
+    union_brown_fox: [
+        1,
+        3,
+        4,
+    ],
+    phrase_brown_fox: [
+        1,
+    ],
+    near_brown_fox: [
+        1,
+    ],
+    integrity: Fts5SegmentIntegrityReport {
+        segment_count: 1,
+        leaf_page_count: 2,
+        idx_row_count: 1,
+        term_count: 4,
+        checksum: 3861481483356166922,
+    },
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_shadow_rows_round_trip_stored_content_and_docsize() {
+        let cx = Cx::new();
+        let mut table =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        table.insert_document(
+            7,
+            &["rust guide".to_owned(), "storage backend codec".to_owned()],
+        );
+        table.insert_document(9, &["sqlite notes".to_owned(), "rust fts".to_owned()]);
+
+        let rows = table.encode_shadow_rows();
+        assert_eq!(
+            rows.content,
+            vec![
+                Fts5ContentRow::new(
+                    7,
+                    vec!["rust guide".to_owned(), "storage backend codec".to_owned()]
+                ),
+                Fts5ContentRow::new(9, vec!["sqlite notes".to_owned(), "rust fts".to_owned()]),
+            ]
+        );
+        assert_eq!(
+            rows.docsize,
+            vec![
+                Fts5DocsizeRow::new(7, vec![2, 3]),
+                Fts5DocsizeRow::new(9, vec![2, 2]),
+            ]
+        );
+
+        let mut reopened =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        reopened.apply_shadow_rows(&rows).unwrap();
+        let matches: Vec<i64> = reopened
+            .search("rust")
+            .unwrap()
+            .into_iter()
+            .map(|(rowid, _rank)| rowid)
+            .collect();
+        assert_eq!(matches, vec![7, 9]);
+        assert_eq!(
+            reopened.lookup_content_row(7),
+            Some(Fts5ContentRow::new(
+                7,
+                vec!["rust guide".to_owned(), "storage backend codec".to_owned()]
+            ))
+        );
+        assert_eq!(
+            reopened.lookup_docsize_row(7),
+            Some(Fts5DocsizeRow::new(7, vec![2, 3]))
+        );
+    }
+
+    #[test]
+    fn test_fts5_shadow_rows_contentless_emits_docsize_without_content() {
+        let cx = Cx::new();
+        let mut table =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "content=''"]).unwrap();
+        table.insert_document(3, &["alpha beta gamma".to_owned()]);
+
+        assert!(table.encode_content_rows().is_empty());
+        assert_eq!(
+            table.lookup_docsize_row(3),
+            Some(Fts5DocsizeRow::new(3, vec![3]))
+        );
+        assert_eq!(table.lookup_content_row(3), None);
+    }
+
+    #[test]
+    fn test_fts5_shadow_rows_contentless_unindexed_keeps_only_unindexed_content() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title UNINDEXED",
+                "body",
+                "content=''",
+                "contentless_unindexed=1",
+            ],
+        )
+        .unwrap();
+        table.insert_document(5, &["visible title".to_owned(), "search body".to_owned()]);
+
+        assert_eq!(
+            table.encode_content_rows(),
+            vec![Fts5ContentRow::new(
+                5,
+                vec!["visible title".to_owned(), String::new()]
+            )]
+        );
+        assert_eq!(
+            table.lookup_docsize_row(5),
+            Some(Fts5DocsizeRow::new(5, vec![0, 2]))
+        );
+        assert_eq!(search_rowids(&table, "visible").unwrap(), Vec::<i64>::new());
+        assert_eq!(search_rowids(&table, "search").unwrap(), vec![5]);
+    }
+
+    #[test]
+    fn test_fts5_open_shadow_rows_binds_stock_segments_without_rebuild() {
+        let cx = Cx::new();
+        let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        let (structure, mut data_rows, idx_rows) = sample_lazy_segment_rows();
+        data_rows.insert(
+            0,
+            Fts5DataRow::new(
+                FTS5_AVERAGES_ROWID,
+                Fts5AveragesRecord::new(2, vec![3, 4]).encode(),
+            ),
+        );
+        data_rows.insert(
+            1,
+            Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()),
+        );
+        let rows = Fts5ShadowRows {
+            data: data_rows,
+            idx: idx_rows,
+            config: base.encode_config_rows(),
+            content: vec![
+                Fts5ContentRow::new(1, vec!["quick brown".to_owned(), "fox".to_owned()]),
+                Fts5ContentRow::new(4, vec!["slow brown".to_owned(), "bear".to_owned()]),
+            ],
+            docsize: vec![
+                Fts5DocsizeRow::new(1, vec![2, 1]),
+                Fts5DocsizeRow::new(4, vec![2, 1]),
+            ],
+        };
+
+        let opened =
+            Fts5Table::open_shadow_rows(&cx, &["fts5", "main", "docs", "title", "body"], &rows)
+                .unwrap();
+        assert!(opened.table.is_empty());
+        assert_eq!(opened.table.next_rowid, 5);
+        assert!(opened.report.bound_without_rebuild);
+        assert_eq!(opened.report.content_row_count, 2);
+        assert_eq!(opened.report.docsize_row_count, 2);
+        assert_eq!(opened.report.integrity.unwrap().term_count, 4);
+    }
+
+    #[test]
+    fn test_fts5_open_shadow_rows_rejects_inconsistent_stock_layout() {
+        let cx = Cx::new();
+        let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        let rows = Fts5ShadowRows {
+            data: base.encode_data_rows(),
+            idx: Vec::new(),
+            config: base.encode_config_rows(),
+            content: vec![Fts5ContentRow::new(1, vec!["only one column".to_owned()])],
+            docsize: Vec::new(),
+        };
+
+        assert!(
+            Fts5Table::open_shadow_rows(&cx, &["fts5", "main", "docs", "title", "body"], &rows)
+                .expect_err("content rows must match table columns")
+                .to_string()
+                .contains("content row column count")
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_shadow_rows() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "body",
+                "secure-delete=1",
+                "insttoken=1",
+            ],
+        )
+        .unwrap();
+        table.insert_document(
+            11,
+            &["rust index".to_owned(), "shadow table rows".to_owned()],
+        );
+        let rows = table.encode_shadow_rows();
+        let snapshot = Fts5ShadowRowsStructure {
+            data: rows
+                .data
+                .iter()
+                .map(|row| (row.id, row.block.clone()))
+                .collect(),
+            idx: rows.idx.clone(),
+            config: rows
+                .config
+                .iter()
+                .map(|record| (record.key.clone(), record.value.to_text()))
+                .collect(),
+            content: rows.content.clone(),
+            docsize: rows.docsize.clone(),
+            matches: search_rowids(&table, "shadow").unwrap(),
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5ShadowRowsStructure {
+    data: [
+        (
+            1,
+            [
+                1,
+                2,
+                3,
+            ],
+        ),
+        (
+            10,
+            [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+    ],
+    idx: [],
+    config: [
+        (
+            "insttoken",
+            "1",
+        ),
+        (
+            "secure-delete",
+            "1",
+        ),
+        (
+            "version",
+            "4",
+        ),
+    ],
+    content: [
+        Fts5ContentRow {
+            rowid: 11,
+            values: [
+                "rust index",
+                "shadow table rows",
+            ],
+        },
+    ],
+    docsize: [
+        Fts5DocsizeRow {
+            rowid: 11,
+            column_token_counts: [
+                2,
+                3,
+            ],
+        },
+    ],
+    matches: [
+        11,
+    ],
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_shadow_open_without_rebuild() {
+        let cx = Cx::new();
+        let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        let (structure, mut data_rows, idx_rows) = sample_lazy_segment_rows();
+        data_rows.insert(
+            0,
+            Fts5DataRow::new(
+                FTS5_AVERAGES_ROWID,
+                Fts5AveragesRecord::new(2, vec![3, 4]).encode(),
+            ),
+        );
+        data_rows.insert(
+            1,
+            Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()),
+        );
+        let rows = Fts5ShadowRows {
+            data: data_rows,
+            idx: idx_rows,
+            config: base.encode_config_rows(),
+            content: vec![
+                Fts5ContentRow::new(1, vec!["quick brown".to_owned(), "fox".to_owned()]),
+                Fts5ContentRow::new(4, vec!["slow brown".to_owned(), "bear".to_owned()]),
+            ],
+            docsize: vec![
+                Fts5DocsizeRow::new(1, vec![2, 1]),
+                Fts5DocsizeRow::new(4, vec![2, 1]),
+            ],
+        };
+        let opened =
+            Fts5Table::open_shadow_rows(&cx, &["fts5", "main", "docs", "title", "body"], &rows)
+                .unwrap();
+        let snapshot = Fts5ShadowOpenStructure {
+            report: opened.report,
+            table_empty: opened.table.is_empty(),
+            next_rowid: opened.table.next_rowid,
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5ShadowOpenStructure {
+    report: Fts5ShadowOpenReport {
+        metadata: Fts5ConfigMetadata {
+            format_version: 4,
+            page_size: 4050,
+            automerge: 4,
+            usermerge: 4,
+            crisismerge: 16,
+            hash_size: 1048576,
+            delete_merge: 10,
+            rank: None,
+            secure_delete: false,
+            insttoken: false,
+        },
+        averages: Some(
+            Fts5AveragesRecord {
+                total_rows: 2,
+                column_token_totals: [
+                    3,
+                    4,
+                ],
+            },
+        ),
+        structure: Some(
+            Fts5StructureRecord {
+                cookie: 0,
+                write_counter: 2,
+                origin_counter: 0,
+                levels: [
+                    Fts5StructureLevel {
+                        merge_inputs: 0,
+                        segments: [
+                            Fts5StructureSegment {
+                                segid: 5,
+                                pgno_first: 1,
+                                pgno_last: 2,
+                                origin_lower: 0,
+                                origin_upper: 0,
+                                tombstone_page_count: 0,
+                                tombstone_entry_count: 0,
+                                entry_count: 0,
+                            },
+                        ],
+                    },
+                ],
+            },
+        ),
+        integrity: Some(
+            Fts5SegmentIntegrityReport {
+                segment_count: 1,
+                leaf_page_count: 2,
+                idx_row_count: 1,
+                term_count: 4,
+                checksum: 3861481483356166922,
+            },
+        ),
+        content_row_count: 2,
+        docsize_row_count: 2,
+        max_seen_rowid: Some(
+            4,
+        ),
+        bound_without_rebuild: true,
+    },
+    table_empty: true,
+    next_rowid: 5,
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_shadow_query_matches_reader_segments_without_hydration()
+    -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        let rows = sample_shadow_query_rows(&base);
+        let opened =
+            Fts5Table::open_shadow_rows(&cx, &["fts5", "main", "docs", "title", "body"], &rows)
+                .map_err(|err| err.to_string())?;
+
+        assert!(opened.table.is_empty());
+        assert_eq!(
+            opened
+                .table
+                .search("brown")
+                .map_err(|err| err.to_string())?[0]
+                .0,
+            1
+        );
+        assert_eq!(
+            opened
+                .table
+                .search("body:ru*")
+                .map_err(|err| err.to_string())?
+                .into_iter()
+                .map(|(rowid, _score)| rowid)
+                .collect::<Vec<_>>(),
+            vec![20]
+        );
+        assert_eq!(
+            opened
+                .table
+                .search(r#""brown fox""#)
+                .map_err(|err| err.to_string())?
+                .into_iter()
+                .map(|(rowid, _score)| rowid)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        let mut cursor = opened.table.open().map_err(|err| err.to_string())?;
+        cursor
+            .filter(
+                &cx,
+                1,
+                None,
+                &[SqliteValue::Text(SmallText::from_string("body:ru*"))],
+            )
+            .map_err(|err| err.to_string())?;
+        assert_eq!(cursor.rowid().map_err(|err| err.to_string())?, 20);
+        let mut ctx = ColumnContext::new();
+        cursor.column(&mut ctx, 1).map_err(|err| err.to_string())?;
+        assert_eq!(
+            ctx.take_value(),
+            Some(SqliteValue::Text(SmallText::from_string("rusty")))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_shadow_query() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        let rows = sample_shadow_query_rows(&base);
+        let opened =
+            Fts5Table::open_shadow_rows(&cx, &["fts5", "main", "docs", "title", "body"], &rows)
+                .map_err(|err| err.to_string())?;
+        let rowids = |query: &str| -> std::result::Result<Vec<i64>, String> {
+            opened
+                .table
+                .search(query)
+                .map_err(|err| err.to_string())
+                .map(|results| results.into_iter().map(|(rowid, _score)| rowid).collect())
+        };
+
+        let mut cursor = opened.table.open().map_err(|err| err.to_string())?;
+        cursor
+            .filter(
+                &cx,
+                1,
+                None,
+                &[SqliteValue::Text(SmallText::from_string("body:ru*"))],
+            )
+            .map_err(|err| err.to_string())?;
+        let mut ctx = ColumnContext::new();
+        cursor.column(&mut ctx, 1).map_err(|err| err.to_string())?;
+
+        let snapshot = Fts5ShadowQueryStructure {
+            exact_matches: rowids("brown")?,
+            prefix_matches: rowids("ru*")?,
+            phrase_matches: rowids(r#""brown fox""#)?,
+            near_matches: rowids("NEAR(brown fox, 2)")?,
+            initial_matches: rowids("^fox")?,
+            column_filtered_matches: rowids("body:ru*")?,
+            boolean_or_matches: rowids("brown OR fox")?,
+            boolean_not_matches: rowids("brown NOT fox")?,
+            cursor_body_value: ctx.take_value(),
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5ShadowQueryStructure {
+    exact_matches: [
+        1,
+        4,
+    ],
+    prefix_matches: [
+        7,
+        20,
+    ],
+    phrase_matches: [
+        1,
+    ],
+    near_matches: [
+        1,
+    ],
+    initial_matches: [
+        3,
+    ],
+    column_filtered_matches: [
+        20,
+    ],
+    boolean_or_matches: [
+        1,
+        3,
+        4,
+    ],
+    boolean_not_matches: [
+        4,
+    ],
+    cursor_body_value: Some(
+        Text(
+            "rusty",
+        ),
+    ),
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_insttoken_control_command() {
+        let mut config = Fts5Config::default();
+        assert!(!config.insttoken_enabled());
+        assert!(config.apply_control_command("insttoken=1"));
+        assert!(config.insttoken_enabled());
+        assert!(config.apply_control_command("insttoken=off"));
+        assert!(!config.insttoken_enabled());
+    }
+
+    #[test]
     fn test_contentless_delete_rejects_without_toggle() {
         let config = Fts5Config::new(ContentMode::Contentless);
         assert_eq!(config.delete_action(), DeleteAction::Reject);
@@ -3023,7 +10547,505 @@ mod tests {
         let tok = Unicode61Tokenizer::new();
         let tokens = tok.tokenize("café résumé naïve");
         let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
+        assert_eq!(terms, vec!["cafe", "resume", "naive"]);
+    }
+
+    #[test]
+    fn test_unicode61_remove_diacritics_zero_preserves_latin_marks() {
+        let tok = create_tokenizer("unicode61 remove_diacritics 0").unwrap();
+        let tokens = tok.tokenize("café résumé naïve");
+        let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
         assert_eq!(terms, vec!["café", "résumé", "naïve"]);
+    }
+
+    #[test]
+    fn test_unicode61_remove_diacritics_option() {
+        let tok = create_tokenizer("unicode61 remove_diacritics 2").unwrap();
+        let tokens = tok.tokenize("café résumé naïve");
+        let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
+        assert_eq!(terms, vec!["cafe", "resume", "naive"]);
+    }
+
+    #[test]
+    fn test_create_tokenizer_unicode61_rejects_invalid_options() {
+        for spec in [
+            "unicode61 unknown 1",
+            "unicode61 remove_diacritics maybe",
+            "unicode61 remove_diacritics 3",
+            "unicode61 tokenchars",
+        ] {
+            assert!(
+                create_tokenizer(spec).is_none(),
+                "invalid unicode61 spec should fail: {spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_unicode61_option_validation() {
+        let tokenizer = create_tokenizer("unicode61 tokenchars=-_ remove_diacritics=2").unwrap();
+        let accepted_terms = tokenizer
+            .tokenize("café-file_name")
+            .into_iter()
+            .map(|token| token.term)
+            .collect();
+        let rejected_specs = [
+            "unicode61 bogus 1",
+            "unicode61 remove_diacritics=-1",
+            "unicode61 remove_diacritics=4",
+            "unicode61 separators",
+        ]
+        .into_iter()
+        .filter(|spec| create_tokenizer(spec).is_none())
+        .map(str::to_owned)
+        .collect();
+        let snapshot = Fts5Unicode61OptionValidationStructure {
+            accepted_terms,
+            rejected_specs,
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5Unicode61OptionValidationStructure {
+    accepted_terms: [
+        "cafe-file_name",
+    ],
+    rejected_specs: [
+        "unicode61 bogus 1",
+        "unicode61 remove_diacritics=-1",
+        "unicode61 remove_diacritics=4",
+        "unicode61 separators",
+    ],
+}"#
+        );
+    }
+
+    #[test]
+    fn test_unicode61_option_char_class_fast_path() {
+        let tok = create_tokenizer("unicode61 tokenchars '§-' separators 'é_' remove_diacritics 0")
+            .unwrap();
+        let tokens = tok.tokenize("sec§tion well-known café alpha_beta");
+        let terms: Vec<&str> = tokens.iter().map(|token| token.term.as_str()).collect();
+
+        assert_eq!(
+            terms,
+            vec!["sec§tion", "well-known", "caf", "alpha", "beta"]
+        );
+        assert_eq!(tokens[0].start, 0);
+        assert_eq!(tokens[0].end, 9);
+        assert_eq!(tokens[2].start, 21);
+        assert_eq!(tokens[2].end, 24);
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_unicode61_char_class() -> std::result::Result<(), String> {
+        let tokenizer_spec = "unicode61 tokenchars '§-' separators 'é_' remove_diacritics 0";
+        let tok = create_tokenizer(tokenizer_spec).unwrap();
+        let tokens = tok
+            .tokenize("sec§tion well-known café alpha_beta")
+            .into_iter()
+            .map(|token| (token.term, token.start, token.end))
+            .collect();
+
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "unicode_docs",
+                "body",
+                "tokenize=\"unicode61 tokenchars '§-' separators 'é_' remove_diacritics 0\"",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["sec§tion well-known café alpha_beta".to_owned()]);
+        table.insert_document(2, &["section alpha cafe".to_owned()]);
+        let structure = table_structure(&table);
+
+        let mut section_matches = search_rowids(&table, "sec§tion")?;
+        section_matches.sort_unstable();
+        let mut alpha_matches = search_rowids(&table, "alpha")?;
+        alpha_matches.sort_unstable();
+        let mut cafe_matches = search_rowids(&table, "cafe")?;
+        cafe_matches.sort_unstable();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5Unicode61CharClassStructure {
+                    tokens,
+                    terms: structure.terms.into_iter().map(|term| term.term).collect(),
+                    section_matches,
+                    alpha_matches,
+                    cafe_matches,
+                }
+            ),
+            r#"Fts5Unicode61CharClassStructure {
+    tokens: [
+        (
+            "sec§tion",
+            0,
+            9,
+        ),
+        (
+            "well-known",
+            10,
+            20,
+        ),
+        (
+            "caf",
+            21,
+            24,
+        ),
+        (
+            "alpha",
+            27,
+            32,
+        ),
+        (
+            "beta",
+            33,
+            37,
+        ),
+    ],
+    terms: [
+        "alpha",
+        "beta",
+        "caf",
+        "cafe",
+        "section",
+        "sec§tion",
+        "well-known",
+    ],
+    section_matches: [
+        1,
+    ],
+    alpha_matches: [
+        1,
+        2,
+    ],
+    cafe_matches: [
+        2,
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_unquote_fts_arg_strips_matching_quote_pairs() {
+        assert_eq!(
+            unquote_fts_arg(" 'unicode61 remove_diacritics 2' "),
+            "unicode61 remove_diacritics 2"
+        );
+        assert_eq!(unquote_fts_arg("\"café\""), "café");
+        assert_eq!(unquote_fts_arg("`2 3`"), "2 3");
+        assert_eq!(unquote_fts_arg("'mismatch`"), "'mismatch`");
+        assert_eq!(unquote_fts_arg("''"), "");
+        assert_eq!(unquote_fts_arg("plain"), "plain");
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_quoted_options() -> std::result::Result<(), String> {
+        let unquoted = [
+            "'unicode61 remove_diacritics 2'",
+            "\"2 3\"",
+            "`quoted`",
+            "'mismatch`",
+            "plain",
+        ]
+        .into_iter()
+        .map(|raw| (raw.to_owned(), unquote_fts_arg(raw).to_owned()))
+        .collect();
+
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "quoted_docs",
+                "body",
+                "tokenize='unicode61 remove_diacritics 2'",
+                "prefix='2 3'",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["café".to_owned()]);
+        let structure = table_structure(&table);
+        let mut cafe_matches = search_rowids(&table, "cafe")?;
+        cafe_matches.sort_unstable();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5QuotedOptionStructure {
+                    unquoted,
+                    tokenizer: table.tokenizer_name.clone(),
+                    prefix_lengths: table.prefix_lengths.clone(),
+                    terms: structure.terms.into_iter().map(|term| term.term).collect(),
+                    cafe_matches,
+                }
+            ),
+            r#"Fts5QuotedOptionStructure {
+    unquoted: [
+        (
+            "'unicode61 remove_diacritics 2'",
+            "unicode61 remove_diacritics 2",
+        ),
+        (
+            "\"2 3\"",
+            "2 3",
+        ),
+        (
+            "`quoted`",
+            "quoted",
+        ),
+        (
+            "'mismatch`",
+            "'mismatch`",
+        ),
+        (
+            "plain",
+            "plain",
+        ),
+    ],
+    tokenizer: "unicode61 remove_diacritics 2",
+    prefix_lengths: [
+        2,
+        3,
+    ],
+    terms: [
+        "cafe",
+    ],
+    cafe_matches: [
+        1,
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_detail_option_parses_case_insensitively_without_allocating() {
+        assert_eq!(parse_detail_option("FULL"), Some(DetailMode::Full));
+        assert_eq!(parse_detail_option(" Column "), Some(DetailMode::Column));
+        assert_eq!(parse_detail_option("NoNe"), Some(DetailMode::None));
+        assert_eq!(parse_detail_option("offsets"), None);
+        assert_eq!(parse_detail_option(""), None);
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_detail_option_casefold() -> std::result::Result<(), String> {
+        let parsed = ["FULL", " Column ", "NoNe", "offsets"]
+            .into_iter()
+            .map(|value| (value.to_owned(), parse_detail_option(value)))
+            .collect();
+
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "detail_docs", "body", "detail=CoLuMn"],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["alpha beta".to_owned()]);
+        let mut matches = search_rowids(&table, "alpha")?;
+        matches.sort_unstable();
+        let phrase_error = table
+            .search("\"alpha beta\"")
+            .expect_err("detail=column should reject phrase queries")
+            .to_string();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5DetailOptionStructure {
+                    parsed,
+                    config_detail: table.config.detail_mode(),
+                    index_detail: table.index.detail_mode(),
+                    matches,
+                    phrase_error,
+                }
+            ),
+            r#"Fts5DetailOptionStructure {
+    parsed: [
+        (
+            "FULL",
+            Some(
+                Full,
+            ),
+        ),
+        (
+            " Column ",
+            Some(
+                Column,
+            ),
+        ),
+        (
+            "NoNe",
+            Some(
+                None,
+            ),
+        ),
+        (
+            "offsets",
+            None,
+        ),
+    ],
+    config_detail: Column,
+    index_detail: Column,
+    matches: [
+        1,
+    ],
+    phrase_error: "detail=column does not support phrase queries",
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_unicode61_default_diacritics()
+    -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"])
+            .map_err(|err| err.to_string())?;
+        table.insert_document(11, &["café résumé naïve".to_owned()]);
+
+        let structure = table_structure(&table);
+        let ascii_matches = table
+            .search("cafe")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let accent_matches = table
+            .search("résumé")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let snapshot = Fts5Unicode61DiacriticsStructure {
+            tokenizer: table.tokenizer_name.clone(),
+            terms: structure.terms.into_iter().map(|term| term.term).collect(),
+            rows: structure.rows,
+            ascii_matches,
+            accent_matches,
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5Unicode61DiacriticsStructure {
+    tokenizer: "unicode61",
+    terms: [
+        "cafe",
+        "naive",
+        "resume",
+    ],
+    rows: [
+        (
+            11,
+            [
+                "café résumé naïve",
+            ],
+        ),
+    ],
+    ascii_matches: [
+        11,
+    ],
+    accent_matches: [
+        11,
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_table_search_unicode61_remove_diacritics() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "body",
+                "tokenize='unicode61 remove_diacritics 2'",
+            ],
+        )
+        .unwrap();
+        table.insert_document(5, &["café résumé".to_owned()]);
+
+        assert_eq!(table.search("cafe").unwrap()[0].0, 5);
+        assert_eq!(table.search("résumé").unwrap()[0].0, 5);
+        assert!(table.search("naive").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_unicode61_remove_diacritics() -> std::result::Result<(), String>
+    {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "body",
+                "tokenize='unicode61 remove_diacritics 2'",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(9, &["café résumé naïve".to_owned()]);
+
+        let structure = table_structure(&table);
+        let ascii_matches = table
+            .search("cafe")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let accent_matches = table
+            .search("résumé")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let snapshot = Fts5Unicode61DiacriticsStructure {
+            tokenizer: table.tokenizer_name.clone(),
+            terms: structure.terms.into_iter().map(|term| term.term).collect(),
+            rows: structure.rows,
+            ascii_matches,
+            accent_matches,
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5Unicode61DiacriticsStructure {
+    tokenizer: "unicode61 remove_diacritics 2",
+    terms: [
+        "cafe",
+        "naive",
+        "resume",
+    ],
+    rows: [
+        (
+            9,
+            [
+                "café résumé naïve",
+            ],
+        ),
+    ],
+    ascii_matches: [
+        9,
+    ],
+    accent_matches: [
+        9,
+    ],
+}"#
+        );
+        Ok(())
     }
 
     #[test]
@@ -3043,6 +11065,102 @@ mod tests {
         let tokens = tok.tokenize("Hello World 123");
         let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
         assert_eq!(terms, vec!["hello", "world", "123"]);
+    }
+
+    #[test]
+    fn test_ascii_tokenizer_lazy_casefold_offsets() {
+        let tok = AsciiTokenizer;
+        let tokens = tok.tokenize("ABCédef 123XYZ");
+        let tokens: Vec<(String, usize, usize)> = tokens
+            .into_iter()
+            .map(|token| (token.term, token.start, token.end))
+            .collect();
+
+        assert_eq!(
+            tokens,
+            vec![
+                ("abc".to_owned(), 0, 3),
+                ("def".to_owned(), 5, 8),
+                ("123xyz".to_owned(), 9, 15),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_ascii_tokenizer_lazy_casefold()
+    -> std::result::Result<(), String> {
+        let tok = AsciiTokenizer;
+        let tokens = tok
+            .tokenize("ABCédef 123XYZ")
+            .into_iter()
+            .map(|token| (token.term, token.start, token.end))
+            .collect();
+
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "ascii_docs", "body", "tokenize='ascii'"],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["ABCédef 123XYZ".to_owned()]);
+        table.insert_document(2, &["abc DEF".to_owned()]);
+        let structure = table_structure(&table);
+
+        let mut upper_matches = search_rowids(&table, "ABC")?;
+        upper_matches.sort_unstable();
+        let mut lower_matches = search_rowids(&table, "def")?;
+        lower_matches.sort_unstable();
+        let mut numeric_matches = search_rowids(&table, "123XYZ")?;
+        numeric_matches.sort_unstable();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5AsciiTokenizerStructure {
+                    tokens,
+                    terms: structure.terms.into_iter().map(|term| term.term).collect(),
+                    upper_matches,
+                    lower_matches,
+                    numeric_matches,
+                }
+            ),
+            r#"Fts5AsciiTokenizerStructure {
+    tokens: [
+        (
+            "abc",
+            0,
+            3,
+        ),
+        (
+            "def",
+            5,
+            8,
+        ),
+        (
+            "123xyz",
+            9,
+            15,
+        ),
+    ],
+    terms: [
+        "123xyz",
+        "abc",
+        "def",
+    ],
+    upper_matches: [
+        1,
+        2,
+    ],
+    lower_matches: [
+        1,
+        2,
+    ],
+    numeric_matches: [
+        1,
+    ],
+}"#
+        );
+        Ok(())
     }
 
     #[test]
@@ -3084,6 +11202,196 @@ mod tests {
         assert!(create_tokenizer("porter").is_some());
         assert!(create_tokenizer("trigram").is_some());
         assert!(create_tokenizer("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_fts5_extension_api_registers_custom_tokenizer_and_aux()
+    -> std::result::Result<(), String> {
+        let mut api = Fts5ExtensionApi::with_builtins();
+        let _ = api.register_tokenizer("synonym", |args| {
+            let suffix = args.first().cloned().unwrap_or_else(|| "_syn".to_owned());
+            Some(Box::new(SynonymTestTokenizer { suffix }))
+        });
+        let _ = api.register_auxiliary("query_term_count", |ctx, args| {
+            let extra = args.first().map_or(0, SqliteValue::to_integer);
+            Ok(SqliteValue::Integer(
+                i64::try_from(ctx.query_terms.len()).unwrap_or(i64::MAX) + extra,
+            ))
+        });
+
+        let tokens = api
+            .tokenize(
+                "synonym _alias",
+                Fts5TokenizeRequest::new("Rust", Fts5TokenizeReason::Query).with_locale("en_US"),
+            )
+            .map_err(|err| err.to_string())?;
+        assert_eq!(
+            tokens,
+            vec![
+                Fts5Token {
+                    term: "rust".to_owned(),
+                    start: 0,
+                    end: 4,
+                    colocated: false,
+                },
+                Fts5Token {
+                    term: "rust_alias".to_owned(),
+                    start: 0,
+                    end: 4,
+                    colocated: true,
+                },
+            ]
+        );
+
+        let columns = vec!["body".to_owned()];
+        let terms = vec!["rust".to_owned(), "sqlite".to_owned()];
+        let context = Fts5ExtensionContext::new("docs", &columns)
+            .with_query_terms(&terms)
+            .with_locale("en_US");
+        let value = api
+            .invoke_auxiliary("query_term_count", &context, &[SqliteValue::Integer(3)])
+            .map_err(|err| err.to_string())?;
+        assert_eq!(value, SqliteValue::Integer(5));
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_extension_api() -> std::result::Result<(), String> {
+        let mut api = Fts5ExtensionApi::with_builtins();
+        let _ = api.register_tokenizer("synonym", |args| {
+            let suffix = args.first().cloned().unwrap_or_else(|| "_syn".to_owned());
+            Some(Box::new(SynonymTestTokenizer { suffix }))
+        });
+        let _ = api.register_auxiliary("row_summary", |ctx, args| {
+            let label = args.first().map_or_else(String::new, SqliteValue::to_text);
+            let rowid = ctx.rowid.unwrap_or_default();
+            let locale = ctx.locale.unwrap_or("none");
+            Ok(SqliteValue::Text(SmallText::from_string(format!(
+                "{label}:{rowid}:{locale}:{}",
+                ctx.query_terms.join("|")
+            ))))
+        });
+
+        let columns = vec!["title".to_owned(), "body".to_owned()];
+        let row = vec!["Rust".to_owned(), "SQLite".to_owned()];
+        let query_terms = vec!["rust".to_owned(), "sqlite".to_owned()];
+        let context = Fts5ExtensionContext::new("docs", &columns)
+            .with_query_terms(&query_terms)
+            .with_row(42, &row)
+            .with_locale("en_US");
+
+        let missing_aux_error = api
+            .invoke_auxiliary("missing_aux", &context, &[])
+            .expect_err("missing custom aux should be explicit")
+            .to_string();
+        let snapshot = Fts5ExtensionApiStructure {
+            tokenizers: api.tokenizer_names(),
+            auxiliaries: api.auxiliary_names(),
+            document_tokens: api
+                .tokenize(
+                    "unicode61",
+                    Fts5TokenizeRequest::new("Café Rust", Fts5TokenizeReason::Document),
+                )
+                .map_err(|err| err.to_string())?,
+            query_tokens: api
+                .tokenize(
+                    "synonym _q",
+                    Fts5TokenizeRequest::new("Rust", Fts5TokenizeReason::Query)
+                        .with_locale("en_US"),
+                )
+                .map_err(|err| err.to_string())?,
+            prefix_tokens: api
+                .tokenize(
+                    "trigram",
+                    Fts5TokenizeRequest::new("Prefix", Fts5TokenizeReason::Prefix),
+                )
+                .map_err(|err| err.to_string())?,
+            aux_value: api
+                .invoke_auxiliary(
+                    "row_summary",
+                    &context,
+                    &[SqliteValue::Text(SmallText::from_string("hit"))],
+                )
+                .map_err(|err| err.to_string())?,
+            missing_aux_error,
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5ExtensionApiStructure {
+    tokenizers: [
+        "ascii",
+        "porter",
+        "synonym",
+        "trigram",
+        "unicode61",
+    ],
+    auxiliaries: [
+        "column_count",
+        "row_summary",
+        "rowid",
+    ],
+    document_tokens: [
+        Fts5Token {
+            term: "cafe",
+            start: 0,
+            end: 5,
+            colocated: false,
+        },
+        Fts5Token {
+            term: "rust",
+            start: 6,
+            end: 10,
+            colocated: false,
+        },
+    ],
+    query_tokens: [
+        Fts5Token {
+            term: "rust",
+            start: 0,
+            end: 4,
+            colocated: false,
+        },
+        Fts5Token {
+            term: "rust_q",
+            start: 0,
+            end: 4,
+            colocated: true,
+        },
+    ],
+    prefix_tokens: [
+        Fts5Token {
+            term: "pre",
+            start: 0,
+            end: 3,
+            colocated: false,
+        },
+        Fts5Token {
+            term: "ref",
+            start: 1,
+            end: 4,
+            colocated: false,
+        },
+        Fts5Token {
+            term: "efi",
+            start: 2,
+            end: 5,
+            colocated: false,
+        },
+        Fts5Token {
+            term: "fix",
+            start: 3,
+            end: 6,
+            colocated: false,
+        },
+    ],
+    aux_value: Text(
+        "hit:42:en_US:rust|sqlite",
+    ),
+    missing_aux_error: "fts5: unknown auxiliary function 'missing_aux'",
+}"#
+        );
+        Ok(())
     }
 
     // -- Query parsing tests --
@@ -3154,6 +11462,21 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_query_phrase_concatenation_tokens() -> std::result::Result<(), String> {
+        let tokens = parse_fts5_query(r#""one two" + three"#).map_err(|err| err.to_string())?;
+        let kinds: Vec<Fts5QueryTokenKind> = tokens.iter().map(|token| token.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                Fts5QueryTokenKind::Phrase,
+                Fts5QueryTokenKind::Plus,
+                Fts5QueryTokenKind::Term,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_fts5_query_column_filter() {
         let tokens = parse_fts5_query("title: hello").unwrap();
         assert_eq!(tokens[0].kind, Fts5QueryTokenKind::ColumnFilter);
@@ -3178,6 +11501,39 @@ mod tests {
         assert_eq!(tokens[0].lexeme, "title");
         assert_eq!(tokens[1].kind, Fts5QueryTokenKind::Prefix);
         assert_eq!(tokens[1].lexeme, "hel");
+    }
+
+    #[test]
+    fn test_fts5_query_braced_column_filter_set() -> std::result::Result<(), String> {
+        let tokens = parse_fts5_query("{title body}: rust").map_err(|err| err.to_string())?;
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].kind, Fts5QueryTokenKind::ColumnFilter);
+        assert_eq!(tokens[0].lexeme, "{title,body}");
+        assert_eq!(tokens[1].kind, Fts5QueryTokenKind::Term);
+        assert_eq!(tokens[1].lexeme, "rust");
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_query_negative_column_filter() -> std::result::Result<(), String> {
+        let tokens = parse_fts5_query("- tag : rust").map_err(|err| err.to_string())?;
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].kind, Fts5QueryTokenKind::ColumnFilter);
+        assert_eq!(tokens[0].lexeme, "-tag");
+        assert_eq!(tokens[1].kind, Fts5QueryTokenKind::Term);
+        assert_eq!(tokens[1].lexeme, "rust");
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_query_negative_braced_column_filter_set() -> std::result::Result<(), String> {
+        let tokens = parse_fts5_query("- {title body}: rust").map_err(|err| err.to_string())?;
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].kind, Fts5QueryTokenKind::ColumnFilter);
+        assert_eq!(tokens[0].lexeme, "-{title,body}");
+        assert_eq!(tokens[1].kind, Fts5QueryTokenKind::Term);
+        assert_eq!(tokens[1].lexeme, "rust");
+        Ok(())
     }
 
     #[test]
@@ -3228,6 +11584,34 @@ mod tests {
         assert_eq!(index.doc_frequency("world"), 1);
         assert_eq!(index.doc_frequency("rust"), 1);
         assert_eq!(index.term_frequency("hello", 1), 1);
+    }
+
+    #[test]
+    fn test_inverted_index_tokendata_uses_query_key_before_nul() {
+        let mut index =
+            InvertedIndex::with_options_and_tokendata(true, &[3], DetailMode::Full, true);
+        let tokens = vec![
+            Fts5Token {
+                term: "alpha\0noun".to_owned(),
+                start: 0,
+                end: 5,
+                colocated: false,
+            },
+            Fts5Token {
+                term: "beta\0verb".to_owned(),
+                start: 6,
+                end: 10,
+                colocated: false,
+            },
+        ];
+        index.add_document(1, 0, &tokens);
+
+        assert!(index.tokendata_enabled());
+        assert_eq!(tokendata_query_key("alpha\0query"), "alpha");
+        assert_eq!(index.doc_frequency("alpha"), 1);
+        assert_eq!(index.doc_frequency("alpha\0noun"), 1);
+        assert_eq!(index.get_prefix_postings("alp").len(), 1);
+        assert!(index.get_postings("noun").is_empty());
     }
 
     #[test]
@@ -3319,6 +11703,87 @@ mod tests {
         assert_eq!(index.total_docs(), 1);
         assert_eq!(index.doc_frequency("hello"), 1);
         assert_eq!(index.doc_frequency("world"), 0);
+    }
+
+    #[test]
+    fn test_inverted_index_remove_document_prunes_empty_buckets() {
+        let mut index = InvertedIndex::with_options(true, &[3, 4], DetailMode::Full);
+        let tok = Unicode61Tokenizer::new();
+
+        index.add_document(1, 0, &tok.tokenize("alpine solo"));
+        index.add_document(2, 0, &tok.tokenize("alpha world"));
+
+        assert!(index.index.contains_key("alpine"));
+        assert!(index.index.contains_key("solo"));
+        assert!(index.prefix_indexes.get(&4).unwrap().contains_key("alpi"));
+        assert!(index.prefix_indexes.get(&3).unwrap().contains_key("sol"));
+
+        index.remove_document(1);
+
+        assert_eq!(index.total_docs(), 1);
+        assert!(!index.index.contains_key("alpine"));
+        assert!(!index.index.contains_key("solo"));
+        assert!(!index.prefix_indexes.get(&4).unwrap().contains_key("alpi"));
+        assert!(!index.prefix_indexes.get(&3).unwrap().contains_key("sol"));
+        assert_eq!(posting_docids(index.get_postings("alpha")), vec![2]);
+        assert_eq!(posting_docids(index.get_postings("world")), vec![2]);
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_posting_prune() {
+        let mut index = InvertedIndex::with_options(true, &[3, 4], DetailMode::Full);
+        let tok = Unicode61Tokenizer::new();
+
+        index.add_document(1, 0, &tok.tokenize("alpine solo"));
+        index.add_document(2, 0, &tok.tokenize("alpha world"));
+        index.add_document(3, 0, &tok.tokenize("world"));
+        let terms_before = indexed_terms(&index);
+        let prefix_terms_before = indexed_prefix_terms(&index, 4);
+
+        index.remove_document(1);
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5PostingPruneStructure {
+                    terms_before,
+                    terms_after: indexed_terms(&index),
+                    prefix_terms_before,
+                    prefix_terms_after: indexed_prefix_terms(&index, 4),
+                    remaining_docs_for_alpha: posting_docids(index.get_postings("alpha")),
+                    remaining_docs_for_world: posting_docids(index.get_postings("world")),
+                }
+            ),
+            r#"Fts5PostingPruneStructure {
+    terms_before: [
+        "alpha",
+        "alpine",
+        "solo",
+        "world",
+    ],
+    terms_after: [
+        "alpha",
+        "world",
+    ],
+    prefix_terms_before: [
+        "alph",
+        "alpi",
+        "solo",
+        "worl",
+    ],
+    prefix_terms_after: [
+        "alph",
+        "worl",
+    ],
+    remaining_docs_for_alpha: [
+        2,
+    ],
+    remaining_docs_for_world: [
+        2,
+        3,
+    ],
+}"#
+        );
     }
 
     #[test]
@@ -3616,6 +12081,410 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_table_search_column_filter_set_and_negative() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec![
+            "title".to_owned(),
+            "body".to_owned(),
+            "tag".to_owned(),
+        ]);
+        table.insert_document(
+            1,
+            &[
+                "rust title".to_owned(),
+                "plain body".to_owned(),
+                "meta tag".to_owned(),
+            ],
+        );
+        table.insert_document(
+            2,
+            &[
+                "plain title".to_owned(),
+                "rust body".to_owned(),
+                "meta tag".to_owned(),
+            ],
+        );
+        table.insert_document(
+            3,
+            &[
+                "plain title".to_owned(),
+                "plain body".to_owned(),
+                "rust tag".to_owned(),
+            ],
+        );
+
+        let mut braced_matches: Vec<i64> = table
+            .search("{title body}:rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        braced_matches.sort_unstable();
+        assert_eq!(braced_matches, vec![1, 2]);
+
+        let mut negative_matches: Vec<i64> = table
+            .search("- tag : rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        negative_matches.sort_unstable();
+        assert_eq!(negative_matches, vec![1, 2]);
+
+        let mut complement_matches: Vec<i64> = table
+            .search("- {title body}: rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        complement_matches.sort_unstable();
+        assert_eq!(complement_matches, vec![3]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_table_search_invalid_column_filter_set() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["title".to_owned(), "body".to_owned()]);
+        table.insert_document(1, &["Rust title".to_owned(), "plain body".to_owned()]);
+
+        let Err(error) = table.search("{title summary}:rust") else {
+            return Err("unknown column inside a set should fail".to_owned());
+        };
+        assert_eq!(
+            error,
+            Fts5QueryError::InvalidColumnFilter("summary".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_table_search_phrase_concatenation() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["one two three".to_owned()]);
+        table.insert_document(2, &["one gap two three".to_owned()]);
+
+        let matches = table
+            .search(r#""one two" + three"#)
+            .map_err(|err| err.to_string())?;
+        assert_eq!(
+            matches
+                .into_iter()
+                .map(|(rowid, _score)| rowid)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_table_search_phrase_concatenation_final_prefix() -> std::result::Result<(), String>
+    {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["one two three".to_owned()]);
+        table.insert_document(2, &["one two throne".to_owned()]);
+        table.insert_document(3, &["one two four".to_owned()]);
+
+        let mut matches = table
+            .search("one + two + thr*")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        assert_eq!(matches, vec![1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_query_tight_phrase_concatenation() -> std::result::Result<(), String> {
+        let tokens = parse_fts5_query("one+two").map_err(|err| err.to_string())?;
+        assert_eq!(
+            tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
+            vec![
+                Fts5QueryTokenKind::Term,
+                Fts5QueryTokenKind::Plus,
+                Fts5QueryTokenKind::Term,
+            ]
+        );
+        assert!(matches!(
+            build_expr(&tokens).map_err(|err| err.to_string())?,
+            Fts5Expr::Phrase(_)
+        ));
+
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["one two".to_owned()]);
+        table.insert_document(2, &["one gap two".to_owned()]);
+
+        assert_eq!(search_rowids(&table, "one+two")?, vec![1]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_tight_phrase_concatenation() -> std::result::Result<(), String>
+    {
+        let mut table = Fts5Table::with_columns(vec!["title".to_owned(), "body".to_owned()]);
+        table.insert_document(1, &["one two".to_owned(), "plain body".to_owned()]);
+        table.insert_document(2, &["one gap two".to_owned(), "one two".to_owned()]);
+        table.insert_document(3, &["plain title".to_owned(), "one gap two".to_owned()]);
+
+        let query = "one+two";
+        let tokens = parse_fts5_query(query)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|token| (token.kind, token.lexeme))
+            .collect::<Vec<_>>();
+        let expr = build_expr(&parse_fts5_query(query).map_err(|err| err.to_string())?)
+            .map_err(|err| err.to_string())?;
+        let mut adjacent_matches = search_rowids(&table, query)?;
+        adjacent_matches.sort_unstable();
+        let mut separated_matches = search_rowids(&table, r#""one gap two""#)?;
+        separated_matches.sort_unstable();
+        let mut column_filtered_matches = search_rowids(&table, "title:one+two")?;
+        column_filtered_matches.sort_unstable();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5TightPhraseConcatStructure {
+                    tokens,
+                    expr,
+                    adjacent_matches,
+                    separated_matches,
+                    column_filtered_matches,
+                }
+            ),
+            r#"Fts5TightPhraseConcatStructure {
+    tokens: [
+        (
+            Term,
+            "one",
+        ),
+        (
+            Plus,
+            "+",
+        ),
+        (
+            Term,
+            "two",
+        ),
+    ],
+    expr: Phrase(
+        [
+            "one",
+            "two",
+        ],
+    ),
+    adjacent_matches: [
+        1,
+        2,
+    ],
+    separated_matches: [
+        2,
+        3,
+    ],
+    column_filtered_matches: [
+        1,
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_phrase_concatenation() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["one two three".to_owned()]);
+        table.insert_document(2, &["one gap two three".to_owned()]);
+        table.insert_document(3, &["one two throne".to_owned()]);
+
+        let exact_query = r#""one two" + three"#;
+        let prefix_query = "one + two + thr*";
+        let tokens = parse_fts5_query(exact_query)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|token| (token.kind, token.lexeme))
+            .collect();
+        let exact_expr = build_expr(&parse_fts5_query(exact_query).map_err(|err| err.to_string())?)
+            .map_err(|err| err.to_string())?;
+        let prefix_expr =
+            build_expr(&parse_fts5_query(prefix_query).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())?;
+        let exact_matches = table
+            .search(exact_query)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let mut prefix_matches = table
+            .search(prefix_query)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect::<Vec<_>>();
+        prefix_matches.sort_unstable();
+        let Err(malformed_error) =
+            build_expr(&parse_fts5_query("one +").map_err(|err| err.to_string())?)
+        else {
+            return Err("dangling phrase concatenation should fail".to_owned());
+        };
+        let malformed_error = malformed_error.to_string();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5PhraseConcatStructure {
+                    tokens,
+                    exact_expr,
+                    prefix_expr,
+                    exact_matches,
+                    prefix_matches,
+                    malformed_error,
+                }
+            ),
+            r#"Fts5PhraseConcatStructure {
+    tokens: [
+        (
+            Phrase,
+            "one two",
+        ),
+        (
+            Plus,
+            "+",
+        ),
+        (
+            Term,
+            "three",
+        ),
+    ],
+    exact_expr: Phrase(
+        [
+            "one",
+            "two",
+            "three",
+        ],
+    ),
+    prefix_expr: PhrasePrefix(
+        [
+            "one",
+            "two",
+        ],
+        "thr",
+    ),
+    exact_matches: [
+        1,
+    ],
+    prefix_matches: [
+        1,
+        3,
+    ],
+    malformed_error: "invalid phrase syntax",
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_column_filter_sets() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec![
+            "title".to_owned(),
+            "body".to_owned(),
+            "tag".to_owned(),
+        ]);
+        table.insert_document(
+            1,
+            &[
+                "rust title".to_owned(),
+                "plain body".to_owned(),
+                "meta tag".to_owned(),
+            ],
+        );
+        table.insert_document(
+            2,
+            &[
+                "plain title".to_owned(),
+                "rust body".to_owned(),
+                "meta tag".to_owned(),
+            ],
+        );
+        table.insert_document(
+            3,
+            &[
+                "plain title".to_owned(),
+                "plain body".to_owned(),
+                "rust tag".to_owned(),
+            ],
+        );
+
+        let tokens = parse_fts5_query("- {title body}: rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|token| (token.kind, token.lexeme))
+            .collect();
+        let mut braced_matches: Vec<i64> = table
+            .search("{title body}:rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        braced_matches.sort_unstable();
+        let mut negative_matches: Vec<i64> = table
+            .search("- tag : rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        negative_matches.sort_unstable();
+        let mut complement_matches: Vec<i64> = table
+            .search("- {title body}: rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        complement_matches.sort_unstable();
+        let Err(invalid_error) = table.search("{title missing}:rust") else {
+            return Err("unknown column inside a set should fail".to_owned());
+        };
+        let invalid_error = invalid_error.to_string();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5ColumnFilterSetStructure {
+                    tokens,
+                    braced_matches,
+                    negative_matches,
+                    complement_matches,
+                    invalid_error,
+                }
+            ),
+            r#"Fts5ColumnFilterSetStructure {
+    tokens: [
+        (
+            ColumnFilter,
+            "-{title,body}",
+        ),
+        (
+            Term,
+            "rust",
+        ),
+    ],
+    braced_matches: [
+        1,
+        2,
+    ],
+    negative_matches: [
+        1,
+        2,
+    ],
+    complement_matches: [
+        3,
+    ],
+    invalid_error: "invalid column filter: missing",
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_fts5_table_detail_column_rejects_offset_queries() {
         let cx = Cx::new();
         let mut table = Fts5Table::connect(
@@ -3717,24 +12586,130 @@ mod tests {
                 "body UNINDEXED",
                 "tokenize='porter'",
                 "content=''",
-                "contentless_delete=1",
+                "contentless_unindexed=1",
                 "columnsize=0",
                 "detail='column'",
                 "prefix='2 3'",
+                "insttoken=1",
+                "locale=1",
+                "tokendata=1",
             ],
         )
         .unwrap();
         assert_eq!(vtab.columns(), &["title", "body"]);
         assert_eq!(vtab.tokenizer_name, "porter");
         assert_eq!(vtab.config.content_mode(), ContentMode::Contentless);
-        assert!(vtab.config.contentless_delete_enabled());
+        assert!(vtab.config.contentless_unindexed_enabled());
         assert!(!vtab.config.columnsize_enabled());
         assert_eq!(vtab.config.detail_mode(), DetailMode::Column);
+        assert!(vtab.config.insttoken_enabled());
+        assert!(vtab.config.locale_enabled());
+        assert!(vtab.config.tokendata_enabled());
+        assert_eq!(vtab.indexed_columns(), &[true, false]);
         assert_eq!(vtab.prefix_lengths, vec![2, 3]);
         assert!(!vtab.index().tracks_column_sizes());
         assert_eq!(vtab.index().detail_mode(), DetailMode::Column);
         assert!(vtab.index().tracks_prefix_length(2));
         assert!(vtab.index().tracks_prefix_length(3));
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_reserved_column_names() {
+        let cx = Cx::new();
+        for (column, expected) in [
+            ("rowid", "column name 'rowid' is reserved"),
+            ("Rank", "column name 'rank' is reserved"),
+        ] {
+            let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", column])
+                .expect_err("reserved column name should fail");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_column_matching_table_name() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "Docs"])
+            .expect_err("column matching table name should fail");
+        assert!(
+            err.to_string()
+                .contains("column name 'Docs' conflicts with table name")
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_duplicate_column_names() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "\"Title\""])
+            .expect_err("duplicate column name should fail");
+        assert!(
+            err.to_string()
+                .contains("fts5: duplicate column name 'Title'")
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_schema_column_validation() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "mail",
+                "sender",
+                "\"subject\" UNINDEXED",
+                "body COLLATE nocase",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+
+        let structure = table_structure(&table);
+        assert_eq!(
+            format!("{structure:#?}"),
+            r#"Fts5TableStructure {
+    columns: [
+        Fts5ColumnStructure {
+            name: "sender",
+            indexed: true,
+        },
+        Fts5ColumnStructure {
+            name: "subject",
+            indexed: false,
+        },
+        Fts5ColumnStructure {
+            name: "body",
+            indexed: true,
+        },
+    ],
+    rows: [],
+    terms: [],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_accepts_valid_contentless_delete() {
+        let cx = Cx::new();
+        let vtab = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "body",
+                "content=''",
+                "contentless_delete=1",
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(vtab.config.content_mode(), ContentMode::Contentless);
+        assert!(vtab.config.contentless_delete_enabled());
     }
 
     #[test]
@@ -3746,11 +12721,137 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_tokenizer_spec() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "body",
+                "tokenize='trigram case_sensitive 1 remove_diacritics 1'",
+            ],
+        )
+        .expect_err("invalid tokenizer should fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported tokenizer specification")
+        );
+    }
+
+    #[test]
     fn test_fts5_vtab_connect_rejects_invalid_columnsize() {
         let cx = Cx::new();
         let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "columnsize=2"])
             .expect_err("invalid columnsize should fail");
         assert!(err.to_string().contains("columnsize must be 0 or 1"));
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_contentless_unindexed() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "content=''",
+                "contentless_unindexed=true",
+            ],
+        )
+        .expect_err("invalid contentless_unindexed should fail");
+        assert!(
+            err.to_string()
+                .contains("contentless_unindexed must be 0 or 1")
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_contentless_delete() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "content=''",
+                "contentless_delete=maybe",
+            ],
+        )
+        .expect_err("invalid contentless_delete should fail");
+        assert!(
+            err.to_string()
+                .contains("contentless_delete must be 0 or 1")
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_secure_delete() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "secure-delete=maybe"],
+        )
+        .expect_err("invalid secure-delete should fail");
+        assert!(
+            err.to_string()
+                .contains("secure_delete must be a boolean value")
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_contentless_delete_on_stored_table() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "contentless_delete=1"],
+        )
+        .expect_err("contentless_delete should require contentless mode");
+        assert!(
+            err.to_string()
+                .contains("contentless_delete=1 requires a contentless table")
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_contentless_delete_columnsize_zero() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "content=''",
+                "contentless_delete=1",
+                "columnsize=0",
+            ],
+        )
+        .expect_err("contentless_delete should reject columnsize=0");
+        assert!(
+            err.to_string()
+                .contains("contentless_delete=1 is incompatible with columnsize=0")
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_contentless_unindexed_on_stored_table() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "contentless_unindexed=1"],
+        )
+        .expect_err("contentless_unindexed should require contentless mode");
+        assert!(
+            err.to_string()
+                .contains("contentless_unindexed=1 requires a contentless table")
+        );
     }
 
     #[test]
@@ -3798,6 +12899,969 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_insttoken() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "insttoken=maybe"])
+            .expect_err("invalid insttoken should fail");
+        assert!(
+            err.to_string()
+                .contains("insttoken must be a boolean value")
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_locale() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "locale=true"])
+            .expect_err("invalid locale should fail");
+        assert!(err.to_string().contains("locale must be 0 or 1"));
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_tokendata() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "tokendata=true"])
+            .expect_err("invalid tokendata should fail");
+        assert!(err.to_string().contains("tokendata must be 0 or 1"));
+    }
+
+    #[test]
+    fn test_fts5_vtab_unindexed_column_is_stored_but_not_searched()
+    -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut vtab =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "uuid UNINDEXED"])
+                .map_err(|err| err.to_string())?;
+        vtab.insert_document(1, &["rust guide".to_owned(), "uuidonly".to_owned()]);
+
+        assert_eq!(vtab.indexed_columns(), &[true, false]);
+        let stored = vtab
+            .get_document(1)
+            .ok_or_else(|| "row should be stored".to_owned())?;
+        assert_eq!(stored.first().map(String::as_str), Some("rust guide"));
+        assert_eq!(stored.get(1).map(String::as_str), Some("uuidonly"));
+
+        let title_results = vtab.search("rust").map_err(|err| err.to_string())?;
+        assert_eq!(title_results.len(), 1);
+        assert_eq!(title_results.first().map(|(rowid, _)| *rowid), Some(1));
+        assert!(
+            vtab.search("uuidonly")
+                .map_err(|err| err.to_string())?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_contentless_hides_all_column_values() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut vtab = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "uuid UNINDEXED",
+                "content=''",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        vtab.insert_document(1, &["rust guide".to_owned(), "uuidonly".to_owned()]);
+
+        assert_eq!(
+            vtab.get_document(1)
+                .ok_or_else(|| "row should be stored".to_owned())?,
+            &["".to_owned(), "".to_owned()]
+        );
+        assert_eq!(
+            vtab.search("rust")
+                .map_err(|err| err.to_string())?
+                .first()
+                .map(|(rowid, _score)| *rowid),
+            Some(1)
+        );
+        assert!(
+            vtab.search("uuidonly")
+                .map_err(|err| err.to_string())?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_contentless_unindexed_keeps_only_unindexed_values()
+    -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut vtab = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "uuid UNINDEXED",
+                "content=''",
+                "contentless_unindexed=1",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        vtab.insert_document(1, &["rust guide".to_owned(), "uuidonly".to_owned()]);
+
+        assert_eq!(
+            vtab.get_document(1)
+                .ok_or_else(|| "row should be stored".to_owned())?,
+            &["".to_owned(), "uuidonly".to_owned()]
+        );
+        assert_eq!(
+            vtab.search("rust")
+                .map_err(|err| err.to_string())?
+                .first()
+                .map(|(rowid, _score)| *rowid),
+            Some(1)
+        );
+        assert!(
+            vtab.search("uuidonly")
+                .map_err(|err| err.to_string())?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_contentless_update_rejects_without_toggle() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "content=''"])
+            .map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(9),
+                    SqliteValue::Text(SmallText::from_string("stable token")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+
+        let err = table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Integer(9),
+                    SqliteValue::Integer(9),
+                    SqliteValue::Text(SmallText::from_string("replacement token")),
+                ],
+            )
+            .map_err(|err| err.to_string())
+            .expect_err("contentless update should require contentless_delete=1");
+
+        assert!(err.contains("cannot update contentless table without contentless_delete=1"));
+        assert_eq!(search_rowids(&table, "stable")?, vec![9]);
+        assert!(search_rowids(&table, "replacement")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_contentless_unindexed() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "uuid UNINDEXED",
+                "content=''",
+                "contentless_unindexed=1",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(7, &["rust guide".to_owned(), "uuidonly".to_owned()]);
+
+        let indexed_matches = table
+            .search("rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let unindexed_matches = table
+            .search("uuidonly")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5ContentlessUnindexedStructure {
+                    config: *table.config(),
+                    indexed_columns: table.indexed_columns().to_vec(),
+                    rows: table.all_rows(),
+                    indexed_matches,
+                    unindexed_matches,
+                }
+            ),
+            r#"Fts5ContentlessUnindexedStructure {
+    config: Fts5Config {
+        secure_delete: false,
+        content_mode: Contentless,
+        contentless_delete: false,
+        contentless_unindexed: true,
+        columnsize: true,
+        detail: Full,
+        insttoken: false,
+        locale: false,
+        tokendata: false,
+    },
+    indexed_columns: [
+        true,
+        false,
+    ],
+    rows: [
+        (
+            7,
+            [
+                "",
+                "uuidonly",
+            ],
+        ),
+    ],
+    indexed_matches: [
+        7,
+    ],
+    unindexed_matches: [],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_contentless_update_mode() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut reject_table =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "content=''"])
+                .map_err(|err| err.to_string())?;
+        reject_table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(3),
+                    SqliteValue::Text(SmallText::from_string("old token")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        let reject_error = reject_table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Integer(3),
+                    SqliteValue::Integer(3),
+                    SqliteValue::Text(SmallText::from_string("new token")),
+                ],
+            )
+            .map_err(|err| err.to_string())
+            .expect_err("contentless update should fail without contentless_delete=1");
+
+        let mut update_table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "body",
+                "content=''",
+                "contentless_delete=1",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        update_table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(4),
+                    SqliteValue::Text(SmallText::from_string("old token")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        update_table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Integer(4),
+                    SqliteValue::Integer(4),
+                    SqliteValue::Text(SmallText::from_string("new token")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5ContentlessUpdateStructure {
+                    reject_error,
+                    rows_after_reject: reject_table.all_rows(),
+                    matches_after_reject: search_rowids(&reject_table, "old OR new")?,
+                    updated_rows: update_table.all_rows(),
+                    updated_old_matches: search_rowids(&update_table, "old")?,
+                    updated_new_matches: search_rowids(&update_table, "new")?,
+                }
+            ),
+            r#"Fts5ContentlessUpdateStructure {
+    reject_error: "fts5: cannot update contentless table without contentless_delete=1",
+    rows_after_reject: [
+        (
+            3,
+            [
+                "",
+            ],
+        ),
+    ],
+    matches_after_reject: [
+        3,
+    ],
+    updated_rows: [
+        (
+            4,
+            [
+                "",
+            ],
+        ),
+    ],
+    updated_old_matches: [],
+    updated_new_matches: [
+        4,
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_vtab_unindexed_column_filter_returns_no_matches() -> std::result::Result<(), String>
+    {
+        let cx = Cx::new();
+        let mut vtab =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body UNINDEXED"])
+                .map_err(|err| err.to_string())?;
+        vtab.insert_document(1, &["plain title".to_owned(), "rust body".to_owned()]);
+
+        assert!(
+            vtab.search("body:rust")
+                .map_err(|err| err.to_string())?
+                .is_empty()
+        );
+        let title_results = vtab.search("title:plain").map_err(|err| err.to_string())?;
+        assert_eq!(title_results.first().map(|(rowid, _)| *rowid), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_unknown_column_option() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title INDEXED"])
+            .err()
+            .ok_or_else(|| "unsupported column option should fail".to_owned())?;
+        assert!(err.to_string().contains("unsupported column option"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_unindexed_columns() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "uuid UNINDEXED", "body"],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(
+            1,
+            &[
+                "Rust guide".to_owned(),
+                "uuidonly".to_owned(),
+                "systems language".to_owned(),
+            ],
+        );
+        table.insert_document(
+            2,
+            &[
+                "Search guide".to_owned(),
+                "secretmarker".to_owned(),
+                "query language".to_owned(),
+            ],
+        );
+
+        assert_eq!(
+            format!("{:#?}", table_structure(&table)),
+            r#"Fts5TableStructure {
+    columns: [
+        Fts5ColumnStructure {
+            name: "title",
+            indexed: true,
+        },
+        Fts5ColumnStructure {
+            name: "uuid",
+            indexed: false,
+        },
+        Fts5ColumnStructure {
+            name: "body",
+            indexed: true,
+        },
+    ],
+    rows: [
+        (
+            1,
+            [
+                "Rust guide",
+                "uuidonly",
+                "systems language",
+            ],
+        ),
+        (
+            2,
+            [
+                "Search guide",
+                "secretmarker",
+                "query language",
+            ],
+        ),
+    ],
+    terms: [
+        Fts5TermStructure {
+            term: "guide",
+            postings: [
+                Fts5PostingStructure {
+                    docid: 1,
+                    column: 0,
+                    positions: [
+                        1,
+                    ],
+                },
+                Fts5PostingStructure {
+                    docid: 2,
+                    column: 0,
+                    positions: [
+                        1,
+                    ],
+                },
+            ],
+        },
+        Fts5TermStructure {
+            term: "language",
+            postings: [
+                Fts5PostingStructure {
+                    docid: 1,
+                    column: 2,
+                    positions: [
+                        1,
+                    ],
+                },
+                Fts5PostingStructure {
+                    docid: 2,
+                    column: 2,
+                    positions: [
+                        1,
+                    ],
+                },
+            ],
+        },
+        Fts5TermStructure {
+            term: "query",
+            postings: [
+                Fts5PostingStructure {
+                    docid: 2,
+                    column: 2,
+                    positions: [
+                        0,
+                    ],
+                },
+            ],
+        },
+        Fts5TermStructure {
+            term: "rust",
+            postings: [
+                Fts5PostingStructure {
+                    docid: 1,
+                    column: 0,
+                    positions: [
+                        0,
+                    ],
+                },
+            ],
+        },
+        Fts5TermStructure {
+            term: "search",
+            postings: [
+                Fts5PostingStructure {
+                    docid: 2,
+                    column: 0,
+                    positions: [
+                        0,
+                    ],
+                },
+            ],
+        },
+        Fts5TermStructure {
+            term: "systems",
+            postings: [
+                Fts5PostingStructure {
+                    docid: 1,
+                    column: 2,
+                    positions: [
+                        0,
+                    ],
+                },
+            ],
+        },
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_insttoken() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "insttoken=1"])
+            .map_err(|err| err.to_string())?;
+        table.insert_document(7, &["prefix present precise".to_owned()]);
+
+        let mut terms: Vec<String> = table.index.index.keys().map(ToString::to_string).collect();
+        terms.sort();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5InsttokenStructure {
+                    config: *table.config(),
+                    columns: table.columns().to_vec(),
+                    rows: table.all_rows(),
+                    terms,
+                }
+            ),
+            r#"Fts5InsttokenStructure {
+    config: Fts5Config {
+        secure_delete: false,
+        content_mode: Stored,
+        contentless_delete: false,
+        contentless_unindexed: false,
+        columnsize: true,
+        detail: Full,
+        insttoken: true,
+        locale: false,
+        tokendata: false,
+    },
+    columns: [
+        "body",
+    ],
+    rows: [
+        (
+            7,
+            [
+                "prefix present precise",
+            ],
+        ),
+    ],
+    terms: [
+        "precise",
+        "prefix",
+        "present",
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_locale() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "locale=1"])
+            .map_err(|err| err.to_string())?;
+        table.insert_document(11, &["cafe creme".to_owned()]);
+
+        let mut terms: Vec<String> = table.index.index.keys().map(ToString::to_string).collect();
+        terms.sort();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5LocaleStructure {
+                    config: *table.config(),
+                    columns: table.columns().to_vec(),
+                    rows: table.all_rows(),
+                    terms,
+                }
+            ),
+            r#"Fts5LocaleStructure {
+    config: Fts5Config {
+        secure_delete: false,
+        content_mode: Stored,
+        contentless_delete: false,
+        contentless_unindexed: false,
+        columnsize: true,
+        detail: Full,
+        insttoken: false,
+        locale: true,
+        tokendata: false,
+    },
+    columns: [
+        "body",
+    ],
+    rows: [
+        (
+            11,
+            [
+                "cafe creme",
+            ],
+        ),
+    ],
+    terms: [
+        "cafe",
+        "creme",
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_locale_blob_storage() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "locale=1"])
+            .map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(29),
+                    SqliteValue::Blob(encode_fts5_locale_blob("tr_TR", "Istanbul").into()),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+
+        let matches = table
+            .search("istanbul")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let actual = format!(
+            "{:#?}",
+            Fts5LocaleBlobStorageStructure {
+                config: *table.config(),
+                indexed_columns: table.indexed_columns().to_vec(),
+                rows: table.all_rows(),
+                locales: table.all_locales(),
+                matches,
+            }
+        );
+        let expected = r#"Fts5LocaleBlobStorageStructure {
+    config: Fts5Config {
+        secure_delete: false,
+        content_mode: Stored,
+        contentless_delete: false,
+        contentless_unindexed: false,
+        columnsize: true,
+        detail: Full,
+        insttoken: false,
+        locale: true,
+        tokendata: false,
+    },
+    indexed_columns: [
+        true,
+    ],
+    rows: [
+        (
+            29,
+            [
+                "Istanbul",
+            ],
+        ),
+    ],
+    locales: [
+        (
+            29,
+            0,
+            "tr_TR",
+        ),
+    ],
+    matches: [
+        29,
+    ],
+}"#;
+        assert!(actual.as_bytes().eq(expected.as_bytes()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_vtab_update_rejects_locale_blob_without_locale_option() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"]).unwrap();
+
+        let err = table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(41),
+                    SqliteValue::Blob(encode_fts5_locale_blob("en_US", "hello").into()),
+                ],
+            )
+            .expect_err("fts5_locale blob must require locale=1");
+
+        assert!(err.to_string().contains("fts5_locale() requires locale=1"));
+        assert!(table.get_document(41).is_none());
+        assert!(table.search("hello").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_fts5_locale_value_returns_text_or_null() {
+        let cx = Cx::new();
+        let mut table =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "locale=1"]).unwrap();
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(5),
+                    SqliteValue::Blob(encode_fts5_locale_blob("en_US", "hello").into()),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            table.locale_value(5, 0),
+            SqliteValue::Text(SmallText::from_string("en_US"))
+        );
+        assert_eq!(table.locale_value(5, 1), SqliteValue::Null);
+
+        let mut no_locale_table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        no_locale_table.insert_document(5, &["hello".to_owned()]);
+        assert_eq!(no_locale_table.locale_value(5, 0), SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_locale_unindexed_discard() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "body",
+                "external_id UNINDEXED",
+                "locale=1",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(43),
+                    SqliteValue::Blob(encode_fts5_locale_blob("en_US", "localized body").into()),
+                    SqliteValue::Blob(encode_fts5_locale_blob("fr_FR", "secret marker").into()),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+
+        let indexed_matches = table
+            .search("localized")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let unindexed_matches = table
+            .search("secret")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let actual = format!(
+            "{:#?}",
+            Fts5LocaleUnindexedDiscardStructure {
+                indexed_columns: table.indexed_columns().to_vec(),
+                rows: table.all_rows(),
+                locales: table.all_locales(),
+                indexed_matches,
+                unindexed_matches,
+            }
+        );
+        let expected = r#"Fts5LocaleUnindexedDiscardStructure {
+    indexed_columns: [
+        true,
+        false,
+    ],
+    rows: [
+        (
+            43,
+            [
+                "localized body",
+                "secret marker",
+            ],
+        ),
+    ],
+    locales: [
+        (
+            43,
+            0,
+            "en_US",
+        ),
+    ],
+    indexed_matches: [
+        43,
+    ],
+    unindexed_matches: [],
+}"#;
+        assert!(actual.as_bytes().eq(expected.as_bytes()));
+        assert_eq!(table.locale_value(43, 1), SqliteValue::Null);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_tokendata() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "tokendata=1"])
+            .map_err(|err| err.to_string())?;
+        table.insert_document_owned_with_tokenizer(
+            17,
+            vec!["alpha beta".to_owned()],
+            &TokendataTestTokenizer,
+        );
+
+        let mut terms: Vec<String> = table.index.index.keys().map(ToString::to_string).collect();
+        terms.sort();
+        let matches = table
+            .search("alpha")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5TokendataStructure {
+                    config: *table.config(),
+                    terms,
+                    rows: table.all_rows(),
+                    matches,
+                }
+            ),
+            r#"Fts5TokendataStructure {
+    config: Fts5Config {
+        secure_delete: false,
+        content_mode: Stored,
+        contentless_delete: false,
+        contentless_unindexed: false,
+        columnsize: true,
+        detail: Full,
+        insttoken: false,
+        locale: false,
+        tokendata: true,
+    },
+    terms: [
+        "alpha",
+        "beta",
+    ],
+    rows: [
+        (
+            17,
+            [
+                "alpha beta",
+            ],
+        ),
+    ],
+    matches: [
+        17,
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_trigram_case_sensitive() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "tri",
+                "body",
+                "tokenize='trigram case_sensitive 1'",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["ABC".to_owned()]);
+        table.insert_document(2, &["abc".to_owned()]);
+
+        let mut terms: Vec<String> = table.index.index.keys().map(ToString::to_string).collect();
+        terms.sort();
+        let upper_matches = table
+            .search("ABC")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let lower_matches = table
+            .search("abc")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+
+        let actual = format!(
+            "{:#?}",
+            Fts5TrigramCaseSensitiveStructure {
+                tokenizer: table.tokenizer_name.clone(),
+                terms,
+                rows: table.all_rows(),
+                upper_matches,
+                lower_matches,
+            }
+        );
+        let expected = r#"Fts5TrigramCaseSensitiveStructure {
+    tokenizer: "trigram case_sensitive 1",
+    terms: [
+        "ABC",
+        "abc",
+    ],
+    rows: [
+        (
+            1,
+            [
+                "ABC",
+            ],
+        ),
+        (
+            2,
+            [
+                "abc",
+            ],
+        ),
+    ],
+    upper_matches: [
+        1,
+    ],
+    lower_matches: [
+        2,
+    ],
+}"#;
+        assert!(actual.as_bytes().eq(expected.as_bytes()));
+        Ok(())
+    }
+
+    #[test]
     fn test_fts5_vtab_update_insert() {
         let cx = Cx::new();
         let mut vtab = Fts5Table::connect(&cx, &["fts5", "main", "t", "content"]).unwrap();
@@ -3814,6 +13878,80 @@ mod tests {
             .unwrap();
         assert_eq!(result, Some(1));
         assert!(vtab.get_document(1).is_some());
+    }
+
+    #[test]
+    fn test_fts5_vtab_metadata_declares_owned_shadow_tables() {
+        let metadata = Fts5Table::module_metadata(&["fts5", "main", "docs", "body"]);
+        assert!(metadata.owns_shadow_tables);
+        assert_eq!(
+            metadata.lifecycle,
+            VtabLifecyclePolicy::SeparateCreateAndConnect
+        );
+        assert_eq!(metadata.integrity, VtabIntegrityPolicy::ShadowAware);
+
+        for shadow_name in [
+            "docs_data",
+            "docs_idx",
+            "docs_config",
+            "docs_content",
+            "docs_docsize",
+        ] {
+            let policy = Fts5Table::shadow_table_policy("docs", shadow_name);
+            assert!(policy.is_shadow(), "{shadow_name} should be FTS5-owned");
+            assert!(
+                !policy.allows_direct_dml(),
+                "{shadow_name} should reject user-authored DML"
+            );
+            assert!(
+                !policy.allows_schema_ddl(),
+                "{shadow_name} should reject user-authored DDL/trigger changes"
+            );
+            assert!(
+                policy.allows_module_internal_write(),
+                "{shadow_name} should allow FTS5-owned internal writes"
+            );
+        }
+
+        let ordinary_policy = Fts5Table::shadow_table_policy("docs", "docs_segments");
+        assert!(!ordinary_policy.is_shadow());
+        assert!(ordinary_policy.allows_direct_dml());
+        assert!(ordinary_policy.allows_schema_ddl());
+        assert!(!Fts5Table::shadow_table_policy("docs", "other_data").is_shadow());
+    }
+
+    #[test]
+    fn test_fts5_vtab_update_decodes_locale_blob() {
+        let cx = Cx::new();
+        let mut vtab =
+            Fts5Table::connect(&cx, &["fts5", "main", "t", "content", "locale=1"]).unwrap();
+
+        let result = vtab
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(7),
+                    SqliteValue::Blob(encode_fts5_locale_blob("tr_TR", "Istanbul").into()),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(result, Some(7));
+        assert_eq!(
+            vtab.get_document(7)
+                .and_then(|columns| columns.first())
+                .map(String::as_str),
+            Some("Istanbul")
+        );
+        assert!(matches!(vtab.get_locale(7, 0), Some("tr_TR")));
+        assert_eq!(
+            vtab.search("istanbul")
+                .unwrap()
+                .first()
+                .map(|(rowid, _score)| *rowid),
+            Some(7)
+        );
     }
 
     #[test]
@@ -3849,6 +13987,602 @@ mod tests {
     }
 
     #[test]
+    fn test_highlight_scalar_func_matches_prefix_query_tokens() {
+        let func = Fts5HighlightFunc;
+        let result = func
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("pre prefix prevent post")),
+                SqliteValue::Text(SmallText::from_string("pre*")),
+                SqliteValue::Text(SmallText::from_string("<b>")),
+                SqliteValue::Text(SmallText::from_string("</b>")),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string(
+                "<b>pre</b> <b>prefix</b> <b>prevent</b> post"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_highlight_scalar_func_preserves_phrase_span() -> std::result::Result<(), String> {
+        let func = Fts5HighlightFunc;
+        let result = func
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("alpha beta gamma")),
+                SqliteValue::Text(SmallText::from_string(r#""alpha beta""#)),
+                SqliteValue::Text(SmallText::from_string("<b>")),
+                SqliteValue::Text(SmallText::from_string("</b>")),
+            ])
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string("<b>alpha beta</b> gamma"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_snippet_scalar_func_matches_phrase_prefix_query() {
+        let func = Fts5SnippetFunc;
+        let result = func
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("alpha one two threefold omega")),
+                SqliteValue::Text(SmallText::from_string("one + two + thr*")),
+                SqliteValue::Text(SmallText::from_string("[")),
+                SqliteValue::Text(SmallText::from_string("]")),
+                SqliteValue::Text(SmallText::from_string("...")),
+                SqliteValue::Integer(4),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string("alpha [one two threefold]..."))
+        );
+    }
+
+    #[test]
+    fn test_snippet_scalar_func_selects_densest_query_window() -> std::result::Result<(), String> {
+        let func = Fts5SnippetFunc;
+        let result = func
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("alpha one gap gap two three omega")),
+                SqliteValue::Text(SmallText::from_string("one OR two OR three")),
+                SqliteValue::Text(SmallText::from_string("[")),
+                SqliteValue::Text(SmallText::from_string("]")),
+                SqliteValue::Text(SmallText::from_string("...")),
+                SqliteValue::Integer(3),
+            ])
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string("...gap [two] [three]..."))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_highlight_prefix_terms() {
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5HighlightPrefixStructure {
+                    parsed_terms: highlight_terms_from_query_text("one + two + thr*"),
+                    prefix_highlight: highlight_with_terms(
+                        "pre prefix prevent post",
+                        &highlight_terms_from_query_text("pre*"),
+                        "<b>",
+                        "</b>",
+                    ),
+                    phrase_prefix_snippet: snippet_with_terms(
+                        "alpha one two threefold omega",
+                        &highlight_terms_from_query_text("one + two + thr*"),
+                        "[",
+                        "]",
+                        "...",
+                        4,
+                    ),
+                    fallback_prefix_highlight: highlight_with_terms(
+                        "prelude prefix other",
+                        &highlight_terms_from_query_text("(pre*"),
+                        "<i>",
+                        "</i>",
+                    ),
+                    exact_highlight: highlight(
+                        "prefix prevent pre",
+                        &["pre".to_owned()],
+                        "<b>",
+                        "</b>",
+                    ),
+                }
+            ),
+            r#"Fts5HighlightPrefixStructure {
+    parsed_terms: [
+        Fts5HighlightTerm {
+            term: "one",
+            prefix: false,
+        },
+        Fts5HighlightTerm {
+            term: "two",
+            prefix: false,
+        },
+        Fts5HighlightTerm {
+            term: "thr",
+            prefix: true,
+        },
+    ],
+    prefix_highlight: "<b>pre</b> <b>prefix</b> <b>prevent</b> post",
+    phrase_prefix_snippet: "alpha [one] [two] [threefold]...",
+    fallback_prefix_highlight: "<i>prelude</i> <i>prefix</i> other",
+    exact_highlight: "prefix prevent <b>pre</b>",
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_phrase_highlight_spans() {
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5PhraseSpanStructure {
+                    phrase_patterns: highlight_patterns_from_query_text(r#""alpha beta" OR gam*"#),
+                    rendered_phrase: highlight_with_patterns(
+                        "alpha beta gamma",
+                        &highlight_patterns_from_query_text(r#""alpha beta""#),
+                        "<b>",
+                        "</b>",
+                    ),
+                    rendered_prefix_snippet: snippet_with_patterns(
+                        "alpha one two threefold omega",
+                        &highlight_patterns_from_query_text("one + two + thr*"),
+                        "[",
+                        "]",
+                        "...",
+                        4,
+                    ),
+                    negated_rhs_rendering: highlight_with_patterns(
+                        "alpha beta gamma",
+                        &highlight_patterns_from_query_text(r#""alpha beta" NOT gamma"#),
+                        "<b>",
+                        "</b>",
+                    ),
+                }
+            ),
+            r#"Fts5PhraseSpanStructure {
+    phrase_patterns: [
+        Fts5HighlightPattern {
+            parts: [
+                Fts5HighlightTerm {
+                    term: "alpha",
+                    prefix: false,
+                },
+                Fts5HighlightTerm {
+                    term: "beta",
+                    prefix: false,
+                },
+            ],
+        },
+        Fts5HighlightPattern {
+            parts: [
+                Fts5HighlightTerm {
+                    term: "gam",
+                    prefix: true,
+                },
+            ],
+        },
+    ],
+    rendered_phrase: "<b>alpha beta</b> gamma",
+    rendered_prefix_snippet: "alpha [one two threefold]...",
+    negated_rhs_rendering: "<b>alpha beta</b> gamma",
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_snippet_window_scoring() {
+        let text = "alpha one gap gap two three omega";
+        let patterns = highlight_patterns_from_query_text("one OR two OR three");
+        let tokenizer = Unicode61Tokenizer::new();
+        let tokens = tokenizer.tokenize(text);
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5SnippetWindowStructure {
+                    scored_window: select_snippet_window(&tokens, &patterns, 3),
+                    rendered_snippet: snippet_with_patterns(text, &patterns, "[", "]", "...", 3,),
+                    no_match_window: select_snippet_window(
+                        &tokens,
+                        &highlight_patterns_from_query_text("absent"),
+                        3,
+                    ),
+                }
+            ),
+            r#"Fts5SnippetWindowStructure {
+    scored_window: Fts5SnippetWindow {
+        first: 3,
+        last_exclusive: 6,
+        distinct: 2,
+        total: 2,
+    },
+    rendered_snippet: "...gap [two] [three]...",
+    no_match_window: Fts5SnippetWindow {
+        first: 0,
+        last_exclusive: 3,
+        distinct: 0,
+        total: 0,
+    },
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_rollback_restores_inserted_rows() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"])
+            .map_err(|err| err.to_string())?;
+
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text(SmallText::from_string("stable root")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        table.begin(&cx).map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text(SmallText::from_string("transient branch")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(search_rowids(&table, "transient")?, vec![2]);
+        table.rollback(&cx).map_err(|err| err.to_string())?;
+
+        assert_eq!(table.all_rows(), vec![(1, vec!["stable root".to_owned()])]);
+        assert!(search_rowids(&table, "transient")?.is_empty());
+        assert_eq!(search_rowids(&table, "stable")?, vec![1]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_transaction_rollback() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "locale=1"])
+            .map_err(|err| err.to_string())?;
+
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1),
+                    SqliteValue::Blob(encode_fts5_locale_blob("tr_TR", "stable root").into()),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        table.begin(&cx).map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text(SmallText::from_string("transient branch")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        table.savepoint(&cx, 1).map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(3),
+                    SqliteValue::Text(SmallText::from_string("deep branch")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        table.rollback_to(&cx, 1).map_err(|err| err.to_string())?;
+        let savepoint_rows = table.all_rows();
+        let savepoint_matches = search_rowids(&table, "transient OR deep")?;
+
+        table.rollback(&cx).map_err(|err| err.to_string())?;
+        let full_rows = table.all_rows();
+        let full_matches = search_rowids(&table, "stable OR transient OR deep")?;
+        let full_locales = table.all_locales();
+        let reused_auto_rowid = table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                    SqliteValue::Text(SmallText::from_string("auto after rollback")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5TransactionRollbackStructure {
+                    savepoint_rows,
+                    savepoint_matches,
+                    full_rows,
+                    full_matches,
+                    full_locales,
+                    reused_auto_rowid,
+                    rows_after_auto: table.all_rows(),
+                }
+            ),
+            r#"Fts5TransactionRollbackStructure {
+    savepoint_rows: [
+        (
+            1,
+            [
+                "stable root",
+            ],
+        ),
+        (
+            2,
+            [
+                "transient branch",
+            ],
+        ),
+    ],
+    savepoint_matches: [
+        2,
+    ],
+    full_rows: [
+        (
+            1,
+            [
+                "stable root",
+            ],
+        ),
+    ],
+    full_matches: [
+        1,
+    ],
+    full_locales: [
+        (
+            1,
+            0,
+            "tr_TR",
+        ),
+    ],
+    reused_auto_rowid: Some(
+        2,
+    ),
+    rows_after_auto: [
+        (
+            1,
+            [
+                "stable root",
+            ],
+        ),
+        (
+            2,
+            [
+                "auto after rollback",
+            ],
+        ),
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_update_decode_failure_preserves_existing_row() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"])
+            .map_err(|err| err.to_string())?;
+
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text(SmallText::from_string("stable old token")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        let err = table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Blob(encode_fts5_locale_blob("tr_TR", "replacement token").into()),
+                ],
+            )
+            .expect_err("locale blob update should fail when locale=0");
+
+        assert!(
+            err.to_string().contains("fts5_locale() requires locale=1"),
+            "unexpected update failure: {err}"
+        );
+        assert_eq!(
+            table.all_rows(),
+            vec![(1, vec!["stable old token".to_owned()])]
+        );
+        assert_eq!(search_rowids(&table, "stable")?, vec![1]);
+        assert!(search_rowids(&table, "replacement")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_update_failure_cleanup() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"])
+            .map_err(|err| err.to_string())?;
+
+        table.begin(&cx).map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text(SmallText::from_string("stable old token")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        table.savepoint(&cx, 1).map_err(|err| err.to_string())?;
+        let error = table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Blob(encode_fts5_locale_blob("tr_TR", "replacement token").into()),
+                ],
+            )
+            .expect_err("decode failure must not mutate the old row")
+            .to_string();
+        let rows_after_error = table.all_rows();
+        let old_matches = search_rowids(&table, "stable")?;
+        let replacement_matches = search_rowids(&table, "replacement")?;
+        let locales_after_error = table.all_locales();
+        table.release(&cx, 1).map_err(|err| err.to_string())?;
+        table.commit(&cx).map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5UpdateFailureCleanupStructure {
+                    error,
+                    rows_after_error,
+                    old_matches,
+                    replacement_matches,
+                    locales_after_error,
+                    committed_rows: table.all_rows(),
+                }
+            ),
+            r#"Fts5UpdateFailureCleanupStructure {
+    error: "fts5_locale() requires locale=1",
+    rows_after_error: [
+        (
+            1,
+            [
+                "stable old token",
+            ],
+        ),
+    ],
+    old_matches: [
+        1,
+    ],
+    replacement_matches: [],
+    locales_after_error: [],
+    committed_rows: [
+        (
+            1,
+            [
+                "stable old token",
+            ],
+        ),
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_not_terms_are_not_auxiliary_match_terms() -> std::result::Result<(), String> {
+        let expr = build_expr(&parse_fts5_query("rust NOT web").map_err(|err| err.to_string())?)
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(extract_query_terms(&expr), vec!["rust"]);
+        assert_eq!(
+            extract_highlight_terms(&expr),
+            vec![Fts5HighlightTerm::exact("rust")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_highlight_scalar_func_ignores_not_rhs_terms() {
+        let func = Fts5HighlightFunc;
+        let result = func
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("rust web sqlite")),
+                SqliteValue::Text(SmallText::from_string("rust NOT web")),
+                SqliteValue::Text(SmallText::from_string("<b>")),
+                SqliteValue::Text(SmallText::from_string("</b>")),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string("<b>rust</b> web sqlite"))
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_not_auxiliary_terms() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["rust systems".to_owned()]);
+        table.insert_document(2, &["rust web".to_owned()]);
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5NotTermStructure {
+                    query_terms: table
+                        .query_terms_for_queries(&["rust NOT web"])
+                        .map_err(|err| err.to_string())?,
+                    highlight_terms: highlight_terms_from_query_text("rust NOT web"),
+                    search_matches: search_rowids(&table, "rust NOT web")?,
+                    positive_highlight: highlight_with_terms(
+                        "rust web sqlite",
+                        &highlight_terms_from_query_text("rust NOT web"),
+                        "<b>",
+                        "</b>",
+                    ),
+                    fallback_highlight_terms: highlight_terms_from_query_text("(rust NOT web"),
+                }
+            ),
+            r#"Fts5NotTermStructure {
+    query_terms: [
+        "rust",
+    ],
+    highlight_terms: [
+        Fts5HighlightTerm {
+            term: "rust",
+            prefix: false,
+        },
+    ],
+    search_matches: [
+        1,
+    ],
+    positive_highlight: "<b>rust</b> web sqlite",
+    fallback_highlight_terms: [
+        Fts5HighlightTerm {
+            term: "rust",
+            prefix: false,
+        },
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_snippet_with_ellipsis() {
         let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
         let result = snippet(text, &["delta".to_owned()], "<b>", "</b>", "...", 5);
@@ -3876,6 +14610,74 @@ mod tests {
         assert!(registry.find_scalar("highlight", 4).is_some());
         assert!(registry.find_scalar("snippet", 6).is_some());
         assert!(registry.find_scalar("fts5_source_id", 0).is_some());
+        assert!(registry.find_scalar("fts5_insttoken", 1).is_some());
+        assert!(registry.find_scalar("fts5_locale", 2).is_some());
+    }
+
+    #[test]
+    fn test_fts5_insttoken_func_passthrough() {
+        let func = Fts5InsttokenFunc;
+        assert_eq!(func.num_args(), 1);
+        assert_eq!(func.name(), "fts5_insttoken");
+
+        let query = SqliteValue::Text(SmallText::from_string("pre*"));
+        assert_eq!(func.invoke(&[query.clone()]).unwrap(), query);
+        assert_eq!(
+            func.invoke(&[SqliteValue::Null]).unwrap(),
+            SqliteValue::Null
+        );
+    }
+
+    #[test]
+    fn test_fts5_locale_func_encodes_locale_blob() {
+        let func = Fts5LocaleFunc;
+        assert_eq!(func.num_args(), 2);
+        assert_eq!(func.name(), "fts5_locale");
+
+        let result = func
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("tr_TR")),
+                SqliteValue::Text(SmallText::from_string("Istanbul")),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            result,
+            SqliteValue::Blob(encode_fts5_locale_blob("tr_TR", "Istanbul").into())
+        );
+    }
+
+    #[test]
+    fn test_fts5_locale_blob_decode_round_trip() {
+        let blob = encode_fts5_locale_blob("ja_JP", "Tokyo");
+        assert!(matches!(
+            decode_fts5_locale_blob(&blob),
+            Some(("ja_JP", "Tokyo"))
+        ));
+        assert!(decode_fts5_locale_blob(b"plain text").is_none());
+        assert!(decode_fts5_locale_blob(&encode_fts5_locale_blob("", "text")).is_none());
+    }
+
+    #[test]
+    fn test_fts5_locale_func_empty_locale_returns_text() {
+        let func = Fts5LocaleFunc;
+
+        assert_eq!(
+            func.invoke(&[
+                SqliteValue::Text(SmallText::from_string("")),
+                SqliteValue::Integer(42),
+            ])
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("42"))
+        );
+        assert_eq!(
+            func.invoke(&[
+                SqliteValue::Text(SmallText::from_string("")),
+                SqliteValue::Null,
+            ])
+            .unwrap(),
+            SqliteValue::Null
+        );
     }
 
     #[test]
@@ -3998,14 +14800,215 @@ mod tests {
         index.add_document(1, 0, &tok.tokenize("hello world foo bar"));
         // "hello" at pos 0, "world" at pos 4 -> within distance 5
         index.add_document(2, 0, &tok.tokenize("hello a b c world"));
-        // "hello" at pos 0, "world" at pos 6 -> NOT within distance 5
-        index.add_document(3, 0, &tok.tokenize("hello a b c d e world"));
+        // "hello" at pos 0, "world" at pos 7 -> NOT within distance 5
+        index.add_document(3, 0, &tok.tokenize("hello a b c d e f world"));
 
-        let expr = Fts5Expr::Near(vec!["hello".to_owned(), "world".to_owned()], 5);
+        let expr = Fts5Expr::Near(vec![near_term("hello"), near_term("world")], 5);
         let docs = evaluate_expr(&index, &expr);
         assert!(docs.contains(&1));
         assert!(docs.contains(&2));
         assert!(!docs.contains(&3));
+    }
+
+    #[test]
+    fn test_fts5_near_distance_counts_intervening_terms() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["hello world".to_owned()]);
+        table.insert_document(2, &["hello gap world".to_owned()]);
+        table.insert_document(3, &["hello gap gap world".to_owned()]);
+
+        assert_eq!(search_rowids(&table, "NEAR(hello world, 0)")?, vec![1]);
+        assert_eq!(search_rowids(&table, "NEAR(hello world, 1)")?, vec![1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_near_distance_counts_phrase_boundaries() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["alpha beta gamma delta".to_owned()]);
+        table.insert_document(2, &["alpha beta gap gamma delta".to_owned()]);
+        table.insert_document(3, &["alpha beta gap gap gamma delta".to_owned()]);
+
+        let adjacent = r#"NEAR("alpha beta" "gamma delta", 0)"#;
+        let one_gap = r#"NEAR("alpha beta" "gamma delta", 1)"#;
+        assert_eq!(search_rowids(&table, adjacent)?, vec![1]);
+        assert_eq!(search_rowids(&table, one_gap)?, vec![1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_near_phrase_operands() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["hello world near rust language".to_owned()]);
+        table.insert_document(2, &["hello world gap gap rust language".to_owned()]);
+
+        let matches = table
+            .search(r#"NEAR("hello world" "rust language", 2)"#)
+            .map_err(|err| err.to_string())?;
+        assert_eq!(
+            matches
+                .into_iter()
+                .map(|(rowid, _score)| rowid)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_near_prefix_operand() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["hello world near rustacean".to_owned()]);
+        table.insert_document(2, &["hello world gap gap rustacean".to_owned()]);
+
+        let matches = table
+            .search(r#"NEAR("hello world" rusta* , 2)"#)
+            .map_err(|err| err.to_string())?;
+        assert_eq!(
+            matches
+                .into_iter()
+                .map(|(rowid, _score)| rowid)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_near_phrase_operands() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["hello world near rust language".to_owned()]);
+        table.insert_document(2, &["hello world gap gap rust language".to_owned()]);
+        table.insert_document(3, &["hello world near rustacean".to_owned()]);
+
+        let phrase_query = r#"NEAR("hello world" "rust language", 2)"#;
+        let expr = build_expr(&parse_fts5_query(phrase_query).map_err(|err| err.to_string())?)
+            .map_err(|err| err.to_string())?;
+        let (operands, distance) = match expr {
+            Fts5Expr::Near(operands, distance) => (operands, distance),
+            other => return Err(format!("expected NEAR expression, got {other:?}")),
+        };
+        let phrase_matches = table
+            .search(phrase_query)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let prefix_matches = table
+            .search(r#"NEAR("hello world" rusta* , 2)"#)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let query_terms = table
+            .query_terms_for_queries(&[phrase_query])
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5NearPhraseStructure {
+                    operands,
+                    distance,
+                    phrase_matches,
+                    prefix_matches,
+                    query_terms,
+                }
+            ),
+            r#"Fts5NearPhraseStructure {
+    operands: [
+        Phrase(
+            [
+                "hello",
+                "world",
+            ],
+        ),
+        Phrase(
+            [
+                "rust",
+                "language",
+            ],
+        ),
+    ],
+    distance: 2,
+    phrase_matches: [
+        1,
+        2,
+    ],
+    prefix_matches: [
+        3,
+    ],
+    query_terms: [
+        "hello",
+        "world",
+        "rust",
+        "language",
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_near_distance_clumps() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["hello world".to_owned()]);
+        table.insert_document(2, &["hello gap world".to_owned()]);
+        table.insert_document(3, &["hello gap gap world".to_owned()]);
+        table.insert_document(4, &["alpha beta gamma delta".to_owned()]);
+        table.insert_document(5, &["alpha beta gap gamma delta".to_owned()]);
+        table.insert_document(6, &["a b c d x x x e f x".to_owned()]);
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5NearDistanceStructure {
+                    adjacent_terms: search_rowids(&table, "NEAR(hello world, 0)")?,
+                    one_gap_terms: search_rowids(&table, "NEAR(hello world, 1)")?,
+                    adjacent_phrases: search_rowids(
+                        &table,
+                        r#"NEAR("alpha beta" "gamma delta", 0)"#,
+                    )?,
+                    one_gap_phrases: search_rowids(
+                        &table,
+                        r#"NEAR("alpha beta" "gamma delta", 1)"#,
+                    )?,
+                    reordered_doc_example: search_rowids(&table, "NEAR(e d, 3)")?,
+                    multi_phrase_doc_example: search_rowids(
+                        &table,
+                        r#"NEAR("a b c d" "b c" "e f", 4)"#,
+                    )?,
+                    too_tight_doc_example: search_rowids(
+                        &table,
+                        r#"NEAR("a b c d" "b c" "e f", 3)"#,
+                    )?,
+                }
+            ),
+            r"Fts5NearDistanceStructure {
+    adjacent_terms: [
+        1,
+    ],
+    one_gap_terms: [
+        1,
+        2,
+    ],
+    adjacent_phrases: [
+        4,
+    ],
+    one_gap_phrases: [
+        4,
+        5,
+    ],
+    reordered_doc_example: [
+        6,
+    ],
+    multi_phrase_doc_example: [
+        6,
+    ],
+    too_tight_doc_example: [],
+}"
+        );
+        Ok(())
     }
 
     // -- Edge case tests --
@@ -4061,8 +15064,12 @@ mod tests {
         assert_eq!(config.content_mode(), ContentMode::Stored);
         assert!(!config.secure_delete_enabled());
         assert!(!config.contentless_delete_enabled());
+        assert!(!config.contentless_unindexed_enabled());
         assert!(config.columnsize_enabled());
         assert_eq!(config.detail_mode(), DetailMode::Full);
+        assert!(!config.insttoken_enabled());
+        assert!(!config.locale_enabled());
+        assert!(!config.tokendata_enabled());
     }
 
     #[test]
@@ -4096,6 +15103,10 @@ mod tests {
         assert_eq!(
             format!("{}", Fts5QueryError::InvalidNearSyntax),
             "invalid NEAR syntax"
+        );
+        assert_eq!(
+            format!("{}", Fts5QueryError::InvalidPhraseSyntax),
+            "invalid phrase syntax"
         );
         assert_eq!(
             format!(
@@ -4177,12 +15188,11 @@ mod tests {
     }
 
     #[test]
-    fn test_ascii_tokenizer_non_ascii_dropped() {
+    fn test_ascii_tokenizer_keeps_non_ascii_token_chars() {
         let tok = AsciiTokenizer;
         let tokens = tok.tokenize("café hello");
         let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
-        // 'é' is not ASCII alphanumeric, so "caf" and "hello" are separate tokens.
-        assert_eq!(terms, vec!["caf", "hello"]);
+        assert_eq!(terms, vec!["café", "hello"]);
     }
 
     #[test]
@@ -4246,6 +15256,128 @@ mod tests {
     }
 
     #[test]
+    fn test_porter_stem_treats_y_as_vowel_after_consonant() {
+        assert!(contains_vowel("cry"));
+        assert!(contains_vowel("fly"));
+        assert!(!contains_vowel("sk"));
+        assert_eq!(porter_stem("crying"), "cry");
+        assert_eq!(porter_stem("flying"), "fly");
+        assert_eq!(porter_stem("sky"), "sky");
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_porter_y_vowel() -> std::result::Result<(), String> {
+        let words = ["crying", "flying", "happy", "sky"];
+        let stems = words
+            .into_iter()
+            .map(|word| (word.to_owned(), porter_stem(word)))
+            .collect();
+        let vowel_checks = ["cr", "cry", "fly", "sky"]
+            .into_iter()
+            .map(|word| (word.to_owned(), contains_vowel(word)))
+            .collect();
+        let measures = ["cr", "cry", "trouble", "relate"]
+            .into_iter()
+            .map(|word| (word.to_owned(), measure(word)))
+            .collect();
+
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "body",
+                "tokenize='porter unicode61'",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["crying flying".to_owned()]);
+        table.insert_document(2, &["sky".to_owned()]);
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5PorterYVowelStructure {
+                    stems,
+                    vowel_checks,
+                    measures,
+                    cry_matches: search_rowids(&table, "cry")?,
+                    fly_matches: search_rowids(&table, "fly")?,
+                    sky_matches: search_rowids(&table, "sky")?,
+                }
+            ),
+            r#"Fts5PorterYVowelStructure {
+    stems: [
+        (
+            "crying",
+            "cry",
+        ),
+        (
+            "flying",
+            "fly",
+        ),
+        (
+            "happy",
+            "happi",
+        ),
+        (
+            "sky",
+            "sky",
+        ),
+    ],
+    vowel_checks: [
+        (
+            "cr",
+            false,
+        ),
+        (
+            "cry",
+            true,
+        ),
+        (
+            "fly",
+            true,
+        ),
+        (
+            "sky",
+            true,
+        ),
+    ],
+    measures: [
+        (
+            "cr",
+            0,
+        ),
+        (
+            "cry",
+            0,
+        ),
+        (
+            "trouble",
+            1,
+        ),
+        (
+            "relate",
+            2,
+        ),
+    ],
+    cry_matches: [
+        1,
+    ],
+    fly_matches: [
+        1,
+    ],
+    sky_matches: [
+        2,
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_porter_stem_step2_ational() {
         assert_eq!(porter_stem("relational"), "relate");
     }
@@ -4274,7 +15406,7 @@ mod tests {
     fn test_contains_vowel_function() {
         assert!(contains_vowel("hello"));
         assert!(contains_vowel("a"));
-        assert!(!contains_vowel("xyz"));
+        assert!(!contains_vowel("xzz"));
         assert!(!contains_vowel(""));
     }
 
@@ -4282,6 +15414,7 @@ mod tests {
     fn test_trigram_case_sensitive() {
         let tok = TrigramTokenizer {
             case_sensitive: true,
+            remove_diacritics: false,
         };
         let tokens = tok.tokenize("ABC");
         assert_eq!(tokens.len(), 1);
@@ -4292,10 +15425,33 @@ mod tests {
     fn test_trigram_case_insensitive() {
         let tok = TrigramTokenizer {
             case_sensitive: false,
+            remove_diacritics: false,
         };
         let tokens = tok.tokenize("ABC");
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].term, "abc");
+    }
+
+    #[test]
+    fn test_create_tokenizer_trigram_case_sensitive_arg() {
+        let tok = create_tokenizer("trigram case_sensitive 1").unwrap();
+        let tokens = tok.tokenize("ABC");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].term, "ABC");
+    }
+
+    #[test]
+    fn test_create_tokenizer_trigram_remove_diacritics_arg() {
+        let tok = create_tokenizer("trigram remove_diacritics 1").unwrap();
+        let tokens = tok.tokenize("ábC");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].term, "abc");
+    }
+
+    #[test]
+    fn test_create_tokenizer_trigram_rejects_invalid_options() {
+        assert!(create_tokenizer("trigram case_sensitive 1 remove_diacritics 1").is_none());
+        assert!(create_tokenizer("trigram case_sensitive maybe").is_none());
     }
 
     #[test]
@@ -4305,6 +15461,193 @@ mod tests {
         assert!(!tokens.is_empty());
         // "café" has 4 chars, so we get 2 trigrams.
         assert_eq!(tokens.len(), 2);
+    }
+
+    #[test]
+    fn test_trigram_streaming_preserves_unicode_offsets() {
+        let tok = TrigramTokenizer::default();
+        let tokens = tok.tokenize("éABC");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].term, "éab");
+        assert_eq!(tokens[0].start, 0);
+        assert_eq!(tokens[0].end, 4);
+        assert_eq!(tokens[1].term, "abc");
+        assert_eq!(tokens[1].start, 2);
+        assert_eq!(tokens[1].end, 5);
+    }
+
+    #[test]
+    fn test_trigram_case_fold_fast_path_preserves_unicode_lowercase() {
+        let insensitive = TrigramTokenizer {
+            case_sensitive: false,
+            remove_diacritics: false,
+        };
+        let tokens = insensitive.tokenize("ABCΣ");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].term, "abc");
+        assert_eq!(tokens[0].start, 0);
+        assert_eq!(tokens[0].end, 3);
+        assert_eq!(tokens[1].term, "bcσ");
+        assert_eq!(tokens[1].start, 1);
+        assert_eq!(tokens[1].end, 5);
+
+        let sensitive = TrigramTokenizer {
+            case_sensitive: true,
+            remove_diacritics: false,
+        };
+        let sensitive_terms: Vec<String> = sensitive
+            .tokenize("ABCΣ")
+            .into_iter()
+            .map(|token| token.term)
+            .collect();
+        assert_eq!(sensitive_terms, vec!["ABC", "BCΣ"]);
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_trigram_case_fold() -> std::result::Result<(), String> {
+        let insensitive = TrigramTokenizer {
+            case_sensitive: false,
+            remove_diacritics: false,
+        };
+        let insensitive_tokens = insensitive
+            .tokenize("ABCΣ")
+            .into_iter()
+            .map(|token| (token.term, token.start, token.end))
+            .collect();
+        let sensitive = TrigramTokenizer {
+            case_sensitive: true,
+            remove_diacritics: false,
+        };
+        let sensitive_terms = sensitive
+            .tokenize("ABCΣ")
+            .into_iter()
+            .map(|token| token.term)
+            .collect();
+        let diacritic_terms = TrigramTokenizer {
+            case_sensitive: false,
+            remove_diacritics: true,
+        }
+        .tokenize("ÉAB")
+        .into_iter()
+        .map(|token| token.term)
+        .collect();
+
+        let cx = Cx::new();
+        let mut table =
+            Fts5Table::connect(&cx, &["fts5", "main", "tri", "body", "tokenize='trigram'"])
+                .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["ABCΣ".to_owned()]);
+        table.insert_document(2, &["abcσ".to_owned()]);
+        let mut upper_matches = search_rowids(&table, "ABCΣ")?;
+        upper_matches.sort_unstable();
+        let mut lower_matches = search_rowids(&table, "abcσ")?;
+        lower_matches.sort_unstable();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5TrigramCaseFoldStructure {
+                    insensitive_tokens,
+                    sensitive_terms,
+                    diacritic_terms,
+                    upper_matches,
+                    lower_matches,
+                }
+            ),
+            r#"Fts5TrigramCaseFoldStructure {
+    insensitive_tokens: [
+        (
+            "abc",
+            0,
+            3,
+        ),
+        (
+            "bcσ",
+            1,
+            5,
+        ),
+    ],
+    sensitive_terms: [
+        "ABC",
+        "BCΣ",
+    ],
+    diacritic_terms: [
+        "eab",
+    ],
+    upper_matches: [
+        1,
+        2,
+    ],
+    lower_matches: [
+        1,
+        2,
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_trigram_streaming() -> std::result::Result<(), String> {
+        let tok = TrigramTokenizer::default();
+        let tokens = tok
+            .tokenize("éABC")
+            .into_iter()
+            .map(|token| (token.term, token.start, token.end))
+            .collect();
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "tri",
+                "body",
+                "tokenize='trigram remove_diacritics 1'",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["éABC".to_owned()]);
+        table.insert_document(2, &["zabc".to_owned()]);
+        let mut accented_matches = search_rowids(&table, "eab")?;
+        accented_matches.sort_unstable();
+        let mut ascii_matches = search_rowids(&table, "abc")?;
+        ascii_matches.sort_unstable();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5TrigramStreamingStructure {
+                    tokens,
+                    short_input_tokens: tok.tokenize("éA").len(),
+                    accented_matches,
+                    ascii_matches,
+                }
+            ),
+            r#"Fts5TrigramStreamingStructure {
+    tokens: [
+        (
+            "éab",
+            0,
+            4,
+        ),
+        (
+            "abc",
+            2,
+            5,
+        ),
+    ],
+    short_input_tokens: 0,
+    accented_matches: [
+        1,
+    ],
+    ascii_matches: [
+        1,
+        2,
+    ],
+}"#
+        );
+        Ok(())
     }
 
     #[test]
@@ -4381,12 +15724,42 @@ mod tests {
     }
 
     #[test]
+    fn test_build_expr_phrase_concatenation() -> std::result::Result<(), String> {
+        let tokens = parse_fts5_query(r#""one two" + three"#).map_err(|err| err.to_string())?;
+        let expr = build_expr(&tokens).map_err(|err| err.to_string())?;
+        match expr {
+            Fts5Expr::Phrase(words) => {
+                assert_eq!(
+                    words,
+                    vec!["one".to_owned(), "two".to_owned(), "three".to_owned()]
+                );
+            }
+            other => return Err(format!("expected phrase expression, got {other:?}")),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_expr_phrase_concatenation_final_prefix() -> std::result::Result<(), String> {
+        let tokens = parse_fts5_query("one + two + thr*").map_err(|err| err.to_string())?;
+        let expr = build_expr(&tokens).map_err(|err| err.to_string())?;
+        match expr {
+            Fts5Expr::PhrasePrefix(words, prefix) => {
+                assert_eq!(words, vec!["one".to_owned(), "two".to_owned()]);
+                assert_eq!(prefix, "thr");
+            }
+            other => return Err(format!("expected phrase-prefix expression, got {other:?}")),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_build_expr_near_default_distance() {
         let tokens = parse_fts5_query("NEAR(hello world)").unwrap();
         let expr = build_expr(&tokens).unwrap();
         match expr {
-            Fts5Expr::Near(terms, distance) => {
-                assert_eq!(terms, vec!["hello".to_owned(), "world".to_owned()]);
+            Fts5Expr::Near(operands, distance) => {
+                assert_eq!(operands, vec![near_term("hello"), near_term("world")]);
                 assert_eq!(distance, 10);
             }
             other => panic!("expected NEAR expression, got {other:?}"),
@@ -4398,8 +15771,8 @@ mod tests {
         let tokens = parse_fts5_query("NEAR(hello world, 5)").unwrap();
         let expr = build_expr(&tokens).unwrap();
         match expr {
-            Fts5Expr::Near(terms, distance) => {
-                assert_eq!(terms, vec!["hello".to_owned(), "world".to_owned()]);
+            Fts5Expr::Near(operands, distance) => {
+                assert_eq!(operands, vec![near_term("hello"), near_term("world")]);
                 assert_eq!(distance, 5);
             }
             other => panic!("expected NEAR expression, got {other:?}"),
@@ -4411,12 +15784,30 @@ mod tests {
         let tokens = parse_fts5_query("NEAR(hello world,5)").unwrap();
         let expr = build_expr(&tokens).unwrap();
         match expr {
-            Fts5Expr::Near(terms, distance) => {
-                assert_eq!(terms, vec!["hello".to_owned(), "world".to_owned()]);
+            Fts5Expr::Near(operands, distance) => {
+                assert_eq!(operands, vec![near_term("hello"), near_term("world")]);
                 assert_eq!(distance, 5);
             }
             other => panic!("expected NEAR expression, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_build_expr_near_phrase_and_prefix_operands() -> std::result::Result<(), String> {
+        let tokens =
+            parse_fts5_query(r#"NEAR("hello world" rust*)"#).map_err(|err| err.to_string())?;
+        let expr = build_expr(&tokens).map_err(|err| err.to_string())?;
+        match expr {
+            Fts5Expr::Near(operands, distance) => {
+                assert_eq!(
+                    operands,
+                    vec![near_phrase(&["hello", "world"]), near_prefix("rust")]
+                );
+                assert_eq!(distance, 10);
+            }
+            other => return Err(format!("expected NEAR expression, got {other:?}")),
+        }
+        Ok(())
     }
 
     #[test]
@@ -4507,7 +15898,7 @@ mod tests {
     #[test]
     fn test_evaluate_near_single_term() {
         let index = InvertedIndex::new();
-        let expr = Fts5Expr::Near(vec!["only".to_owned()], 5);
+        let expr = Fts5Expr::Near(vec![near_term("only")], 5);
         let docs = evaluate_expr(&index, &expr);
         assert!(docs.is_empty());
     }
@@ -4894,8 +16285,10 @@ mod tests {
             position: 0,
             columns: vec!["content".to_owned()],
             tokenizer_name: "unicode61".to_owned(),
+            detail: DetailMode::Full,
             index: InvertedIndex::new(),
             documents: HashMap::new(),
+            shadow_rows: None,
         };
 
         assert!(cursor.eof());
@@ -4925,8 +16318,10 @@ mod tests {
             position: 0,
             columns: vec!["content".to_owned()],
             tokenizer_name: "unicode61".to_owned(),
+            detail: DetailMode::Full,
             index: InvertedIndex::new(),
             documents: HashMap::new(),
+            shadow_rows: None,
         };
 
         cursor.set_results(vec![(1, -1.0, vec!["hello world".to_owned()])]);
@@ -4951,8 +16346,10 @@ mod tests {
             position: 0,
             columns: vec!["content".to_owned()],
             tokenizer_name: "unicode61".to_owned(),
+            detail: DetailMode::Full,
             index: InvertedIndex::new(),
             documents: HashMap::new(),
+            shadow_rows: None,
         };
 
         cursor.set_results(vec![(1, -1.0, vec!["hello world".to_owned()])]);
@@ -4973,8 +16370,10 @@ mod tests {
             position: 0,
             columns: vec!["content".to_owned()],
             tokenizer_name: "unicode61".to_owned(),
+            detail: DetailMode::Full,
             index: InvertedIndex::new(),
             documents: HashMap::new(),
+            shadow_rows: None,
         };
 
         cursor.set_results(vec![(1, -1.0, vec!["hello world".to_owned()])]);
@@ -4991,8 +16390,10 @@ mod tests {
             position: 0,
             columns: vec!["content".to_owned()],
             tokenizer_name: "unicode61".to_owned(),
+            detail: DetailMode::Full,
             index: InvertedIndex::new(),
             documents: HashMap::new(),
+            shadow_rows: None,
         };
 
         cursor.set_results(vec![(1, -1.0, vec!["hello world".to_owned()])]);
@@ -5047,7 +16448,7 @@ mod tests {
             )),
         );
         let terms = extract_query_terms(&expr);
-        assert_eq!(terms, vec!["hello", "wor", "exact", "match"]);
+        assert_eq!(terms, vec!["Hello", "Wor", "exact", "match"]);
     }
 
     #[test]

@@ -242,12 +242,36 @@ pub enum ShadowTableKind {
     Shadow,
 }
 
+/// Access decision for a shadow-table operation class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShadowTableAccess {
+    /// The operation is permitted by the module policy.
+    #[default]
+    Allow,
+    /// The operation is rejected by the module policy.
+    Deny,
+}
+
+impl ShadowTableAccess {
+    /// Whether the access decision permits the operation.
+    #[must_use]
+    pub const fn is_allowed(self) -> bool {
+        matches!(self, Self::Allow)
+    }
+}
+
 /// Policy returned by a module when the core asks whether a table name is a
 /// shadow table of a virtual table instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShadowTablePolicy {
     /// Whether the table is ordinary or shadow-owned.
     pub kind: ShadowTableKind,
+    /// User-authored INSERT/UPDATE/DELETE against this schema object.
+    pub direct_dml: ShadowTableAccess,
+    /// User-authored schema changes such as CREATE TRIGGER on this object.
+    pub schema_ddl: ShadowTableAccess,
+    /// Writes performed by the owning module while applying its own lifecycle.
+    pub module_internal_write: ShadowTableAccess,
 }
 
 impl ShadowTablePolicy {
@@ -256,6 +280,9 @@ impl ShadowTablePolicy {
     pub const fn ordinary() -> Self {
         Self {
             kind: ShadowTableKind::Ordinary,
+            direct_dml: ShadowTableAccess::Allow,
+            schema_ddl: ShadowTableAccess::Allow,
+            module_internal_write: ShadowTableAccess::Allow,
         }
     }
 
@@ -264,6 +291,9 @@ impl ShadowTablePolicy {
     pub const fn owned_shadow() -> Self {
         Self {
             kind: ShadowTableKind::Shadow,
+            direct_dml: ShadowTableAccess::Deny,
+            schema_ddl: ShadowTableAccess::Deny,
+            module_internal_write: ShadowTableAccess::Allow,
         }
     }
 
@@ -271,6 +301,24 @@ impl ShadowTablePolicy {
     #[must_use]
     pub const fn is_shadow(self) -> bool {
         matches!(self.kind, ShadowTableKind::Shadow)
+    }
+
+    /// Whether user-authored INSERT/UPDATE/DELETE should be accepted.
+    #[must_use]
+    pub const fn allows_direct_dml(self) -> bool {
+        self.direct_dml.is_allowed()
+    }
+
+    /// Whether user-authored schema DDL such as CREATE TRIGGER should be accepted.
+    #[must_use]
+    pub const fn allows_schema_ddl(self) -> bool {
+        self.schema_ddl.is_allowed()
+    }
+
+    /// Whether the owning module may write this object internally.
+    #[must_use]
+    pub const fn allows_module_internal_write(self) -> bool {
+        self.module_internal_write.is_allowed()
     }
 }
 
@@ -1346,6 +1394,19 @@ mod tests {
         let policy = ReadOnlyVtab::shadow_table_policy("docs", "docs_data");
         assert_eq!(policy, ShadowTablePolicy::ordinary());
         assert!(!policy.is_shadow());
+        assert!(policy.allows_direct_dml());
+        assert!(policy.allows_schema_ddl());
+        assert!(policy.allows_module_internal_write());
+    }
+
+    #[test]
+    fn test_owned_shadow_policy_blocks_user_dml_and_schema_ddl() {
+        let policy = ShadowTablePolicy::owned_shadow();
+
+        assert!(policy.is_shadow());
+        assert!(!policy.allows_direct_dml());
+        assert!(!policy.allows_schema_ddl());
+        assert!(policy.allows_module_internal_write());
     }
 
     #[test]
@@ -1372,8 +1433,12 @@ mod tests {
         let unrelated = factory.shadow_table_policy("docs", "docs_segments");
 
         assert_eq!(owned.kind, ShadowTableKind::Shadow);
+        assert!(!owned.allows_direct_dml());
+        assert!(!owned.allows_schema_ddl());
+        assert!(owned.allows_module_internal_write());
         assert!(!other_owner.is_shadow());
         assert!(!unrelated.is_shadow());
+        assert!(unrelated.allows_direct_dml());
     }
 
     #[test]

@@ -1647,6 +1647,14 @@ mod tests {
         assert_float_near(&results[3], 1.0);
     }
 
+    #[test]
+    fn test_percent_rank_without_order_treats_partition_as_one_peer_group() {
+        let results = run_window_two_pass(&PercentRankFunc, &[vec![], vec![], vec![]]);
+        for value in results {
+            assert_float_near(&value, 0.0);
+        }
+    }
+
     // ── cume_dist ────────────────────────────────────────────────────
 
     #[test]
@@ -1679,6 +1687,15 @@ mod tests {
         for value in results {
             assert_float_near(&value, 1.0);
         }
+    }
+
+    #[test]
+    fn test_cume_dist_null_peers_share_same_peer_group() {
+        let results =
+            run_window_two_pass(&CumeDistFunc, &[vec![null()], vec![null()], vec![int(1)]]);
+        assert_float_near(&results[0], 2.0 / 3.0);
+        assert_float_near(&results[1], 2.0 / 3.0);
+        assert_float_near(&results[2], 1.0);
     }
 
     // ── ntile ────────────────────────────────────────────────────────
