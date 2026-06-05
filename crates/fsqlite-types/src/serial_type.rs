@@ -15,25 +15,29 @@
 /// | 7           | 8           | IEEE 754 float             |
 /// | 8           | 0           | Integer constant 0         |
 /// | 9           | 0           | Integer constant 1         |
-/// | 10, 11      | —           | Reserved                   |
+/// | 10, 11      | 0           | Reserved/internal          |
 /// | N >= 12 even| (N-12)/2    | BLOB of (N-12)/2 bytes     |
 /// | N >= 13 odd | (N-13)/2    | TEXT of (N-13)/2 bytes      |
 ///
 /// Compute the number of bytes of data for a given serial type.
 ///
-/// Returns `None` for reserved serial types (10, 11).
+/// Returns `Some(0)` for reserved serial types 10 and 11 to match canonical
+/// SQLite's `sqlite3VdbeSerialTypeLen` size table. SQLite's file-format
+/// documentation says these values do not appear in well-formed database
+/// files, but they are reserved for SQLite's own internal/transient records.
+/// Treating their length as zero keeps record scanners aligned; higher layers
+/// can still decide whether to tolerate or reject such records.
 #[allow(clippy::inline_always)]
 #[inline(always)]
 pub const fn serial_type_len(serial_type: u64) -> Option<u64> {
     match serial_type {
-        0 | 8 | 9 => Some(0),
+        0 | 8 | 9 | 10 | 11 => Some(0),
         1 => Some(1),
         2 => Some(2),
         3 => Some(3),
         4 => Some(4),
         5 => Some(6),
         6 | 7 => Some(8),
-        10 | 11 => None, // reserved
         n if n % 2 == 0 => Some((n - 12) / 2),
         n => Some((n - 13) / 2),
     }
@@ -103,6 +107,37 @@ pub const fn serial_type_for_integer(value: i64) -> u64 {
         5
     } else {
         6
+    }
+}
+
+/// Compute the serial type and payload length for an integer in one pass.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+pub const fn integer_serial_type_and_len(value: i64) -> (u64, usize) {
+    let u = if value < 0 {
+        !(value as u64)
+    } else {
+        value as u64
+    };
+
+    if u <= 127 {
+        if value == 0 {
+            return (8, 0);
+        }
+        if value == 1 {
+            return (9, 0);
+        }
+        (1, 1)
+    } else if u <= 32767 {
+        (2, 2)
+    } else if u <= 8_388_607 {
+        (3, 3)
+    } else if u <= 2_147_483_647 {
+        (4, 4)
+    } else if u <= 0x0000_7FFF_FFFF_FFFF {
+        (5, 6)
+    } else {
+        (6, 8)
     }
 }
 
@@ -306,8 +341,11 @@ mod tests {
         assert_eq!(serial_type_len(7), Some(8)); // float
         assert_eq!(serial_type_len(8), Some(0)); // constant 0
         assert_eq!(serial_type_len(9), Some(0)); // constant 1
-        assert_eq!(serial_type_len(10), None); // reserved
-        assert_eq!(serial_type_len(11), None); // reserved
+        // Reserved serial types 10 and 11: canonical SQLite assigns these
+        // zero-length payloads in its internal size table. They are not
+        // expected in well-formed database files.
+        assert_eq!(serial_type_len(10), Some(0)); // reserved, zero-length
+        assert_eq!(serial_type_len(11), Some(0)); // reserved, zero-length
     }
 
     #[test]
@@ -990,10 +1028,13 @@ mod tests {
             let class = classify_serial_type(st);
             // Re-classify to confirm determinism
             prop_assert_eq!(classify_serial_type(st), class);
-            // Verify consistency with serial_type_len
+            // Verify consistency with serial_type_len: every classified serial
+            // type — including Reserved (10, 11) — now reports a finite
+            // length. Canonical SQLite assigns reserved types zero payload
+            // length; see serial_type_len's doc-comment.
             match class {
                 SerialTypeClass::Reserved => {
-                    prop_assert!(serial_type_len(st).is_none());
+                    prop_assert_eq!(serial_type_len(st), Some(0));
                 }
                 _ => {
                     prop_assert!(serial_type_len(st).is_some());

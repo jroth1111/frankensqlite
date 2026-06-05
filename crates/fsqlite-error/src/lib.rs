@@ -18,6 +18,17 @@ pub enum FrankenError {
     #[error("database is locked: '{path}'")]
     DatabaseLocked { path: PathBuf },
 
+    /// Strict multi-process mode (frankensqlite#81) refused to silently
+    /// proceed past an ambiguous concurrency state. The variant carries
+    /// a human-readable `detail` describing the specific contract
+    /// violation (e.g. "freelist trunk page %d exceeds db_size %d",
+    /// "F_SETLK contention beyond busy_timeout", "WAL checkpoint in
+    /// progress at open"). Returned only when the caller opted in via
+    /// `ConnectionEnv::set_strict_multi_process(true)`; default
+    /// best-effort mode preserves the existing behavior.
+    #[error("multi-process contract violation: {detail}")]
+    MultiProcessContractViolation { detail: String },
+
     /// Database file is corrupt.
     #[error("database disk image is malformed: {detail}")]
     DatabaseCorrupt { detail: String },
@@ -350,7 +361,9 @@ impl FrankenError {
     pub const fn error_code(&self) -> ErrorCode {
         match self {
             Self::DatabaseNotFound { .. } | Self::CannotOpen { .. } => ErrorCode::CantOpen,
-            Self::DatabaseLocked { .. } => ErrorCode::Busy,
+            Self::DatabaseLocked { .. } | Self::MultiProcessContractViolation { .. } => {
+                ErrorCode::Busy
+            }
             Self::DatabaseCorrupt { .. } | Self::WalCorrupt { .. } => ErrorCode::Corrupt,
             Self::NotADatabase { .. } => ErrorCode::NotADb,
             Self::DatabaseFull => ErrorCode::Full,
@@ -640,10 +653,18 @@ mod tests {
         assert!(matches!(err, FrankenError::ParseError { offset: 42, .. }));
 
         let err = FrankenError::internal("assertion failed");
-        assert!(matches!(err, FrankenError::Internal(msg) if msg == "assertion failed"));
+        let actual = match &err {
+            FrankenError::Internal(msg) => Some(msg.as_str()),
+            _ => None,
+        };
+        assert_eq!(actual, Some("assertion failed"));
 
         let err = FrankenError::not_implemented("window functions");
-        assert!(matches!(err, FrankenError::NotImplemented(msg) if msg == "window functions"));
+        let actual = match &err {
+            FrankenError::NotImplemented(msg) => Some(msg.as_str()),
+            _ => None,
+        };
+        assert_eq!(actual, Some("window functions"));
     }
 
     #[test]
@@ -1430,7 +1451,11 @@ mod tests {
     #[test]
     fn function_error_constructor() {
         let err = FrankenError::function_error("division by zero");
-        assert!(matches!(err, FrankenError::FunctionError(ref msg) if msg == "division by zero"));
+        let actual = match &err {
+            FrankenError::FunctionError(msg) => Some(msg.as_str()),
+            _ => None,
+        };
+        assert_eq!(actual, Some("division by zero"));
         assert_eq!(err.error_code(), ErrorCode::Error);
     }
 

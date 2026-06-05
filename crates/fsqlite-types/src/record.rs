@@ -21,8 +21,9 @@ use std::simd::{
 };
 
 use crate::serial_type::{
-    SerialTypeClass, classify_serial_type, read_varint, serial_type_for_blob,
-    serial_type_for_integer, serial_type_for_text, serial_type_len, varint_len, write_varint,
+    SerialTypeClass, classify_serial_type, integer_serial_type_and_len, read_varint,
+    serial_type_for_blob, serial_type_for_integer, serial_type_for_text, serial_type_len,
+    varint_len, write_varint,
 };
 use crate::value::{SqliteValue, pool_acquire, pool_return_reusable};
 
@@ -733,7 +734,10 @@ pub fn decode_numeric_column_from_offset(
     let bytes = &data[start..end];
 
     match classify_serial_type(col.serial_type) {
-        SerialTypeClass::Null => Some(NumericColumnValue::Null),
+        // Reserved serial types (10, 11): zero-length internal codes. The
+        // tolerant decoder maps them to NULL after the record scanner has
+        // preserved SQLite's zero-length layout.
+        SerialTypeClass::Null | SerialTypeClass::Reserved => Some(NumericColumnValue::Null),
         SerialTypeClass::Zero => Some(NumericColumnValue::Integer(0)),
         SerialTypeClass::One => Some(NumericColumnValue::Integer(1)),
         SerialTypeClass::Integer => {
@@ -752,7 +756,6 @@ pub fn decode_numeric_column_from_offset(
             })
         }
         SerialTypeClass::Text | SerialTypeClass::Blob => Some(NumericColumnValue::NonNumeric),
-        SerialTypeClass::Reserved => None,
     }
 }
 
@@ -1892,20 +1895,7 @@ fn compute_header_size(content_size: usize) -> usize {
 fn serialized_value_layout(value: &SqliteValue) -> (u64, usize) {
     match value {
         SqliteValue::Null => (0, 0),
-        SqliteValue::Integer(i) => {
-            let serial_type = serial_type_for_integer(*i);
-            let payload_len = match serial_type {
-                8 | 9 => 0,
-                1 => 1,
-                2 => 2,
-                3 => 3,
-                4 => 4,
-                5 => 6,
-                6 => 8,
-                _ => unreachable!("integer serial type must be in 1..=9"),
-            };
-            (serial_type, payload_len)
-        }
+        SqliteValue::Integer(i) => integer_serial_type_and_len(*i),
         // SQLite normalizes NaN to NULL for deterministic storage.
         SqliteValue::Float(f) => {
             if f.is_nan() {
@@ -2425,7 +2415,11 @@ pub fn encode_batch_auto(rows: &[&[SqliteValue]]) -> fsqlite_error::Result<Vec<u
 #[allow(clippy::cast_possible_truncation)]
 pub fn decode_value(serial_type: u64, bytes: &[u8], profile_enabled: bool) -> Option<SqliteValue> {
     match classify_serial_type(serial_type) {
-        SerialTypeClass::Null => {
+        // Serial types 10 and 11 are reserved for SQLite internal use and
+        // are not expected in well-formed database files. Their serialized
+        // length is nevertheless zero in SQLite's internal size table; the
+        // tolerant value decoder maps that zero-length payload to NULL.
+        SerialTypeClass::Null | SerialTypeClass::Reserved => {
             return Some(profile_decoded_value(SqliteValue::Null, profile_enabled));
         }
         SerialTypeClass::Zero => {
@@ -2461,7 +2455,6 @@ pub fn decode_value(serial_type: u64, bytes: &[u8], profile_enabled: bool) -> Op
                 profile_enabled,
             ));
         }
-        SerialTypeClass::Reserved => return None,
         SerialTypeClass::Text | SerialTypeClass::Blob => {}
     }
 
@@ -2491,7 +2484,9 @@ fn decode_value_into(
     profile_enabled: bool,
 ) -> Option<()> {
     match classify_serial_type(serial_type) {
-        SerialTypeClass::Null => {
+        // Reserved serial types (10, 11): decode the zero-length internal
+        // code as NULL. See `decode_value` for the rationale.
+        SerialTypeClass::Null | SerialTypeClass::Reserved => {
             replace_decoded_slot(slot, SqliteValue::Null);
         }
         SerialTypeClass::Zero => {
@@ -2577,7 +2572,6 @@ fn decode_value_into(
             }
             replace_decoded_slot(slot, SqliteValue::Blob(Arc::from(bytes)));
         }
-        SerialTypeClass::Reserved => return None,
     }
 
     if profile_enabled {
@@ -2658,6 +2652,99 @@ mod tests {
         assert!(!data.is_empty());
         let values = parse_record(&data).unwrap();
         assert!(values.is_empty());
+    }
+
+    /// Regression for the bug that wedged the live MCP Agent Mail backend.
+    ///
+    /// Canonical SQLite's `sqlite3VdbeSerialTypeLen` treats serial types 10
+    /// and 11 as zero-length payloads (the `aSize[]` table in vdbeaux.c
+    /// has both as 0). Records containing these types appear in real
+    /// databases despite the spec calling 10/11 "reserved for internal
+    /// use" — they round-trip without complaint under canonical SQLite.
+    ///
+    /// Prior to the fix, fsqlite-types::serial_type_len returned `None`
+    /// for 10/11, which made `parse_record_into` bail with the cursor-
+    /// layer error `"malformed index key record while extracting rowid"`.
+    /// That mismatch between the bespoke parser and canonical SQLite was
+    /// the root of the futile-recovery spin loop observed at runtime.
+    ///
+    /// This test hand-builds a record with the header column-type sequence
+    /// `[text-len-0, type-10, type-11, int8]` and asserts:
+    ///   1. The record parses cleanly (no Option::None / DatabaseCorrupt).
+    ///   2. Types 10 and 11 decode to `SqliteValue::Null` — matching the
+    ///      canonical "treat reserved as zero-length" behavior.
+    ///   3. The trailing 1-byte integer decodes correctly, proving the
+    ///      record scanner advances past zero-length reserved columns
+    ///      rather than getting wedged on them.
+    #[test]
+    fn record_with_reserved_serial_types_10_and_11_parses_as_null() {
+        // Hand-built record bytes:
+        //   header_size (varint=5)
+        //   col 0: serial 13 (text, len 0)
+        //   col 1: serial 10 (reserved, len 0)
+        //   col 2: serial 11 (reserved, len 0)
+        //   col 3: serial 1  (8-bit signed integer)
+        // body:
+        //   col 0: <0 bytes>
+        //   col 1: <0 bytes>
+        //   col 2: <0 bytes>
+        //   col 3: 0x2A (= 42i8)
+        let record: [u8; 6] = [0x05, 0x0D, 0x0A, 0x0B, 0x01, 0x2A];
+
+        let values = parse_record(&record).expect(
+            "record containing serial types 10/11 must parse cleanly; \
+             returning None here was the spin-loop trigger fixed by \
+             aligning serial_type_len with canonical SQLite's aSize table",
+        );
+        assert_eq!(values.len(), 4, "expected 4 columns, got {values:?}");
+
+        // Column 0: empty text.
+        let SqliteValue::Text(text) = &values[0] else {
+            assert!(
+                matches!(values[0], SqliteValue::Text(_)),
+                "col 0 should be Text(\"\"), got {:?}",
+                values[0]
+            );
+            return;
+        };
+        assert_eq!(
+            text.as_str(),
+            "",
+            "empty-text column should decode as the empty string"
+        );
+
+        // Column 1: serial type 10 → NULL.
+        assert!(
+            matches!(values[1], SqliteValue::Null),
+            "serial type 10 must decode as NULL (canonical aSize[10]=0); got {:?}",
+            values[1]
+        );
+        // Column 2: serial type 11 → NULL.
+        assert!(
+            matches!(values[2], SqliteValue::Null),
+            "serial type 11 must decode as NULL (canonical aSize[11]=0); got {:?}",
+            values[2]
+        );
+
+        // Column 3: 1-byte signed integer 42, proving the parser advanced
+        // past the two zero-length reserved columns without consuming any
+        // body bytes.
+        assert!(
+            matches!(values[3], SqliteValue::Integer(42)),
+            "trailing int8 must decode as 42; got {:?} — parser advanced \
+             incorrectly past types 10/11",
+            values[3]
+        );
+
+        // Also verify the slot-reusing path (parse_record_into) so we know
+        // the fix landed in both decode entry points.
+        let mut slots = Vec::new();
+        parse_record_into(&record, &mut slots)
+            .expect("parse_record_into must also tolerate reserved types");
+        assert_eq!(slots.len(), 4);
+        assert!(matches!(slots[1], SqliteValue::Null));
+        assert!(matches!(slots[2], SqliteValue::Null));
+        assert!(matches!(slots[3], SqliteValue::Integer(42)));
     }
 
     // -----------------------------------------------------------------------
@@ -3653,6 +3740,58 @@ mod tests {
         .boxed()
     }
 
+    fn arb_boundary_length_sqlite_value() -> BoxedStrategy<SqliteValue> {
+        prop_oneof![
+            2 => Just(SqliteValue::Null),
+            4 => prop_oneof![
+                Just(0_i64),
+                Just(1_i64),
+                Just(-1_i64),
+                Just(127_i64),
+                Just(-128_i64),
+                Just(128_i64),
+                Just(32_767_i64),
+                Just(-32_768_i64),
+                Just(i64::MAX),
+                Just(i64::MIN),
+            ].prop_map(SqliteValue::Integer),
+            2 => prop_oneof![
+                Just(0.0_f64),
+                Just(-0.0_f64),
+                Just(1.0_f64),
+                Just(-1.0_f64),
+                Just(f64::MIN_POSITIVE),
+            ].prop_map(SqliteValue::Float),
+            5 => prop_oneof![
+                Just(0_usize),
+                Just(1_usize),
+                Just(2_usize),
+                Just(56_usize),
+                Just(57_usize),
+                Just(58_usize),
+                Just(59_usize),
+                Just(120_usize),
+                Just(121_usize),
+                Just(122_usize),
+            ]
+            .prop_map(|len| SqliteValue::Text(SmallText::from_string("x".repeat(len)))),
+            5 => prop_oneof![
+                Just(0_usize),
+                Just(1_usize),
+                Just(2_usize),
+                Just(56_usize),
+                Just(57_usize),
+                Just(58_usize),
+                Just(59_usize),
+                Just(120_usize),
+                Just(121_usize),
+                Just(122_usize),
+            ]
+            .prop_map(|len| SqliteValue::Blob(Arc::from(vec![0xAB; len].as_slice()))),
+        ]
+        .boxed()
+    }
+
     #[test]
     fn simd_integer_record_matches_scalar_record_bytes() {
         let row = vec![
@@ -3847,6 +3986,70 @@ mod tests {
                 values[0],
                 decoded[0]
             );
+        }
+
+        /// bd-7ij9b: Stress record-header varint boundaries where text/blob
+        /// serial types cross from one-byte to two-byte header entries.
+        #[test]
+        fn prop_record_roundtrip_header_varint_boundaries(
+            values in proptest::collection::vec(arb_boundary_length_sqlite_value(), 0..24)
+        ) {
+            let via_vec = serialize_record(&values);
+            let exact = record_iter_exact_size(values.iter());
+            prop_assert_eq!(
+                exact,
+                via_vec.len(),
+                "bead_id=bd-7ij9b case=exact_size_mismatch exact={} vec_len={}",
+                exact,
+                via_vec.len()
+            );
+
+            let mut via_slice = vec![0u8; exact];
+            serialize_record_iter_into_slice(values.iter(), via_slice.as_mut_slice())
+                .expect("boundary-focused slice serialize must succeed");
+            prop_assert_eq!(
+                via_slice.as_slice(),
+                via_vec.as_slice(),
+                "bead_id=bd-7ij9b case=slice_vs_vec_mismatch values={:?}",
+                values
+            );
+
+            let parsed = parse_record(&via_vec).expect("serialized record must parse");
+            prop_assert_eq!(
+                parsed.len(),
+                values.len(),
+                "bead_id=bd-7ij9b case=parse_len_mismatch expected={} got={}",
+                values.len(),
+                parsed.len()
+            );
+
+            let mut scratch = Vec::new();
+            parse_record_into(&via_vec, &mut scratch).expect("serialized record must parse into scratch");
+            prop_assert_eq!(
+                scratch.len(),
+                values.len(),
+                "bead_id=bd-7ij9b case=parse_into_len_mismatch expected={} got={}",
+                values.len(),
+                scratch.len()
+            );
+
+            for (i, ((expected, decoded), reused)) in values
+                .iter()
+                .zip(parsed.iter())
+                .zip(scratch.iter())
+                .enumerate()
+            {
+                prop_assert!(
+                    values_bitwise_eq(expected, decoded),
+                    "bead_id=bd-7ij9b case=parse_mismatch col={} expected={expected:?} decoded={decoded:?}",
+                    i
+                );
+                prop_assert!(
+                    values_bitwise_eq(expected, reused),
+                    "bead_id=bd-7ij9b case=parse_into_mismatch col={} expected={expected:?} decoded={reused:?}",
+                    i
+                );
+            }
         }
 
         /// INV-PBT-4: Lazy header-only parse + per-column decode matches full parse.
