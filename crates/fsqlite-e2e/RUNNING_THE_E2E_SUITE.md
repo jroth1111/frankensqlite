@@ -578,6 +578,56 @@ bash scripts/verify_bd_db300_8_1_1_matched_artifact_packs.sh
 Override `PREVIOUS_SHARED_PLACEMENT_REPORT_JSON` when you need to compare
 against a specific earlier H1.2 report instead of the latest discovered one.
 
+For the H3 single-writer role check, keep the same steering row and fixture,
+run the collector in the foreground with a timeout, and emit the dedicated
+role artifact. The benchmark collector still captures all three modes so the
+forced single-writer row is interpreted next to SQLite and MVCC, while the
+verify-suite package is generated explicitly in forced single-writer mode:
+
+```bash
+timeout 30m env \
+  BEAD_ID=bd-db300.8.3 \
+  ROW_IDS=mixed_read_write_c4 \
+  FIXTURE_IDS=frankensqlite \
+  PLACEMENT_PROFILE_IDS=recommended_pinned,adversarial_cross_node \
+  STORAGE_PROFILE_IDS=file_backed,memory \
+  WARMUP=0 \
+  REPEAT=1 \
+  bash scripts/verify_bd_db300_8_1_1_matched_artifact_packs.sh
+```
+
+When `BEAD_ID=bd-db300.8.3`, the collector also emits:
+
+- `single_writer_role.json`
+- `single_writer_role.md`
+- `verify-suite/single-writer/suite_package.json`
+- `verify-suite/single-writer/logs/verify_suite.jsonl`
+- `concurrent_mode_default_guard.txt`
+
+The H3 role artifact records single-writer mode as comparison or fallback
+evidence only. It must not be treated as the product default or as a headline
+performance mode. The product default remains MVCC concurrent writers
+(`concurrent_mode_default=true`); forced single-writer exists for explicit
+`PRAGMA fsqlite.concurrent_mode=OFF`, `realdb-e2e bench --no-mvcc`, fallback
+diagnostics, and G4 causal attribution. G4 should read the mode bridge as:
+SQLite reference measures the external baseline, forced single-writer measures
+FrankenSQLite's shared fixed tax without MVCC concurrency, and MVCC measures
+the intended concurrent-writer product path.
+
+The H3 verification plan is deliberately small and reproducible:
+
+- Unit guards: `cargo test -p fsqlite-e2e --test bd_2yqp6_6_5_concurrent_mode_defaults`
+  and `cargo test -p fsqlite-e2e --test bd_db300_7_1_2_counter_schema_alignment`.
+- E2E suite package: `realdb-e2e verify-suite --mode fsqlite_single_writer
+  --verification-depth quick --activation-regime low_concurrency_fixed_cost
+  --placement-profile baseline_unpinned`.
+- Benchmark evidence: matched packs for `sqlite_reference`, `fsqlite_mvcc`,
+  and `fsqlite_single_writer` on `mixed_read_write_c4` with the H2 placement
+  profiles and both `file_backed` and `memory` storage profiles.
+- Logs for follow-on implementation: `events.jsonl`, `report.json`,
+  `single_writer_role.json`, `single_writer_role.md`, the verify-suite JSONL
+  log, and the source guard proving `concurrent_mode_default` remains true.
+
 ### Persistent Phase-Attribution Packs
 
 `bd-db300.1.7.2` uses the persistent Criterion harness, not `realdb-e2e bench`.

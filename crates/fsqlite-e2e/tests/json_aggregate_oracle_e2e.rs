@@ -1,0 +1,165 @@
+//! bd-233zb — Oracle-parity e2e: JSON aggregate functions vs rusqlite.
+//!
+//! json_function_oracle covered the JSON1 SCALAR functions; this covers the
+//! aggregates `json_group_array(value)` (build a JSON array from a group) and
+//! `json_group_object(key, value)` (build a JSON object), plain and with
+//! GROUP BY, over mixed value types and NULLs. Compared against rusqlite
+//! (bundled SQLite ~3.46).
+
+use fsqlite::Connection;
+use fsqlite_types::SqliteValue;
+
+fn render_frank(v: &SqliteValue) -> String {
+    match v {
+        SqliteValue::Null => "NULL".to_owned(),
+        SqliteValue::Integer(n) => n.to_string(),
+        SqliteValue::Float(f) => format!("{f}"),
+        SqliteValue::Text(s) => format!("'{s}'"),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
+    }
+}
+
+fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+    Ok(rows
+        .iter()
+        .map(|row| row.values().iter().map(render_frank).collect())
+        .collect())
+}
+
+fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let n = stmt.column_count();
+    stmt.query_map([], |row| {
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let v: rusqlite::types::Value = row.get_unwrap(i);
+            out.push(match v {
+                rusqlite::types::Value::Null => "NULL".to_owned(),
+                rusqlite::types::Value::Integer(x) => x.to_string(),
+                rusqlite::types::Value::Real(f) => format!("{f}"),
+                rusqlite::types::Value::Text(s) => format!("'{s}'"),
+                rusqlite::types::Value::Blob(b) => format!(
+                    "X'{}'",
+                    b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+                ),
+            });
+        }
+        Ok(out)
+    })
+    .map_err(|e| e.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| e.to_string())
+}
+
+fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+    let mut mismatches = Vec::new();
+    for q in queries {
+        match (frank_rows(f, q), sqlite_rows(r, q)) {
+            (Ok(a), Ok(b)) if a == b => {}
+            (Ok(a), Ok(b)) => {
+                mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
+            }
+            (Err(e), Ok(b)) => mismatches.push(format!(
+                "FRANK_ERR: {q}\n  frank: ERROR({e})\n  csql:  {b:?}"
+            )),
+            (Ok(a), Err(e)) => {
+                mismatches.push(format!("CSQL_ERR: {q}\n  frank: {a:?}\n  csql: ERROR({e})"))
+            }
+            (Err(_), Err(_)) => {}
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{label}: {} mismatch(es)\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
+}
+
+fn data() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").unwrap();
+    let r = rusqlite::Connection::open_in_memory().unwrap();
+    for s in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, k TEXT, v INTEGER)",
+        "INSERT INTO t VALUES (1,'a','x',10),(2,'a','y',20),(3,'b','z',30)",
+    ] {
+        f.execute(s).unwrap();
+        r.execute_batch(s).unwrap();
+    }
+    (f, r)
+}
+
+#[test]
+#[ignore = "bd-cnwdm: json_group_array not registered as an aggregate ('no such function')"]
+fn json_group_array_basic_and_grouped() {
+    let (f, r) = data();
+    check(
+        &f,
+        &r,
+        &[
+            "SELECT json_group_array(v) FROM t",                              // [10,20,30]
+            "SELECT g, json_group_array(v) FROM t GROUP BY g ORDER BY g",     // a:[10,20], b:[30]
+            "SELECT json_group_array(k) FROM t",                             // ["x","y","z"]
+        ],
+        "json_group_array_basic_and_grouped",
+    );
+}
+
+#[test]
+#[ignore = "bd-cnwdm: json_group_object not registered ('no such function'; GROUP BY form silently NULL)"]
+fn json_group_object_basic_and_grouped() {
+    let (f, r) = data();
+    check(
+        &f,
+        &r,
+        &[
+            "SELECT json_group_object(k, v) FROM t",                          // {"x":10,"y":20,"z":30}
+            "SELECT g, json_group_object(k, v) FROM t GROUP BY g ORDER BY g", // a:{x:10,y:20}, b:{z:30}
+        ],
+        "json_group_object_basic_and_grouped",
+    );
+}
+
+#[test]
+#[ignore = "bd-cnwdm: json_group_array not registered as an aggregate"]
+fn json_group_array_mixed_and_null() {
+    let f = Connection::open(":memory:").unwrap();
+    let r = rusqlite::Connection::open_in_memory().unwrap();
+    for s in [
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, v)",
+        "INSERT INTO m VALUES (1,1),(2,2.5),(3,'text'),(4,NULL)",
+    ] {
+        f.execute(s).unwrap();
+        r.execute_batch(s).unwrap();
+    }
+    check(
+        &f,
+        &r,
+        &[
+            // Mixed storage classes + NULL -> JSON array [1,2.5,"text",null].
+            "SELECT json_group_array(v) FROM m",
+            // Validity + element count.
+            "SELECT json_valid(json_group_array(v)), json_array_length(json_group_array(v)) FROM m",
+        ],
+        "json_group_array_mixed_and_null",
+    );
+}
+
+#[test]
+#[ignore = "bd-cnwdm: json_group_array not registered as an aggregate"]
+fn json_group_array_empty_group() {
+    let (f, r) = data();
+    check(
+        &f,
+        &r,
+        &[
+            // Aggregate over zero matching rows.
+            "SELECT json_group_array(v) FROM t WHERE v > 1000",
+        ],
+        "json_group_array_empty_group",
+    );
+}

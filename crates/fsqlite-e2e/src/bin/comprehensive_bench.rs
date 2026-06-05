@@ -3232,7 +3232,7 @@ fn profile_fsqlite_insert_with_strategy(
     set_hot_path_profile_enabled(previous_hot_path_profile_enabled);
 
     eprintln!(
-        "    [fs_insert_{}_{}_{count}] insert_profile setup_us={setup_us:.1} begin_us={begin_us:.1} prepare_us={prepare_us:.1} insert_us={insert_us:.1} commit_us={commit_us:.1} rows={count} direct_insert={} fast={} slow={} schema_refreshes={} schema_refresh_ns={} begin_ns={} execute_body_ns={} direct_flush_calls={} direct_flush_ns={} page_run_flushes={} page_run_records={} page_run_bytes={} page_run_owned={} page_run_arena={} page_run_repeated={} page_run_empty_root={} page_run_depth2={} page_run_fallbacks={} page_run_fallback_rows={} commit_pre_ns={} commit_roundtrip_ns={} pager_commit_calls={} pager_phase_a_ns={} pager_wal_ns={} pager_mem_flush_ns={} pager_journal_ns={} pager_c_metadata_ns={} pager_file_size_ns={} pager_unlock_ns={} pager_publish_ns={} pager_cache_finish_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} finalize_post_ns={} parser_multi_calls={} parser_cache_hits={} parser_cache_misses={} parser_parse_ns={} parser_rewrite_ns={} bg_checks={} bg_ns={} op_cx_bg_gates={} dispatch_bg_gates={} pager_pub_refreshes={} commit_refreshes={} prepared_lookup_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} row_build_ns={} preserialize_ns={} preserialize_cell_ns={} preserialize_encode_ns={} row_value_build_ns={} cursor_setup_ns={} serialize_ns={} btree_insert_ns={} memdb_apply_ns={} schema_validation_ns={} autocommit_begin_ns={} autocommit_resolve_ns={} autocommit_executions={} change_tracking_ns={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} btree_leaf_payload_appends={} btree_leaf_payload_mutate_ns={} btree_leaf_payload_stage_ns={} btree_leaf_full_cell_appends={} btree_leaf_full_cell_mutate_ns={} btree_leaf_full_cell_stage_ns={} btree_quick_balance_attempts={} btree_quick_balance_hits={} btree_quick_balance_ns={} btree_local_split_attempts={} btree_local_split_hits={} btree_local_split_ns={} btree_nonroot_balance_calls={} btree_nonroot_balance_ns={} btree_bulk_group={}/{} btree_bulk_leaf_build={}/{} btree_bulk_leaf_write={}/{} btree_bulk_interior_build={}/{} btree_bulk_interior_write={}/{} btree_no_split_reuse_hits={} btree_conservative_reloads={} btree_page_header_rebuilds={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={} wal_frames={} wal_bytes={} wal_group_commits={} wal_group_commit_size_sum={} wal_group_commit_latency_us={} commit_prepare_us={} commit_batch_build_us={} commit_conflict_snapshot_us={} commit_lane_prepare_us={} commit_consolidator_lock_wait_us={} commit_consolidator_flushing_wait_us={} commit_flusher_arrival_wait_us={} commit_wal_backend_lock_wait_us={} commit_exclusive_lock_us={} commit_wal_append_us={} commit_flush_frame_prep_us={} commit_append_conflict_check_us={} commit_append_frames_us={} commit_wal_sync_us={} commit_waiter_epoch_wait_us={} commit_flusher_commits={} commit_waiter_commits={} commit_phase_a_us={} commit_phase_b_us={} commit_phase_c1_us={} commit_phase_c2_us={} commit_phase_count={} commit_flusher_lock_wait_us={} commit_wal_service_us={}",
+        "    [fs_insert_{}_{}_{count}] insert_profile setup_us={setup_us:.1} begin_us={begin_us:.1} prepare_us={prepare_us:.1} insert_us={insert_us:.1} commit_us={commit_us:.1} rows={count} direct_insert={} fast={} slow={} schema_refreshes={} schema_refresh_ns={} begin_ns={} execute_body_ns={} direct_flush_calls={} direct_flush_ns={} page_run_flushes={} page_run_records={} page_run_bytes={} page_run_owned={} page_run_arena={} page_run_repeated={} page_run_empty_root={} page_run_depth2={} page_run_fallbacks={} page_run_fallback_rows={} commit_pre_ns={} commit_roundtrip_ns={} pager_commit_calls={} pager_phase_a_ns={} pager_wal_ns={} pager_mem_flush_ns={} pager_journal_ns={} pager_c_metadata_ns={} pager_file_size_ns={} pager_unlock_ns={} pager_publish_ns={} pager_cache_finish_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} finalize_post_ns={} parser_multi_calls={} parser_cache_hits={} parser_cache_misses={} parser_parse_ns={} parser_rewrite_ns={} bg_checks={} bg_ns={} op_cx_bg_gates={} dispatch_bg_gates={} pager_pub_refreshes={} commit_refreshes={} prepared_lookup_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} row_build_ns={} preserialize_ns={} preserialize_cell_ns={} preserialize_eval_ns={} preserialize_affinity_ns={} preserialize_layout_ns={} preserialize_encode_ns={} row_value_build_ns={} cursor_setup_ns={} serialize_ns={} btree_insert_ns={} memdb_apply_ns={} schema_validation_ns={} autocommit_begin_ns={} autocommit_resolve_ns={} autocommit_executions={} change_tracking_ns={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} btree_leaf_payload_appends={} btree_leaf_payload_mutate_ns={} btree_leaf_payload_stage_ns={} btree_leaf_full_cell_appends={} btree_leaf_full_cell_mutate_ns={} btree_leaf_full_cell_stage_ns={} btree_quick_balance_attempts={} btree_quick_balance_hits={} btree_quick_balance_ns={} btree_local_split_attempts={} btree_local_split_hits={} btree_local_split_ns={} btree_nonroot_balance_calls={} btree_nonroot_balance_ns={} btree_bulk_group={}/{} btree_bulk_leaf_build={}/{} btree_bulk_leaf_write={}/{} btree_bulk_interior_build={}/{} btree_bulk_interior_write={}/{} btree_no_split_reuse_hits={} btree_conservative_reloads={} btree_page_header_rebuilds={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={} wal_frames={} wal_bytes={} wal_group_commits={} wal_group_commit_size_sum={} wal_group_commit_latency_us={} commit_prepare_us={} commit_batch_build_us={} commit_conflict_snapshot_us={} commit_lane_prepare_us={} commit_consolidator_lock_wait_us={} commit_consolidator_flushing_wait_us={} commit_flusher_arrival_wait_us={} commit_wal_backend_lock_wait_us={} commit_exclusive_lock_us={} commit_wal_append_us={} commit_flush_frame_prep_us={} commit_append_conflict_check_us={} commit_append_frames_us={} commit_wal_sync_us={} commit_waiter_epoch_wait_us={} commit_flusher_commits={} commit_waiter_commits={} commit_phase_a_us={} commit_phase_b_us={} commit_phase_c1_us={} commit_phase_c2_us={} commit_phase_count={} commit_flusher_lock_wait_us={} commit_wal_service_us={}",
         label,
         record_size.name(),
         profile.prepared_direct_insert_executions,
@@ -3290,6 +3290,9 @@ fn profile_fsqlite_insert_with_strategy(
         profile.prepared_direct_insert_row_build_time_ns,
         profile.prepared_direct_insert_preserialize_time_ns,
         profile.prepared_direct_insert_preserialize_cell_time_ns,
+        profile.prepared_direct_insert_preserialize_eval_time_ns,
+        profile.prepared_direct_insert_preserialize_affinity_time_ns,
+        profile.prepared_direct_insert_preserialize_layout_time_ns,
         profile.prepared_direct_insert_preserialize_encode_time_ns,
         profile.prepared_direct_insert_row_value_build_time_ns,
         profile.prepared_direct_insert_cursor_setup_time_ns,
@@ -3864,6 +3867,7 @@ mod tests {
             "update",
             "delete",
             "update-delete",
+            "update-delete-throughput",
             "update-deletethroughput",
             "update/delete",
             "dml",
@@ -3873,6 +3877,7 @@ mod tests {
             "update",
             "delete",
             "update-delete",
+            "update-delete-throughput",
             "update-deletethroughput",
             "update/delete",
             "dml",
@@ -4678,9 +4683,27 @@ fn profile_fsqlite_update_delete_dml(
     set_hot_path_profile_enabled(previous_hot_path_profile_enabled);
 
     eprintln!(
-        "    [fs_{kind}_{count}] dml_profile setup_us={setup_us:.1} begin_us={begin_us:.1} prepare_us={prepare_us:.1} mutate_us={mutate_us:.1} commit_us={commit_us:.1} mutations={mutation_count} direct_update={} direct_delete={} delete_qf_ns={} delete_seek_ns={} delete_physical_ns={} delete_leaf_start={}/{} delete_leaf_start_ns={} delete_leaf_active={}/{} delete_leaf_miss={} delete_leaf_miss_shape={} delete_leaf_miss_out_of_leaf={} delete_leaf_miss_duplicate={} delete_leaf_miss_empty_leaf={} delete_leaf_miss_last_cell={} delete_leaf_miss_noncompact={} delete_leaf_miss_cell_shape={} delete_leaf_active_ns={} delete_leaf_flush={}/{} delete_leaf_flush_ns={} delete_leaf_materialize={}/{} delete_leaf_write={}/{} delete_leaf_search={}/{} delete_leaf_dupcheck={}/{} delete_leaf_compact={}/{} delete_leaf_cellparse={}/{} fast={} slow={} ud_fast_lane={} ud_instrumented_lane={} schema_refreshes={} schema_refresh_ns={} begin_ns={} execute_body_ns={} direct_flush_calls={} direct_flush_ns={} commit_pre_ns={} commit_roundtrip_ns={} pager_commit_calls={} pager_phase_a_ns={} pager_wal_ns={} pager_mem_flush_ns={} pager_journal_ns={} pager_c_metadata_ns={} pager_file_size_ns={} pager_unlock_ns={} pager_publish_ns={} pager_cache_finish_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} finalize_post_ns={} parser_multi_calls={} parser_cache_hits={} parser_cache_misses={} parser_parse_ns={} parser_rewrite_ns={} bg_checks={} bg_ns={} op_cx_bg_gates={} dispatch_bg_gates={} pager_pub_refreshes={} commit_refreshes={} prepared_lookup_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={}",
+        "    [fs_{kind}_{count}] dml_profile setup_us={setup_us:.1} begin_us={begin_us:.1} prepare_us={prepare_us:.1} mutate_us={mutate_us:.1} commit_us={commit_us:.1} mutations={mutation_count} direct_update={} direct_delete={} update_leaf_start={}/{} update_leaf_start_ns={} update_leaf_active={}/{} update_leaf_miss={} update_leaf_active_ns={} update_leaf_flush={}/{} update_leaf_flush_ns={} delete_preflush_ns={} delete_rowid_ns={} delete_active_probe_ns={} delete_cursor_setup_ns={} delete_memdb_abandon={}/{} delete_memory_sync={}/{} delete_qf_ns={} delete_seek_ns={} delete_physical_ns={} delete_leaf_start={}/{} delete_leaf_start_ns={} delete_leaf_active={}/{} delete_leaf_miss={} delete_leaf_miss_shape={} delete_leaf_miss_staged={} delete_leaf_miss_out_of_leaf={} delete_leaf_miss_duplicate={} delete_leaf_miss_empty_leaf={} delete_leaf_miss_last_cell={} delete_leaf_miss_noncompact={} delete_leaf_miss_cell_shape={} delete_leaf_active_ns={} delete_leaf_flush={}/{} delete_leaf_flush_ns={} delete_leaf_materialize={}/{} delete_leaf_write={}/{} delete_leaf_search={}/{} delete_leaf_dupcheck={}/{} delete_leaf_compact={}/{} delete_leaf_cellparse={}/{} fast={} slow={} ud_fast_lane={} ud_instrumented_lane={} schema_refreshes={} schema_refresh_ns={} begin_ns={} execute_body_ns={} direct_flush_calls={} direct_flush_ns={} commit_pre_ns={} commit_roundtrip_ns={} pager_commit_calls={} pager_phase_a_ns={} pager_wal_ns={} pager_mem_flush_ns={} pager_journal_ns={} pager_c_metadata_ns={} pager_file_size_ns={} pager_unlock_ns={} pager_publish_ns={} pager_cache_finish_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} finalize_post_ns={} parser_multi_calls={} parser_cache_hits={} parser_cache_misses={} parser_parse_ns={} parser_rewrite_ns={} bg_checks={} bg_ns={} op_cx_bg_gates={} dispatch_bg_gates={} pager_pub_refreshes={} commit_refreshes={} prepared_lookup_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={}",
         profile.prepared_direct_update_executions,
         profile.prepared_direct_delete_executions,
+        profile.prepared_direct_update_leaf_patch_run_start_hits,
+        profile.prepared_direct_update_leaf_patch_run_start_attempts,
+        profile.prepared_direct_update_leaf_patch_run_start_time_ns,
+        profile.prepared_direct_update_leaf_patch_run_active_hits,
+        profile.prepared_direct_update_leaf_patch_run_active_attempts,
+        profile.prepared_direct_update_leaf_patch_run_active_misses,
+        profile.prepared_direct_update_leaf_patch_run_active_time_ns,
+        profile.prepared_direct_update_leaf_patch_run_dirty_flushes,
+        profile.prepared_direct_update_leaf_patch_run_flushes,
+        profile.prepared_direct_update_leaf_patch_run_flush_time_ns,
+        profile.prepared_direct_delete_preflush_time_ns,
+        profile.prepared_direct_delete_rowid_lookup_time_ns,
+        profile.prepared_direct_delete_active_leaf_probe_time_ns,
+        profile.prepared_direct_delete_cursor_setup_time_ns,
+        profile.prepared_direct_delete_memdb_abandon_calls,
+        profile.prepared_direct_delete_memdb_abandon_time_ns,
+        profile.prepared_direct_delete_memory_sync_calls,
+        profile.prepared_direct_delete_memory_sync_time_ns,
         profile.prepared_direct_delete_qf_time_ns,
         profile.prepared_direct_delete_seek_time_ns,
         profile.prepared_direct_delete_physical_delete_time_ns,
@@ -4691,6 +4714,7 @@ fn profile_fsqlite_update_delete_dml(
         profile.prepared_direct_delete_leaf_run_active_attempts,
         profile.prepared_direct_delete_leaf_run_active_misses,
         profile.prepared_direct_delete_leaf_run_active_miss_shape_mismatches,
+        profile.prepared_direct_delete_leaf_run_active_miss_staged_runs,
         profile.prepared_direct_delete_leaf_run_active_miss_rowid_not_in_leaf,
         profile.prepared_direct_delete_leaf_run_active_miss_already_deleted,
         profile.prepared_direct_delete_leaf_run_active_miss_nonroot_would_empty_leaf,
@@ -4776,7 +4800,7 @@ fn profile_fsqlite_update_delete_dml(
 
 fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
     let section = report.add_section(
-        "UPDATE/DELETEThroughput",
+        "UPDATE/DELETE Throughput",
         "Pre-populated table with N rows. Measures batch update (10% of rows) and batch delete (5% of rows).",
     );
 
@@ -5917,6 +5941,7 @@ fn main() {
         "update",
         "delete",
         "update-delete",
+        "update-delete-throughput",
         "update-deletethroughput",
         "update/delete",
         "dml",

@@ -18,6 +18,7 @@ pub mod comparison;
 pub mod concurrency_showcase;
 pub mod corruption;
 pub mod corruption_demo_sqlite;
+pub mod corruption_fingerprint;
 pub mod corruption_scenarios;
 pub mod corruption_walkthrough;
 pub mod executor;
@@ -45,8 +46,10 @@ pub mod run_workspace;
 pub mod smoke;
 pub mod sqlite3_baseline;
 pub mod sqlite_executor;
+pub mod tracing_schema;
 pub mod validation;
 pub mod verification_gates;
+pub mod verify_csqlite;
 pub mod workload;
 
 // ─── Deterministic Seed Constants (bd-mblr.4.3.1) ────────────────────────────

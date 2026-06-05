@@ -27,7 +27,7 @@ fsqlite-error = { workspace = true }
 fsqlite-harness = { workspace = true }
 fsqlite-parser = { workspace = true }
 fsqlite-vdbe = { workspace = true }
-fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.4", default-features = false }
+fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.5", default-features = false }
 fsqlite-types = { workspace = true }
 fsqlite-wal = { workspace = true }
 ftui = { workspace = true, features = ["crossterm"], optional = true }
@@ -114,6 +114,10 @@ harness = false
 name = "concurrent_write_persistent_bench"
 harness = false
 
+[[bench]]
+name = "pipeline_stage_bench"
+harness = false
+
 [[bin]]
 name = "comprehensive-bench"
 path = "src/bin/comprehensive_bench.rs"
@@ -129,3 +133,7 @@ path = "src/bin/swarm_multiprocess.rs"
 [[bin]]
 name = "mt-mvcc-bench"
 path = "src/bin/mt_mvcc_bench.rs"
+
+[[bin]]
+name = "mt-oltp-bench"
+path = "src/bin/mt_oltp_bench.rs"

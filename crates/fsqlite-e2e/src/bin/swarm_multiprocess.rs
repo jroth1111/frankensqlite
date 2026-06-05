@@ -8,14 +8,16 @@
 
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fsqlite::{Connection, FrankenError, SqliteValue};
+use fsqlite_e2e::verify_csqlite::{verify_concurrency_artifact, write_artifact_bundle};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -31,6 +33,7 @@ const ROW_ID_STRIDE: i64 = 1_000_000_000;
 const HOT_ROW_BASE: i64 = -1_000_000;
 const START_DELAY_MS: u64 = 1_500;
 const PARENT_TIMEOUT_GRACE_MS: u64 = 20_000;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_WORKERS: usize = 1_024;
 static GROUP_COMMIT_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 
@@ -86,6 +89,7 @@ struct ChildConfig {
     worker_id: usize,
     start_at_ms: u64,
     report_path: PathBuf,
+    jsonl_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -285,7 +289,32 @@ fn run_parent(config: RunConfig) -> HarnessResult<bool> {
 
     let start_at_ms = unix_time_ms().saturating_add(START_DELAY_MS);
     let workers = spawn_workers(&config, &db_path, &run_dir, start_at_ms)?;
+
+    let heartbeat_stop = Arc::new(AtomicBool::new(false));
+    let heartbeat_handle = {
+        let stop = Arc::clone(&heartbeat_stop);
+        let n_workers = config.workers;
+        let seed = config.seed;
+        thread::spawn(move || {
+            let mut tick = 0_u64;
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(HEARTBEAT_INTERVAL);
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                tick += 1;
+                let elapsed_s = tick * HEARTBEAT_INTERVAL.as_secs();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[swarm-heartbeat] tick={tick} elapsed={elapsed_s}s workers={n_workers} seed={seed}"
+                );
+            }
+        })
+    };
+
     let worker_reports = collect_workers(workers, &config, &run_dir)?;
+    heartbeat_stop.store(true, Ordering::Relaxed);
+    let _ = heartbeat_handle.join();
 
     let wal_shape = timed_criterion("wal_shape", || validate_wal_shape(&db_path));
     let wal_checkpoint = timed_criterion("wal_checkpoint", || {
@@ -302,7 +331,13 @@ fn run_parent(config: RunConfig) -> HarnessResult<bool> {
     });
     let row_counts = collect_row_counts(&db_path, &config);
 
+    let jsonl_check = timed_criterion("jsonl_schema_validation", || {
+        validate_worker_jsonl(&run_dir, config.workers)
+    });
     let wal_corruption = wal_corruption_criterion(&wal_shape, &wal_checkpoint);
+    let csqlite_cross = timed_criterion("csqlite_cross_check", || {
+        csqlite_cross_check(&db_path, &run_dir)
+    });
     let criteria = vec![
         open_check,
         worker_process_criterion(&worker_reports),
@@ -310,11 +345,13 @@ fn run_parent(config: RunConfig) -> HarnessResult<bool> {
         cross_process_visibility_criterion(&worker_reports, &final_visibility, config.workers),
         wrong_row_criterion(&worker_reports),
         busy_timeout_criterion(&worker_reports),
+        jsonl_check,
         wal_corruption,
         wal_shape,
         wal_checkpoint,
         fsqlite_integrity,
         sqlite_integrity,
+        csqlite_cross,
         final_visibility,
     ];
 
@@ -424,6 +461,22 @@ fn run_child_workload(
     let conn = open_fsqlite(db_path)?;
     configure_fsqlite(&conn, config)?;
 
+    let mut jsonl_writer = child
+        .jsonl_path
+        .as_ref()
+        .map(|path| -> HarnessResult<std::io::BufWriter<File>> {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|err| {
+                    format!("failed to create jsonl dir `{}`: {err}", parent.display())
+                })?;
+            }
+            let file = File::create(path).map_err(|err| {
+                format!("failed to create jsonl file `{}`: {err}", path.display())
+            })?;
+            Ok(std::io::BufWriter::new(file))
+        })
+        .transpose()?;
+
     let worker_seed = config
         .seed
         .wrapping_add((child.worker_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -433,12 +486,25 @@ fn run_child_workload(
         live_ids: Vec::new(),
     };
     let deadline = Instant::now() + Duration::from_secs(config.seconds);
+    let mut op_id: u64 = 0;
 
     while config.iters.is_none_or(|limit| counters.iterations < limit) && Instant::now() < deadline
     {
         let committed =
             commit_mixed_transaction(&conn, config, child, &mut state, counters, &mut rng)?;
         counters.iterations = counters.iterations.saturating_add(1);
+        if let Some(writer) = jsonl_writer.as_mut() {
+            emit_op_jsonl(
+                writer,
+                config,
+                child,
+                op_id,
+                "mixed_commit",
+                "ok",
+                &committed,
+            );
+            op_id += 1;
+        }
         verify_committed_own_row(&conn, config, child.worker_id, &committed, counters)?;
         verify_random_pk_lookup(&conn, config, &state, counters, &mut rng)?;
         verify_other_worker_visible(&conn, config, child.worker_id, counters, &mut rng)?;
@@ -752,6 +818,46 @@ fn query_progress(
     progress_row(&rows[0])
 }
 
+fn emit_op_jsonl(
+    writer: &mut std::io::BufWriter<File>,
+    config: &RunConfig,
+    child: &ChildConfig,
+    op_id: u64,
+    op_type: &str,
+    outcome: &str,
+    committed: &CommittedWrite,
+) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let line = serde_json::json!({
+        "ts_unix_nanos": ts,
+        "level": "INFO",
+        "target": "fsqlite_e2e::swarm",
+        "run_id": format!("swarm-seed-{}", config.seed),
+        "trace_id": config.seed,
+        "workspace_id": "fsqlite-swarm",
+        "host": hostname(),
+        "process_id": child.worker_id,
+        "op_id": op_id,
+        "op_type": op_type,
+        "outcome": outcome,
+        "row_id": committed.id,
+        "seq": committed.seq,
+    });
+    let _ = writeln!(writer, "{line}");
+}
+
+fn hostname() -> &'static str {
+    static HOST: OnceLock<String> = OnceLock::new();
+    HOST.get_or_init(|| {
+        fs::read_to_string("/etc/hostname")
+            .map(|h| h.trim().to_owned())
+            .unwrap_or_else(|_| format!("pid-{}", std::process::id()))
+    })
+}
+
 fn trace_swarm_post_commit_visibility(
     conn: &Connection,
     config: &RunConfig,
@@ -969,6 +1075,7 @@ fn spawn_workers(
     let mut workers = Vec::with_capacity(config.workers);
     for worker_id in 0..config.workers {
         let report_path = run_dir.join(format!("worker_{worker_id}.json"));
+        let jsonl_path = run_dir.join(format!("worker_{worker_id}.jsonl"));
         let stdout_path = run_dir.join(format!("worker_{worker_id}.stdout.txt"));
         let stderr_path = run_dir.join(format!("worker_{worker_id}.stderr.txt"));
         let mut command = Command::new(&exe);
@@ -993,7 +1100,9 @@ fn spawn_workers(
             .arg("--start-at-ms")
             .arg(start_at_ms.to_string())
             .arg("--child-report")
-            .arg(&report_path);
+            .arg(&report_path)
+            .arg("--jsonl-path")
+            .arg(&jsonl_path);
         if direct_output {
             let stdout_file = File::create(&stdout_path)
                 .map_err(|err| format!("failed to create `{}`: {err}", stdout_path.display()))?;
@@ -1246,6 +1355,30 @@ fn run_sqlite_integrity_check(db_path: &Path, config: &RunConfig) -> HarnessResu
     } else {
         Err(format!(
             "stock SQLite PRAGMA integrity_check returned `{message}`"
+        ))
+    }
+}
+
+fn csqlite_cross_check(db_path: &Path, run_dir: &Path) -> HarnessResult<String> {
+    let (report, artifact) = verify_concurrency_artifact(db_path)
+        .map_err(|err| format!("csqlite cross-check failed: {err}"))?;
+
+    if let Some(ref art) = artifact {
+        let artifact_dir = run_dir.join("verify_artifacts");
+        if let Err(e) = write_artifact_bundle(art, &artifact_dir, "swarm") {
+            eprintln!("[swarm] WARNING: failed to write verify artifact: {e}");
+        }
+    }
+
+    if report.ok {
+        Ok(format!(
+            "csqlite cross-check PASSED: {} pages, {} tables, {:.1}ms",
+            report.page_count, report.table_count, report.timings.total_ms
+        ))
+    } else {
+        Err(format!(
+            "csqlite cross-check FAILED: quick_check={}, integrity_check={}, wal_checkpoint={}",
+            report.quick_check, report.integrity_check, report.wal_checkpoint
         ))
     }
 }
@@ -1580,6 +1713,54 @@ where
     }
 }
 
+fn validate_worker_jsonl(run_dir: &Path, workers: usize) -> HarnessResult<String> {
+    let mut total_lines = 0_u64;
+    let mut invalid_lines = 0_u64;
+    let required_fields = [
+        "ts_unix_nanos",
+        "level",
+        "target",
+        "run_id",
+        "trace_id",
+        "workspace_id",
+        "host",
+        "process_id",
+        "op_id",
+        "op_type",
+        "outcome",
+    ];
+    for worker_id in 0..workers {
+        let jsonl_path = run_dir.join(format!("worker_{worker_id}.jsonl"));
+        if !jsonl_path.exists() {
+            continue;
+        }
+        let content = fs::read_to_string(&jsonl_path)
+            .map_err(|err| format!("failed to read `{}`: {err}", jsonl_path.display()))?;
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            total_lines += 1;
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(obj) => {
+                    for field in &required_fields {
+                        if obj.get(*field).is_none() {
+                            invalid_lines += 1;
+                            break;
+                        }
+                    }
+                }
+                Err(_) => {
+                    invalid_lines += 1;
+                }
+            }
+        }
+    }
+    if invalid_lines > 0 {
+        return Err(format!(
+            "{invalid_lines}/{total_lines} JSONL lines failed schema validation"
+        ));
+    }
+    Ok(format!("{total_lines} JSONL lines validated, zero invalid"))
+}
+
 fn copy_forensics(db_path: &Path, run_dir: &Path) -> HarnessResult<PathBuf> {
     let forensic_dir = run_dir
         .join("forensics")
@@ -1603,6 +1784,17 @@ fn copy_forensics(db_path: &Path, run_dir: &Path) -> HarnessResult<PathBuf> {
                     destination.display()
                 )
             })?;
+        }
+    }
+    // Copy per-worker JSONL logs and reports into forensics
+    if let Ok(entries) = fs::read_dir(run_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with(".jsonl") || name_str.ends_with(".json") {
+                let destination = forensic_dir.join(&name);
+                let _ = fs::copy(entry.path(), destination);
+            }
         }
     }
     Ok(forensic_dir)
@@ -1629,6 +1821,7 @@ fn parse_args() -> HarnessResult<Mode> {
     let mut worker_id = None;
     let mut start_at_ms = None;
     let mut child_report = None;
+    let mut jsonl_path = None;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -1684,6 +1877,14 @@ fn parse_args() -> HarnessResult<Mode> {
                     "--child-report",
                 )?));
             }
+            "--jsonl-path" => {
+                index = index.saturating_add(1);
+                jsonl_path = Some(PathBuf::from(parse_required_string(
+                    &args,
+                    index,
+                    "--jsonl-path",
+                )?));
+            }
             _ if arg.starts_with("--workers=") => {
                 config.workers = parse_value(arg, "--workers=")?;
             }
@@ -1717,6 +1918,9 @@ fn parse_args() -> HarnessResult<Mode> {
             _ if arg.starts_with("--child-report=") => {
                 child_report = Some(PathBuf::from(strip_prefix(arg, "--child-report=")?));
             }
+            _ if arg.starts_with("--jsonl-path=") => {
+                jsonl_path = Some(PathBuf::from(strip_prefix(arg, "--jsonl-path=")?));
+            }
             _ => return Err(format!("unknown argument `{arg}`\n{}", usage())),
         }
         index = index.saturating_add(1);
@@ -1730,6 +1934,7 @@ fn parse_args() -> HarnessResult<Mode> {
                 .ok_or_else(|| "child mode requires --start-at-ms".to_owned())?,
             report_path: child_report
                 .ok_or_else(|| "child mode requires --child-report".to_owned())?,
+            jsonl_path,
         };
         if child.worker_id >= config.workers {
             return Err(format!(
