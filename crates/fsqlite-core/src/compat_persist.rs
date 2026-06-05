@@ -17,7 +17,8 @@ use std::path::Path;
 
 use fsqlite_ast::{
     ColumnConstraintKind, CreateTableBody, CreateTableStatement, DefaultValue, Expr,
-    GeneratedStorage, IndexedColumn, SortDirection, Statement, TableConstraintKind,
+    GeneratedStorage, IndexedColumn, Literal, SortDirection, Statement, TableConstraintKind,
+    UnaryOp,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_btree::BtreeCursorOps;
@@ -277,9 +278,26 @@ pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
         // "wrong # of entries in index" and "page N: never used" errors when
         // stock SQLite runs integrity_check (issue #55).
         for index in &table.indexes {
-            if index.columns.is_empty() {
+            let is_expression_index = index.columns.is_empty() && !index.key_expressions.is_empty();
+            if index.columns.is_empty() && !is_expression_index {
                 continue;
             }
+            let key_exprs = if is_expression_index {
+                index
+                    .key_expressions
+                    .iter()
+                    .map(|expr| {
+                        fsqlite_parser::expr::parse_expr(expr).map_err(|err| {
+                            FrankenError::Internal(format!(
+                                "failed to parse expression index term `{expr}` while persisting `{}`: {err}",
+                                index.name
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
             // Allocate and initialize root page as leaf index page (0x0A).
             let idx_root = txn.allocate_page(cx)?;
             init_leaf_index_page(cx, &mut txn, idx_root, page_size_usize, usable_size)?;
@@ -316,18 +334,25 @@ pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
                             // If evaluation fails, include the row (safe default).
                         }
 
-                        // Build index key: (indexed_column_values..., rowid).
+                        // Build index key: (indexed_terms..., rowid).
                         let mut key_values: Vec<SqliteValue> = Vec::new();
-                        for col_name in &index.columns {
-                            let col_idx = table
-                                .columns
-                                .iter()
-                                .position(|c| c.name.eq_ignore_ascii_case(col_name));
-                            if let Some(idx) = col_idx {
-                                key_values
-                                    .push(values.get(idx).cloned().unwrap_or(SqliteValue::Null));
-                            } else {
-                                key_values.push(SqliteValue::Null);
+                        if is_expression_index {
+                            for expr in &key_exprs {
+                                key_values.push(eval_join_expr(expr, values, &col_map)?);
+                            }
+                        } else {
+                            for col_name in &index.columns {
+                                let col_idx = table
+                                    .columns
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case(col_name));
+                                if let Some(idx) = col_idx {
+                                    key_values.push(
+                                        values.get(idx).cloned().unwrap_or(SqliteValue::Null),
+                                    );
+                                } else {
+                                    key_values.push(SqliteValue::Null);
+                                }
                             }
                         }
                         key_values.push(SqliteValue::Integer(rowid));
@@ -347,6 +372,16 @@ pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
                 // Prefer original DDL for the same reasons as tables: preserves
                 // exact WHERE clause formatting, collation names, etc.
                 Some(orig.clone())
+            } else if is_expression_index {
+                Some(build_create_expression_index_sql(
+                    &index.name,
+                    &table_name,
+                    index.is_unique,
+                    &index.key_expressions,
+                    &index.key_collations,
+                    &index.key_sort_directions,
+                    index.where_clause.as_deref(),
+                ))
             } else {
                 let terms: Vec<CreateIndexSqlTerm<'_>> = index
                     .columns
@@ -623,6 +658,11 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             foreign_keys,
             check_constraints,
         });
+        let current_table_schema = schema.last().ok_or_else(|| {
+            FrankenError::Internal(format!(
+                "compat loader lost table schema after registering `{table_name_for_err}`"
+            ))
+        })?;
 
         // Read all rows from this table's B-tree.
         let file_root =
@@ -638,13 +678,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 
         if let Some(mem_table) = db.tables.get_mut(&real_root_page) {
             let mut unique_groups = Vec::<(Vec<usize>, Vec<Option<String>>)>::new();
-            for (column_index, column) in schema
-                .last()
-                .expect("current table schema must exist")
-                .columns
-                .iter()
-                .enumerate()
-            {
+            for (column_index, column) in current_table_schema.columns.iter().enumerate() {
                 if column.unique && !column.is_ipk {
                     unique_groups.push((vec![column_index], vec![column.collation.clone()]));
                 }
@@ -658,9 +692,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                     .iter()
                     .enumerate()
                     .filter_map(|(term_idx, column_name)| {
-                        schema
-                            .last()
-                            .expect("current table schema must exist")
+                        current_table_schema
                             .columns
                             .iter()
                             .position(|column| column.name.eq_ignore_ascii_case(column_name))
@@ -673,13 +705,9 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                     })
                     .unzip();
                 if group.is_empty()
-                    || group.iter().all(|&column_index| {
-                        schema
-                            .last()
-                            .expect("current table schema must exist")
-                            .columns[column_index]
-                            .is_ipk
-                    })
+                    || group
+                        .iter()
+                        .all(|&column_index| current_table_schema.columns[column_index].is_ipk)
                     || unique_groups.iter().any(|(existing, _)| existing == &group)
                 {
                     continue;
@@ -709,15 +737,13 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                             ),
                         }
                     })?;
-                    if !without_rowid && let Some(ipk_idx) = ipk_col_idx {
-                        hydrate_rowid_alias_value(
-                            &mut values,
-                            ipk_idx,
-                            rowid,
-                            num_columns,
-                            &table_name_for_err,
-                        )?;
-                    }
+                    inflate_loaded_table_row_values(
+                        &mut values,
+                        rowid,
+                        &current_table_schema.columns,
+                        if without_rowid { None } else { ipk_col_idx },
+                        &table_name_for_err,
+                    )?;
                     mem_table.insert_row(rowid, values);
                     if !cursor.next(cx)? {
                         break;
@@ -763,6 +789,14 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             continue;
         }
 
+        let root_page_u32 = validate_sqlite_master_root_page(&index_name, root_page_num)?;
+        let root_page_i32 =
+            i32::try_from(root_page_u32).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "sqlite_master index `{index_name}` has rootpage {root_page_num} that exceeds supported range"
+                ),
+            })?;
+
         // Find the parent table in the schema.
         let Some(table) = schema
             .iter_mut()
@@ -774,7 +808,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
         // Parse the CREATE INDEX SQL to extract column names, collations,
         // sort directions, and WHERE clause.
         if let Some(idx_schema) =
-            self::parse_create_index_sql_to_schema(&index_name, root_page_num, &create_sql)
+            self::parse_create_index_sql_to_schema(&index_name, root_page_i32, &create_sql)
         {
             // Only add if not already present (avoid duplicates with autoindexes).
             if !table.indexes.iter().any(|i| i.name == index_name) {
@@ -870,63 +904,53 @@ fn init_leaf_index_page(
 /// Returns `None` if the SQL cannot be parsed.
 fn parse_create_index_sql_to_schema(
     index_name: &str,
-    root_page: i64,
+    root_page: i32,
     sql: &str,
 ) -> Option<IndexSchema> {
+    if let Some(Statement::CreateIndex(create)) = parse_single_statement(sql) {
+        return Some(create_index_statement_to_index_schema(
+            index_name, root_page, &create,
+        ));
+    }
+
     // Simple regex-free parser: look for "ON table_name (col1, col2 COLLATE NOCASE DESC)"
-    let upper = sql.to_ascii_uppercase();
-    let is_unique = upper.contains("CREATE UNIQUE INDEX");
-    // Find the column list between the first '(' and matching ')'.
-    let paren_start = sql.find('(')?;
-    let paren_end = sql[paren_start..].find(')')? + paren_start;
+    // while preserving quoted names and comments inside the indexed term list.
+    let keyword_tokens = unquoted_sql_keyword_tokens(sql);
+    let is_unique = unquoted_tokens_contain_phrase(&keyword_tokens, &["CREATE", "UNIQUE", "INDEX"]);
+    // Find the indexed-term list between the unquoted '(' after ON and its
+    // matching ')'.
+    let on_pos = find_unquoted_sql_keyword(sql, "ON")?;
+    let after_on_pos = on_pos + "ON".len();
+    let paren_start = after_on_pos + find_unquoted_sql_char(&sql[after_on_pos..], '(')?;
+    let paren_end = find_matching_sql_paren(sql, paren_start)?;
     let col_list = &sql[paren_start + 1..paren_end];
 
     let mut columns = Vec::new();
     let mut collations = Vec::new();
     let mut directions = Vec::new();
 
-    for part in col_list.split(',') {
-        let tokens: Vec<&str> = part.split_whitespace().collect();
-        if tokens.is_empty() {
-            continue;
-        }
-        // First token is the column name (possibly quoted).
-        let col_name = tokens[0].trim_matches('"');
-        columns.push(col_name.to_owned());
-
-        let mut coll = None;
-        let mut dir = SortDirection::Asc;
-        let mut i = 1;
-        while i < tokens.len() {
-            if tokens[i].eq_ignore_ascii_case("COLLATE") && i + 1 < tokens.len() {
-                coll = Some(tokens[i + 1].trim_matches('"').to_owned());
-                i += 2;
-            } else if tokens[i].eq_ignore_ascii_case("DESC") {
-                dir = SortDirection::Desc;
-                i += 1;
-            } else if tokens[i].eq_ignore_ascii_case("ASC") {
-                dir = SortDirection::Asc;
-                i += 1;
-            } else {
-                i += 1;
-            }
-        }
-        collations.push(coll);
-        directions.push(dir);
+    for part in split_top_level_csv_items(col_list) {
+        let (col_name, remainder) = parse_column_name_and_remainder(&part)?;
+        columns.push(col_name);
+        collations.push(extract_collation_name(remainder));
+        directions.push(extract_index_term_direction(remainder));
     }
 
     // WHERE clause for partial indexes (everything after the closing paren).
-    let after_paren = sql[paren_end + 1..].trim();
-    let where_clause = if after_paren.to_ascii_uppercase().starts_with("WHERE ") {
-        Some(after_paren["WHERE ".len()..].to_owned())
+    let after_paren = trim_leading_sql_space_and_comments(&sql[paren_end + 1..]);
+    let where_clause = if collect_unquoted_sql_keyword_tokens(after_paren)
+        .first()
+        .is_some_and(|(token, start)| token == "WHERE" && *start == 0)
+    {
+        let expr = trim_leading_sql_space_and_comments(&after_paren["WHERE".len()..]);
+        Some(expr.to_owned())
     } else {
         None
     };
 
-    #[allow(clippy::cast_possible_truncation)]
     Some(IndexSchema {
         name: index_name.to_owned(),
-        root_page: root_page as i32,
+        root_page,
         columns,
         key_expressions: Vec::new(),
         key_sort_directions: directions,
@@ -934,6 +958,89 @@ fn parse_create_index_sql_to_schema(
         is_unique,
         key_collations: collations,
     })
+}
+
+fn create_index_statement_to_index_schema(
+    index_name: &str,
+    root_page: i32,
+    create: &fsqlite_ast::CreateIndexStatement,
+) -> IndexSchema {
+    let normalized_terms = create
+        .columns
+        .iter()
+        .map(|indexed| {
+            Some((
+                indexed_column_name(indexed)?.to_owned(),
+                normalized_indexed_column_collation(indexed),
+            ))
+        })
+        .collect::<Option<Vec<_>>>();
+    let (columns, key_expressions, key_collations) =
+        if let Some(normalized_terms) = normalized_terms {
+            (
+                normalized_terms
+                    .iter()
+                    .map(|(column_name, _)| column_name.clone())
+                    .collect(),
+                Vec::new(),
+                normalized_terms
+                    .into_iter()
+                    .map(|(_, collation)| collation)
+                    .collect(),
+            )
+        } else {
+            (
+                Vec::new(),
+                create
+                    .columns
+                    .iter()
+                    .map(|indexed| indexed.expr.to_string())
+                    .collect(),
+                create
+                    .columns
+                    .iter()
+                    .map(normalized_indexed_column_collation)
+                    .collect(),
+            )
+        };
+
+    IndexSchema {
+        name: index_name.to_owned(),
+        root_page,
+        columns,
+        key_expressions,
+        key_sort_directions: create
+            .columns
+            .iter()
+            .map(|indexed| indexed.direction.unwrap_or(SortDirection::Asc))
+            .collect(),
+        where_clause: create.where_clause.as_ref().map(ToString::to_string),
+        is_unique: create.unique,
+        key_collations,
+    }
+}
+
+fn normalized_indexed_column_collation(indexed: &IndexedColumn) -> Option<String> {
+    indexed_column_collation(indexed).map(|collation| collation.to_ascii_uppercase())
+}
+
+fn extract_index_term_direction(remainder: &str) -> SortDirection {
+    let collation_name_range = find_collation_name_range(remainder);
+    let mut direction = SortDirection::Asc;
+    for (token, start) in collect_unquoted_sql_keyword_tokens(remainder) {
+        if collation_name_range
+            .as_ref()
+            .is_some_and(|range| range.contains(&start))
+        {
+            continue;
+        }
+        match token.as_str() {
+            "DESC" => direction = SortDirection::Desc,
+            "ASC" => direction = SortDirection::Asc,
+            _ => {}
+        }
+    }
+    direction
 }
 
 fn quote_identifier(identifier: &str) -> String {
@@ -1385,6 +1492,55 @@ pub(crate) fn build_create_index_sql(
     sql
 }
 
+fn build_create_expression_index_sql(
+    index_name: &str,
+    table_name: &str,
+    unique: bool,
+    expressions: &[String],
+    collations: &[Option<String>],
+    directions: &[SortDirection],
+    where_clause: Option<&str>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut sql = if unique {
+        format!(
+            "CREATE UNIQUE INDEX {} ON {} (",
+            quote_identifier(index_name),
+            quote_identifier(table_name)
+        )
+    } else {
+        format!(
+            "CREATE INDEX {} ON {} (",
+            quote_identifier(index_name),
+            quote_identifier(table_name)
+        )
+    };
+    for (i, expr) in expressions.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(expr);
+        let expression_already_declares_collation = unquoted_sql_keyword_tokens(expr)
+            .iter()
+            .any(|token| token == "COLLATE");
+        if !expression_already_declares_collation
+            && let Some(collation) = collations.get(i).and_then(|c| c.as_deref())
+        {
+            let _ = write!(sql, " COLLATE {}", quote_identifier(collation));
+        }
+        match directions.get(i).copied() {
+            Some(SortDirection::Asc) => sql.push_str(" ASC"),
+            Some(SortDirection::Desc) => sql.push_str(" DESC"),
+            None => {}
+        }
+    }
+    sql.push(')');
+    if let Some(predicate) = where_clause {
+        let _ = write!(sql, " WHERE {predicate}");
+    }
+    sql
+}
+
 /// Parse column info from a CREATE TABLE SQL string.
 ///
 /// This is a best-effort parser that handles the common case of
@@ -1421,10 +1577,18 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
             let tokens: Vec<&str> = remainder.split_whitespace().collect();
             let type_decl = extract_type_declaration(&tokens);
             let affinity = type_to_affinity(&type_decl);
-            let upper = col_def.to_ascii_uppercase();
+            let keyword_tokens = unquoted_sql_keyword_tokens(remainder);
+            let has_primary_key =
+                unquoted_tokens_contain_phrase(&keyword_tokens, &["PRIMARY", "KEY"]);
+            let has_primary_key_desc =
+                unquoted_tokens_contain_phrase(&keyword_tokens, &["PRIMARY", "KEY", "DESC"]);
+            let has_unique = keyword_tokens
+                .iter()
+                .any(|keyword| matches!(keyword.as_str(), "UNIQUE"));
+            let has_not_null = unquoted_tokens_contain_phrase(&keyword_tokens, &["NOT", "NULL"]);
             let is_ipk = !is_without_rowid
-                && upper.contains("PRIMARY KEY")
-                && !upper.contains("PRIMARY KEY DESC")
+                && has_primary_key
+                && !has_primary_key_desc
                 && type_decl.eq_ignore_ascii_case("INTEGER");
             let type_name = if type_decl.is_empty() {
                 None
@@ -1441,28 +1605,15 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
 
             let default_value = extract_default_value(remainder);
 
-            // Extract COLLATE name from column definition.
-            let collation = upper
-                .find("COLLATE ")
-                .map(|pos| {
-                    // Read the collation name from the original (non-uppercased) text.
-                    let after = &col_def[pos + 8..];
-                    after
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .trim_end_matches(',')
-                        .to_owned()
-                })
-                .filter(|s| !s.is_empty());
+            let collation = extract_collation_name(remainder);
 
             Some(ColumnInfo {
                 name,
                 affinity,
                 is_ipk,
                 type_name,
-                notnull: upper.contains("NOT NULL"),
-                unique: upper.contains("UNIQUE") || upper.contains("PRIMARY KEY"),
+                notnull: has_not_null,
+                unique: has_unique || has_primary_key,
                 default_value,
                 strict_type,
                 generated_expr: None,
@@ -1487,18 +1638,20 @@ pub fn parse_columns_from_sqlite_master_sql(sql: &str) -> Vec<ColumnInfo> {
 pub(crate) fn validate_sqlite_master_root_page(name: &str, root_page_num: i64) -> Result<u32> {
     if root_page_num <= 0 {
         return Err(FrankenError::DatabaseCorrupt {
-            detail: format!("table `{name}` has invalid rootpage {root_page_num} in sqlite_master"),
+            detail: format!("sqlite_master entry `{name}` has invalid rootpage {root_page_num}"),
         });
     }
 
     let root_page_u32 =
         u32::try_from(root_page_num).map_err(|_| FrankenError::DatabaseCorrupt {
             detail: format!(
-                "table `{name}` has out-of-range rootpage {root_page_num} in sqlite_master"
+                "sqlite_master entry `{name}` has out-of-range rootpage {root_page_num}"
             ),
         })?;
     i32::try_from(root_page_u32).map_err(|_| FrankenError::DatabaseCorrupt {
-        detail: format!("table `{name}` has rootpage {root_page_num} that exceeds supported range"),
+        detail: format!(
+            "sqlite_master entry `{name}` has rootpage {root_page_num} that exceeds supported range"
+        ),
     })?;
     Ok(root_page_u32)
 }
@@ -1519,21 +1672,7 @@ pub fn is_without_rowid_table_sql(sql: &str) -> bool {
         return false;
     };
     let tail = &sql[close_paren + 1..];
-    let mut tokens = Vec::new();
-    let mut token = String::new();
-    for ch in tail.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            token.push(ch.to_ascii_uppercase());
-        } else if !token.is_empty() {
-            tokens.push(std::mem::take(&mut token));
-        }
-    }
-    if !token.is_empty() {
-        tokens.push(token);
-    }
-    tokens
-        .windows(2)
-        .any(|window| window[0] == "WITHOUT" && window[1] == "ROWID")
+    unquoted_tokens_contain_phrase(&unquoted_sql_keyword_tokens(tail), &["WITHOUT", "ROWID"])
 }
 
 fn parse_virtual_table_columns_from_sql(sql: &str) -> Option<Vec<ColumnInfo>> {
@@ -1616,18 +1755,9 @@ pub fn is_strict_table_sql(sql: &str) -> bool {
         return false;
     };
     let tail = &sql[close_paren + 1..];
-    let mut token = String::new();
-    for ch in tail.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            token.push(ch.to_ascii_uppercase());
-        } else if !token.is_empty() {
-            if token == "STRICT" {
-                return true;
-            }
-            token.clear();
-        }
-    }
-    token == "STRICT"
+    unquoted_sql_keyword_tokens(tail)
+        .iter()
+        .any(|keyword| matches!(keyword.as_str(), "STRICT"))
 }
 
 /// Return true when CREATE TABLE SQL declares AUTOINCREMENT.
@@ -1637,18 +1767,9 @@ pub fn is_autoincrement_table_sql(sql: &str) -> bool {
         return autoincrement_from_create_table_statement(&create);
     }
 
-    let mut token = String::new();
-    for ch in sql.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            token.push(ch.to_ascii_uppercase());
-        } else if !token.is_empty() {
-            if token == "AUTOINCREMENT" {
-                return true;
-            }
-            token.clear();
-        }
-    }
-    token == "AUTOINCREMENT"
+    unquoted_sql_keyword_tokens(sql)
+        .iter()
+        .any(|keyword| matches!(keyword.as_str(), "AUTOINCREMENT"))
 }
 
 pub(crate) fn autoincrement_from_create_table_statement(create: &CreateTableStatement) -> bool {
@@ -1768,11 +1889,14 @@ fn parse_column_name_and_remainder(def: &str) -> Option<(String, &str)> {
         b'`' => parse_quoted_identifier(trimmed, b'`', b'`')?,
         b'[' => parse_bracket_identifier(trimmed)?,
         _ => {
-            let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+            let end = find_unquoted_name_end(trimmed);
             (&trimmed[..end], &trimmed[end..])
         }
     };
-    Some((strip_identifier_quotes(name_raw), remainder.trim_start()))
+    Some((
+        strip_identifier_quotes(name_raw),
+        trim_leading_sql_space_and_comments(remainder),
+    ))
 }
 
 fn parse_single_statement(sql: &str) -> Option<Statement> {
@@ -1819,56 +1943,341 @@ fn indexed_column_collation(indexed_column: &IndexedColumn) -> Option<String> {
         .or_else(|| extract(&indexed_column.expr).map(str::to_owned))
 }
 
-fn hydrate_rowid_alias_value(
-    values: &mut Vec<SqliteValue>,
-    ipk_idx: usize,
-    rowid: i64,
-    num_columns: usize,
-    table_name: &str,
-) -> Result<()> {
-    match values.len() {
-        len if len + 1 == num_columns => {
-            values.insert(ipk_idx, SqliteValue::Integer(rowid));
+fn strip_wrapping_default_parens(mut default_sql: &str) -> &str {
+    loop {
+        let trimmed = default_sql.trim();
+        let bytes = trimmed.as_bytes();
+        if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
+            return trimmed;
         }
-        len if len == num_columns => match values.get_mut(ipk_idx) {
-            Some(slot @ SqliteValue::Null) => {
-                *slot = SqliteValue::Integer(rowid);
+
+        let mut depth = 0_i32;
+        let mut idx = 0_usize;
+        let mut wraps_entire_expr = false;
+        while idx < bytes.len() {
+            match bytes[idx] {
+                quote @ (b'\'' | b'"') => {
+                    idx += 1;
+                    while idx < bytes.len() {
+                        if bytes[idx] == quote {
+                            if idx + 1 < bytes.len() && bytes[idx + 1] == quote {
+                                idx += 2;
+                            } else {
+                                idx += 1;
+                                break;
+                            }
+                        } else {
+                            idx += 1;
+                        }
+                    }
+                    continue;
+                }
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        wraps_entire_expr = idx == bytes.len() - 1;
+                        break;
+                    }
+                    if depth < 0 {
+                        return trimmed;
+                    }
+                }
+                _ => {}
             }
-            Some(SqliteValue::Integer(encoded_rowid)) if *encoded_rowid == rowid => {}
-            Some(SqliteValue::Integer(encoded_rowid)) => {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "table `{table_name}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}"
-                    ),
-                });
-            }
-            Some(other) => {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "table `{table_name}` rowid {rowid} stores non-integer INTEGER PRIMARY KEY alias value {other:?}"
-                    ),
-                });
-            }
-            None => {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "table `{table_name}` rowid {rowid} payload is missing INTEGER PRIMARY KEY alias column"
-                    ),
-                });
-            }
-        },
-        len => {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "table `{table_name}` rowid {rowid} payload has {len} columns; expected {} or {}",
-                    num_columns.saturating_sub(1),
-                    num_columns
-                ),
-            });
+            idx += 1;
         }
+
+        if !wraps_entire_expr || depth != 0 {
+            return trimmed;
+        }
+        default_sql = &trimmed[1..trimmed.len() - 1];
+    }
+}
+
+fn parse_wrapped_default_text(default_sql: &str, quote: char) -> Option<SqliteValue> {
+    if !default_sql.starts_with(quote) {
+        return None;
+    }
+    let mut value = String::new();
+    let body = &default_sql[quote.len_utf8()..];
+    let mut chars = body.char_indices().peekable();
+
+    while let Some((offset, ch)) = chars.next() {
+        if ch != quote {
+            value.push(ch);
+            continue;
+        }
+        if let Some((_, next_ch)) = chars.peek()
+            && *next_ch == quote
+        {
+            value.push(quote);
+            let _ = chars.next();
+            continue;
+        }
+        let absolute_end = quote.len_utf8() + offset + ch.len_utf8();
+        return (absolute_end == default_sql.len()).then(|| SqliteValue::Text(value.into()));
     }
 
+    None
+}
+
+fn loaded_default_literal_value(literal: &Literal) -> Option<SqliteValue> {
+    match literal {
+        Literal::Integer(value) => Some(SqliteValue::Integer(*value)),
+        Literal::Float(value) => Some(SqliteValue::Float(*value)),
+        Literal::String(value) => Some(SqliteValue::Text(value.clone().into())),
+        Literal::Blob(value) => Some(SqliteValue::from(value.clone())),
+        Literal::Null => Some(SqliteValue::Null),
+        Literal::True => Some(SqliteValue::Integer(1)),
+        Literal::False => Some(SqliteValue::Integer(0)),
+        Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp => None,
+    }
+}
+
+fn loaded_constant_default_expr_value(expr: &Expr) -> Option<SqliteValue> {
+    match expr {
+        Expr::Literal(literal, _) => loaded_default_literal_value(literal),
+        Expr::UnaryOp {
+            op: UnaryOp::Plus,
+            expr,
+            ..
+        } => match loaded_constant_default_expr_value(expr)? {
+            value @ (SqliteValue::Integer(_) | SqliteValue::Float(_)) => Some(value),
+            _ => None,
+        },
+        Expr::UnaryOp {
+            op: UnaryOp::Negate,
+            expr,
+            ..
+        } => match loaded_constant_default_expr_value(expr)? {
+            SqliteValue::Integer(value) => Some(
+                value
+                    .checked_neg()
+                    .map_or_else(|| SqliteValue::Float(-(value as f64)), SqliteValue::Integer),
+            ),
+            SqliteValue::Float(value) => Some(SqliteValue::Float(-value)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_loaded_column_default_value(default_sql: &str) -> SqliteValue {
+    let default_sql = strip_wrapping_default_parens(default_sql);
+    if let Some(value) = parse_wrapped_default_text(default_sql, '\'')
+        .or_else(|| parse_wrapped_default_text(default_sql, '"'))
+    {
+        return value;
+    }
+    if let Ok(expr) = fsqlite_parser::expr::parse_expr(default_sql)
+        && let Some(value) = loaded_constant_default_expr_value(&expr)
+    {
+        return value;
+    }
+    SqliteValue::Text(default_sql.into())
+}
+
+fn inflate_loaded_table_row_values(
+    values: &mut Vec<SqliteValue>,
+    rowid: i64,
+    columns: &[ColumnInfo],
+    rowid_alias_col_idx: Option<usize>,
+    table_name: &str,
+) -> Result<()> {
+    let num_columns = columns.len();
+    if values.len() > num_columns {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "table `{table_name}` rowid {rowid} payload has {} columns; expected at most {num_columns}",
+                values.len()
+            ),
+        });
+    }
+    if let Some(ipk_idx) = rowid_alias_col_idx
+        && ipk_idx >= num_columns
+    {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "table `{table_name}` rowid {rowid} has invalid INTEGER PRIMARY KEY alias column index {ipk_idx}"
+            ),
+        });
+    }
+
+    let payload_values = std::mem::take(values);
+    let inflated = inflate_loaded_table_row_values_from_payload(
+        &payload_values,
+        rowid,
+        columns,
+        rowid_alias_col_idx,
+        table_name,
+    )?;
+    *values = inflated;
+
     Ok(())
+}
+
+fn inflate_loaded_table_row_values_from_payload(
+    payload_values: &[SqliteValue],
+    rowid: i64,
+    columns: &[ColumnInfo],
+    rowid_alias_col_idx: Option<usize>,
+    table_name: &str,
+) -> Result<Vec<SqliteValue>> {
+    let Some(ipk_idx) = rowid_alias_col_idx else {
+        return inflate_loaded_table_row_values_with_alias_alignment(
+            payload_values,
+            rowid,
+            columns,
+            None,
+            false,
+            table_name,
+        );
+    };
+
+    if payload_values.len() == columns.len() {
+        return inflate_loaded_table_row_values_with_alias_alignment(
+            payload_values,
+            rowid,
+            columns,
+            Some(ipk_idx),
+            true,
+            table_name,
+        );
+    }
+
+    let Some(value_at_alias_position) = payload_values.get(ipk_idx) else {
+        return inflate_loaded_table_row_values_with_alias_alignment(
+            payload_values,
+            rowid,
+            columns,
+            Some(ipk_idx),
+            false,
+            table_name,
+        );
+    };
+
+    let alias_slot_could_be_present = match value_at_alias_position {
+        SqliteValue::Null => true,
+        SqliteValue::Integer(encoded_rowid) => *encoded_rowid == rowid,
+        _ => false,
+    };
+    if !alias_slot_could_be_present {
+        return inflate_loaded_table_row_values_with_alias_alignment(
+            payload_values,
+            rowid,
+            columns,
+            Some(ipk_idx),
+            false,
+            table_name,
+        );
+    }
+
+    let with_alias = inflate_loaded_table_row_values_with_alias_alignment(
+        payload_values,
+        rowid,
+        columns,
+        Some(ipk_idx),
+        true,
+        table_name,
+    )?;
+    let without_alias = inflate_loaded_table_row_values_with_alias_alignment(
+        payload_values,
+        rowid,
+        columns,
+        Some(ipk_idx),
+        false,
+        table_name,
+    )?;
+    let with_alias_valid = loaded_row_values_satisfy_notnull(columns, &with_alias);
+    let without_alias_valid = loaded_row_values_satisfy_notnull(columns, &without_alias);
+
+    if !with_alias_valid && !without_alias_valid {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "table `{table_name}` rowid {rowid} short payload violates NOT NULL constraints under both rowid-alias alignments"
+            ),
+        });
+    }
+    if with_alias_valid
+        && (!without_alias_valid || matches!(value_at_alias_position, SqliteValue::Null))
+    {
+        Ok(with_alias)
+    } else {
+        Ok(without_alias)
+    }
+}
+
+fn inflate_loaded_table_row_values_with_alias_alignment(
+    payload_values: &[SqliteValue],
+    rowid: i64,
+    columns: &[ColumnInfo],
+    rowid_alias_col_idx: Option<usize>,
+    payload_includes_rowid_alias: bool,
+    table_name: &str,
+) -> Result<Vec<SqliteValue>> {
+    let mut inflated = Vec::with_capacity(columns.len());
+    let mut payload_idx = 0_usize;
+
+    for (col_idx, column) in columns.iter().enumerate() {
+        if rowid_alias_col_idx == Some(col_idx) && !payload_includes_rowid_alias {
+            inflated.push(SqliteValue::Integer(rowid));
+            continue;
+        }
+
+        let value = if let Some(value) = payload_values.get(payload_idx) {
+            payload_idx += 1;
+            value.clone()
+        } else if let Some(default_sql) = column.default_value.as_ref() {
+            parse_loaded_column_default_value(default_sql)
+        } else {
+            SqliteValue::Null
+        };
+
+        if rowid_alias_col_idx == Some(col_idx) {
+            match &value {
+                SqliteValue::Null => {
+                    inflated.push(SqliteValue::Integer(rowid));
+                    continue;
+                }
+                SqliteValue::Integer(encoded_rowid) if *encoded_rowid == rowid => {}
+                SqliteValue::Integer(encoded_rowid) => {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{table_name}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}"
+                        ),
+                    });
+                }
+                other => {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{table_name}` rowid {rowid} stores non-integer INTEGER PRIMARY KEY alias value {other:?}"
+                        ),
+                    });
+                }
+            }
+        }
+
+        inflated.push(value);
+    }
+
+    if payload_idx != payload_values.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "table `{table_name}` rowid {rowid} left {} payload columns unconsumed after rowid-alias inflation",
+                payload_values.len() - payload_idx
+            ),
+        });
+    }
+
+    Ok(inflated)
+}
+
+fn loaded_row_values_satisfy_notnull(columns: &[ColumnInfo], values: &[SqliteValue]) -> bool {
+    values.len() == columns.len()
+        && columns.iter().zip(values.iter()).all(|(column, value)| {
+            !column.notnull || column.is_ipk || !matches!(value, SqliteValue::Null)
+        })
 }
 
 fn table_primary_key_is_rowid_alias(
@@ -2103,7 +2512,7 @@ const COLUMN_CONSTRAINT_KEYWORDS: &[&str] = &[
 ];
 
 /// Split a comma-separated SQL list while respecting parentheses, quotes,
-/// and top-level `-- ...` line comments.
+/// and SQL comments.
 fn split_top_level_csv_items(input: &str) -> Vec<String> {
     let mut chars = input.char_indices().peekable();
     let mut out = Vec::new();
@@ -2166,6 +2575,21 @@ fn split_top_level_csv_items(input: &str) -> Vec<String> {
                     }
                 }
             }
+            '/' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '*') => {
+                chars.next();
+                let ends_with_whitespace = current.chars().last().is_some_and(char::is_whitespace);
+                if !current.trim_end().is_empty() && !ends_with_whitespace {
+                    current.push(' ');
+                }
+
+                let mut previous = '\0';
+                for (_, next_ch) in chars.by_ref() {
+                    if previous == '*' && next_ch == '/' {
+                        break;
+                    }
+                    previous = next_ch;
+                }
+            }
             '(' => {
                 paren_depth = paren_depth.saturating_add(1);
                 current.push(ch);
@@ -2193,6 +2617,22 @@ fn split_top_level_csv_items(input: &str) -> Vec<String> {
     out
 }
 
+fn find_unquoted_name_end(input: &str) -> usize {
+    let mut chars = input.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if ch.is_whitespace() {
+            return idx;
+        }
+        if ch == '-' && chars.peek().is_some_and(|(_, next_ch)| *next_ch == '-') {
+            return idx;
+        }
+        if ch == '/' && chars.peek().is_some_and(|(_, next_ch)| *next_ch == '*') {
+            return idx;
+        }
+    }
+    input.len()
+}
+
 fn starts_with_unquoted_table_constraint(def: &str) -> bool {
     let trimmed = def.trim_start();
     if trimmed.is_empty() {
@@ -2215,6 +2655,237 @@ fn starts_with_unquoted_table_constraint(def: &str) -> bool {
         || upper.starts_with("FOREIGN KEY")
         || upper.starts_with("FOREIGN(")
         || upper == "FOREIGN"
+}
+
+type SqlCharIndices<'a> = std::iter::Peekable<std::str::CharIndices<'a>>;
+
+fn unquoted_sql_keyword_tokens(input: &str) -> Vec<String> {
+    collect_unquoted_sql_keyword_tokens(input)
+        .into_iter()
+        .map(|(token, _)| token)
+        .collect()
+}
+
+fn find_unquoted_sql_keyword(input: &str, keyword: &str) -> Option<usize> {
+    let keyword = keyword.to_ascii_uppercase();
+    collect_unquoted_sql_keyword_tokens(input)
+        .into_iter()
+        .find_map(|(token, start)| (token == keyword).then_some(start))
+}
+
+fn find_unquoted_sql_char(input: &str, target: char) -> Option<usize> {
+    let mut chars = input.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '\'' | '"' | '`' => skip_quoted_sql(&mut chars, ch),
+            '[' => skip_bracket_identifier(&mut chars),
+            '-' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '-') => {
+                let _ = chars.next();
+                skip_line_comment(&mut chars);
+            }
+            '/' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '*') => {
+                let _ = chars.next();
+                skip_block_comment(&mut chars);
+            }
+            _ if ch == target => return Some(idx),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_matching_sql_paren(input: &str, open_idx: usize) -> Option<usize> {
+    if input.as_bytes().get(open_idx).copied() != Some(b'(') {
+        return None;
+    }
+
+    let mut depth = 0_usize;
+    let mut chars = input[open_idx..].char_indices().peekable();
+    while let Some((rel_idx, ch)) = chars.next() {
+        let idx = open_idx + rel_idx;
+        match ch {
+            '\'' | '"' | '`' => skip_quoted_sql(&mut chars, ch),
+            '[' => skip_bracket_identifier(&mut chars),
+            '-' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '-') => {
+                let _ = chars.next();
+                skip_line_comment(&mut chars);
+            }
+            '/' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '*') => {
+                let _ = chars.next();
+                skip_block_comment(&mut chars);
+            }
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn trim_leading_sql_space_and_comments(mut input: &str) -> &str {
+    loop {
+        let trimmed = input.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("--") {
+            let end = rest.find(['\n', '\r']).map_or(rest.len(), |idx| idx + 1);
+            input = &rest[end..];
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/*") {
+            let Some(end) = rest.find("*/") else {
+                return "";
+            };
+            input = &rest[end + 2..];
+            continue;
+        }
+        return trimmed;
+    }
+}
+
+fn collect_unquoted_sql_keyword_tokens(input: &str) -> Vec<(String, usize)> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut current_start = 0_usize;
+    let mut chars = input.char_indices().peekable();
+
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '\'' | '"' | '`' => {
+                push_keyword_token(&mut tokens, &mut current, current_start);
+                skip_quoted_sql(&mut chars, ch);
+            }
+            '[' => {
+                push_keyword_token(&mut tokens, &mut current, current_start);
+                skip_bracket_identifier(&mut chars);
+            }
+            '-' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '-') => {
+                let _ = chars.next();
+                push_keyword_token(&mut tokens, &mut current, current_start);
+                skip_line_comment(&mut chars);
+            }
+            '/' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '*') => {
+                let _ = chars.next();
+                push_keyword_token(&mut tokens, &mut current, current_start);
+                skip_block_comment(&mut chars);
+            }
+            _ if ch.is_ascii_alphanumeric() || matches!(ch, '_') => {
+                if current.is_empty() {
+                    current_start = idx;
+                }
+                current.push(ch.to_ascii_uppercase());
+            }
+            _ => push_keyword_token(&mut tokens, &mut current, current_start),
+        }
+    }
+
+    push_keyword_token(&mut tokens, &mut current, current_start);
+    tokens
+}
+
+fn push_keyword_token(
+    tokens: &mut Vec<(String, usize)>,
+    current: &mut String,
+    current_start: usize,
+) {
+    if !current.is_empty() {
+        tokens.push((std::mem::take(current), current_start));
+    }
+}
+
+fn skip_quoted_sql(chars: &mut SqlCharIndices<'_>, quote: char) {
+    while let Some((_, ch)) = chars.next() {
+        if ch != quote {
+            continue;
+        }
+        if chars.peek().is_some_and(|(_, next_ch)| *next_ch == quote) {
+            let _ = chars.next();
+        } else {
+            break;
+        }
+    }
+}
+
+fn skip_bracket_identifier(chars: &mut SqlCharIndices<'_>) {
+    for (_, ch) in chars.by_ref() {
+        if ch == ']' {
+            break;
+        }
+    }
+}
+
+fn skip_line_comment(chars: &mut SqlCharIndices<'_>) {
+    for (_, ch) in chars.by_ref() {
+        if ch == '\n' || ch == '\r' {
+            break;
+        }
+    }
+}
+
+fn skip_block_comment(chars: &mut SqlCharIndices<'_>) {
+    let mut previous = '\0';
+    for (_, ch) in chars.by_ref() {
+        if previous == '*' && ch == '/' {
+            break;
+        }
+        previous = ch;
+    }
+}
+
+fn unquoted_tokens_contain_phrase(tokens: &[String], phrase: &[&str]) -> bool {
+    !phrase.is_empty()
+        && tokens.len() >= phrase.len()
+        && tokens.windows(phrase.len()).any(|window| {
+            window
+                .iter()
+                .zip(phrase)
+                .all(|(token, expected)| token.as_str() == *expected)
+        })
+}
+
+fn extract_collation_name(remainder: &str) -> Option<String> {
+    let raw_name = remainder.get(find_collation_name_range(remainder)?)?;
+    let name = strip_sql_name_quotes(raw_name);
+    (!name.is_empty()).then(|| name.to_ascii_uppercase())
+}
+
+fn find_collation_name_range(remainder: &str) -> Option<std::ops::Range<usize>> {
+    let pos = find_unquoted_sql_keyword(remainder, "COLLATE")?;
+    let after = trim_leading_sql_space_and_comments(&remainder[pos + 7..]);
+    let start = remainder.len().checked_sub(after.len())?;
+    let bytes = after.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let raw_len = match bytes[0] {
+        b'\'' => parse_quoted_identifier(after, b'\'', b'\'')?.0,
+        b'"' => parse_quoted_identifier(after, b'"', b'"')?.0,
+        b'`' => parse_quoted_identifier(after, b'`', b'`')?.0,
+        b'[' => parse_bracket_identifier(after)?.0,
+        _ => {
+            let end = after
+                .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                .unwrap_or(after.len());
+            &after[..end]
+        }
+    }
+    .len();
+    (raw_len > 0).then_some(start..start + raw_len)
+}
+
+fn strip_sql_name_quotes(token: &str) -> String {
+    let trimmed = token.trim();
+    if trimmed.len() >= 2 {
+        if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+            return trimmed[1..trimmed.len() - 1].replace("''", "'");
+        }
+        return strip_identifier_quotes(trimmed);
+    }
+    trimmed.to_owned()
 }
 
 fn strip_identifier_quotes(token: &str) -> String {
@@ -2257,36 +2928,65 @@ fn extract_type_declaration(tokens: &[&str]) -> String {
 
 /// Extract a DEFAULT value from a column definition remainder (the part after
 /// the column name).  Handles `DEFAULT literal`, `DEFAULT -number`,
-/// `DEFAULT 'string'`, and `DEFAULT (expr)`.
+/// `DEFAULT 'string'`, `DEFAULT "string"`, and `DEFAULT (expr)`.
 fn extract_default_value(remainder: &str) -> Option<String> {
-    let upper = remainder.to_ascii_uppercase();
-    let pos = upper.find("DEFAULT")?;
-    let after = remainder[pos + 7..].trim_start();
+    let pos = find_unquoted_sql_keyword(remainder, "DEFAULT")?;
+    let after = trim_leading_sql_space_and_comments(&remainder[pos + 7..]);
     if after.is_empty() {
         return None;
     }
     // Parenthesized expression: DEFAULT (...)
     if after.starts_with('(') {
         let mut depth = 0i32;
-        for (i, ch) in after.char_indices() {
-            if ch == '(' {
-                depth += 1;
-            } else if ch == ')' {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(after[..=i].to_owned());
+        let bytes = after.as_bytes();
+        let mut idx = 0_usize;
+        while idx < bytes.len() {
+            match bytes[idx] {
+                quote @ (b'\'' | b'"') => {
+                    idx += 1;
+                    while idx < bytes.len() {
+                        if bytes[idx] == quote {
+                            if idx + 1 < bytes.len() && bytes[idx + 1] == quote {
+                                idx += 2;
+                            } else {
+                                idx += 1;
+                                break;
+                            }
+                        } else {
+                            idx += 1;
+                        }
+                    }
+                    continue;
                 }
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(after[..=idx].to_owned());
+                    }
+                    if depth < 0 {
+                        return None;
+                    }
+                }
+                _ => {}
             }
+            idx += 1;
         }
         return None;
     }
-    // Quoted string: DEFAULT '...'
-    if let Some(rest) = after.strip_prefix('\'') {
+    // Quoted string: DEFAULT '...' or DEFAULT "..."
+    if let Some(quote) = after
+        .as_bytes()
+        .first()
+        .copied()
+        .filter(|quote| matches!(*quote, b'\'' | b'"'))
+    {
+        let rest = &after[1..];
         let mut i = 0;
         let bytes = rest.as_bytes();
         while i < bytes.len() {
-            if bytes[i] == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+            if bytes[i] == quote {
+                if i + 1 < bytes.len() && bytes[i + 1] == quote {
                     i += 2;
                     continue;
                 }
@@ -2348,6 +3048,58 @@ mod tests {
     fn load_test_db(path: &Path) -> Result<LoadedState> {
         let cx = Cx::new();
         load_from_sqlite(&cx, path)
+    }
+
+    #[test]
+    fn test_parse_loaded_default_text_requires_complete_quoted_literal() {
+        assert_eq!(
+            parse_loaded_column_default_value("'can''t'"),
+            SqliteValue::Text("can't".into()),
+        );
+        assert_eq!(
+            parse_loaded_column_default_value(r#""a""b""#),
+            SqliteValue::Text("a\"b".into()),
+        );
+        assert_eq!(
+            parse_loaded_column_default_value("'x' || 'y'"),
+            SqliteValue::Text("'x' || 'y'".into()),
+        );
+        assert_eq!(
+            parse_loaded_column_default_value("('a)b')"),
+            SqliteValue::Text("a)b".into()),
+        );
+        assert_eq!(
+            parse_loaded_column_default_value(r#"("a)b")"#),
+            SqliteValue::Text("a)b".into()),
+        );
+        assert_eq!(
+            extract_default_value("TEXT DEFAULT ('a)b')").as_deref(),
+            Some("('a)b')")
+        );
+        assert_eq!(
+            extract_default_value(r#"TEXT DEFAULT ("a)b")"#).as_deref(),
+            Some(r#"("a)b")"#)
+        );
+        assert_eq!(
+            extract_default_value("TEXT CHECK (note <> 'DEFAULT bad') DEFAULT 'ok'").as_deref(),
+            Some("'ok'")
+        );
+        assert_eq!(
+            extract_default_value("TEXT CHECK (note <> 'DEFAULT bad')").as_deref(),
+            None
+        );
+        assert_eq!(
+            extract_default_value("TEXT /* DEFAULT 'bad' */ DEFAULT 'ok'").as_deref(),
+            Some("'ok'")
+        );
+        assert_eq!(
+            extract_default_value("TEXT DEFAULT /* comment */ 'ok'").as_deref(),
+            Some("'ok'")
+        );
+        assert_eq!(
+            extract_default_value("TEXT DEFAULT -- comment\n 'ok'").as_deref(),
+            Some("'ok'")
+        );
     }
 
     fn make_test_schema_and_db() -> (Vec<TableSchema>, MemDatabase) {
@@ -2574,6 +3326,147 @@ mod tests {
         assert_eq!(rows[1].0, 20);
         assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
         assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
+    }
+
+    #[test]
+    fn test_load_sqlite3_rowid_alias_multi_alter_short_rows_preserves_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_ipk_multi_alter.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (
+                    prefix TEXT,
+                    id INTEGER PRIMARY KEY,
+                    nullable TEXT,
+                    required TEXT NOT NULL
+                 );
+                 INSERT INTO items(prefix, id, nullable, required)
+                 VALUES ('p', 7, NULL, 'keep');
+                 ALTER TABLE items ADD COLUMN extra TEXT DEFAULT 'x';
+                 ALTER TABLE items ADD COLUMN note INTEGER DEFAULT 9;",
+            )
+            .unwrap();
+        }
+
+        let loaded = load_test_db(&db_path).unwrap();
+        assert_eq!(loaded.schema.len(), 1);
+        assert_eq!(loaded.schema[0].name, "items");
+
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 7);
+        assert_eq!(rows[0].1[0], SqliteValue::Text("p".into()));
+        assert_eq!(rows[0].1[1], SqliteValue::Integer(7));
+        assert_eq!(rows[0].1[2], SqliteValue::Null);
+        assert_eq!(rows[0].1[3], SqliteValue::Text("keep".into()));
+        assert_eq!(rows[0].1[4], SqliteValue::Text("x".into()));
+        assert_eq!(rows[0].1[5], SqliteValue::Integer(9));
+    }
+
+    #[test]
+    fn test_load_sqlite3_rowid_alias_parenthesized_added_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_ipk_parenthesized_defaults.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO items(id, name) VALUES (3, 'alpha');
+                 ALTER TABLE items ADD COLUMN score INTEGER DEFAULT (9);
+                 ALTER TABLE items ADD COLUMN tag TEXT DEFAULT ('fallback');",
+            )
+            .unwrap();
+        }
+
+        let loaded = load_test_db(&db_path).unwrap();
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 3);
+        assert_eq!(rows[0].1[0], SqliteValue::Integer(3));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[0].1[2], SqliteValue::Integer(9));
+        assert_eq!(rows[0].1[3], SqliteValue::Text("fallback".into()));
+    }
+
+    #[test]
+    fn test_load_sqlite3_altered_short_rows_parse_boolean_blob_and_quoted_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_ipk_literal_defaults.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO items(id, name) VALUES (5, 'alpha');
+                 ALTER TABLE items ADD COLUMN active BOOLEAN DEFAULT TRUE;
+                 ALTER TABLE items ADD COLUMN disabled BOOLEAN DEFAULT FALSE;
+                 ALTER TABLE items ADD COLUMN payload BLOB DEFAULT X'6162';
+                 ALTER TABLE items ADD COLUMN tag TEXT DEFAULT "fallback";"#,
+            )
+            .unwrap();
+        }
+
+        let loaded = load_test_db(&db_path).unwrap();
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 5);
+        assert_eq!(rows[0].1[0], SqliteValue::Integer(5));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[0].1[2], SqliteValue::Integer(1));
+        assert_eq!(rows[0].1[3], SqliteValue::Integer(0));
+        assert_eq!(rows[0].1[4], SqliteValue::from(vec![0x61, 0x62]));
+        assert_eq!(rows[0].1[5], SqliteValue::Text("fallback".into()));
+    }
+
+    #[test]
+    fn test_inflate_loaded_rowid_alias_omitted_slot_keeps_shifted_null_alignment() {
+        let column = |name: &str, affinity: char, is_ipk: bool| ColumnInfo {
+            name: name.to_owned(),
+            affinity,
+            is_ipk,
+            type_name: None,
+            notnull: false,
+            unique: false,
+            default_value: None,
+            strict_type: None,
+            generated_expr: None,
+            generated_stored: None,
+            collation: None,
+        };
+        let mut required = column("required", 'B', false);
+        required.notnull = true;
+        let mut extra = column("extra", 'B', false);
+        extra.default_value = Some("'x'".to_owned());
+        let mut note = column("note", 'D', false);
+        note.default_value = Some("9".to_owned());
+        let columns = vec![
+            column("prefix", 'B', false),
+            column("id", 'D', true),
+            column("nullable", 'B', false),
+            required,
+            extra,
+            note,
+        ];
+        let mut values = vec![
+            SqliteValue::Text("p".into()),
+            SqliteValue::Null,
+            SqliteValue::Text("keep".into()),
+        ];
+
+        inflate_loaded_table_row_values(&mut values, 7, &columns, Some(1), "items").unwrap();
+
+        assert_eq!(values[0], SqliteValue::Text("p".into()));
+        assert_eq!(values[1], SqliteValue::Integer(7));
+        assert_eq!(values[2], SqliteValue::Null);
+        assert_eq!(values[3], SqliteValue::Text("keep".into()));
+        assert_eq!(values[4], SqliteValue::Text("x".into()));
+        assert_eq!(values[5], SqliteValue::Integer(9));
     }
 
     #[test]
@@ -2853,9 +3746,12 @@ PRAGMA integrity_check;
 
     #[test]
     fn test_parse_columns_from_create_sql_ignores_constraint_keywords_inside_default_literals() {
-        let sql = "CREATE TABLE t (note TEXT DEFAULT 'NOT NULL UNIQUE PRIMARY KEY')";
+        let sql = r#"CREATE TABLE t (
+            note TEXT DEFAULT 'NOT NULL UNIQUE PRIMARY KEY',
+            tag TEXT DEFAULT "fallback"
+        )"#;
         let cols = parse_columns_from_create_sql(sql);
-        assert_eq!(cols.len(), 1);
+        assert_eq!(cols.len(), 2);
         assert!(!cols[0].notnull);
         assert!(!cols[0].unique);
         assert!(!cols[0].is_ipk);
@@ -2863,6 +3759,63 @@ PRAGMA integrity_check;
             cols[0].default_value.as_deref(),
             Some("'NOT NULL UNIQUE PRIMARY KEY'")
         );
+        assert_eq!(cols[1].default_value.as_deref(), Some("fallback"));
+    }
+
+    #[test]
+    fn test_parse_columns_fallback_ignores_constraint_keywords_inside_default_literals() {
+        let sql = r#"CREATE TABLE t (
+            note TEXT DEFAULT 'NOT NULL UNIQUE PRIMARY KEY COLLATE bogus',
+            actual INTEGER DEFAULT "PRIMARY KEY" PRIMARY KEY,
+            required TEXT DEFAULT "UNIQUE" NOT NULL,
+            uniq TEXT DEFAULT "NOT NULL" UNIQUE COLLATE nocase
+        ) trailing"#;
+        let cols = parse_columns_from_create_sql(sql);
+
+        assert_eq!(cols.len(), 4);
+        assert!(!cols[0].notnull);
+        assert!(!cols[0].unique);
+        assert!(!cols[0].is_ipk);
+        assert_eq!(cols[0].collation, None);
+        assert!(cols[1].is_ipk);
+        assert!(cols[1].unique);
+        assert!(cols[2].notnull);
+        assert!(!cols[2].unique);
+        assert!(!cols[3].notnull);
+        assert!(cols[3].unique);
+        assert_eq!(cols[3].collation.as_deref(), Some("NOCASE"));
+    }
+
+    #[test]
+    fn test_parse_columns_fallback_finds_unquoted_default_keyword() {
+        let sql = r#"CREATE TABLE t (
+            note TEXT CHECK (note <> 'DEFAULT NOT NULL') DEFAULT 'ok',
+            other TEXT CHECK (other <> "DEFAULT UNIQUE")
+        ) trailing"#;
+        let cols = parse_columns_from_create_sql(sql);
+
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].default_value.as_deref(), Some("'ok'"));
+        assert!(!cols[0].notnull);
+        assert_eq!(cols[1].default_value, None);
+        assert!(!cols[1].unique);
+    }
+
+    #[test]
+    fn test_parse_columns_fallback_keeps_quoted_collation_names() {
+        let sql = r#"CREATE TABLE t (
+            name TEXT COLLATE "NOCASE",
+            code TEXT COLLATE [RTRIM],
+            note TEXT COLLATE 'BINARY',
+            tag/* name/type comment, comma */TEXT COLLATE/* collation comment, comma */`NOCASE`
+        ) trailing"#;
+        let cols = parse_columns_from_create_sql(sql);
+
+        assert_eq!(cols.len(), 4);
+        assert_eq!(cols[0].collation.as_deref(), Some("NOCASE"));
+        assert_eq!(cols[1].collation.as_deref(), Some("RTRIM"));
+        assert_eq!(cols[2].collation.as_deref(), Some("BINARY"));
+        assert_eq!(cols[3].collation.as_deref(), Some("NOCASE"));
     }
 
     #[test]
@@ -3410,6 +4363,9 @@ PRAGMA integrity_check;
         assert!(!is_autoincrement_table_sql(
             "CREATE TABLE t(id INTEGER PRIMARY KEY, note TEXT DEFAULT 'AUTOINCREMENT')"
         ));
+        assert!(!is_autoincrement_table_sql(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, note TEXT DEFAULT 'AUTOINCREMENT') trailing"
+        ));
     }
 
     #[test]
@@ -3450,6 +4406,62 @@ PRAGMA integrity_check;
         assert_eq!(type_to_affinity("VARCHAR"), 'B');
         assert_eq!(type_to_affinity("BLOB"), 'A');
         assert_eq!(type_to_affinity("NUMERIC"), 'C');
+    }
+
+    #[test]
+    fn test_parse_create_index_sql_preserves_quoted_collations_and_comments() {
+        let sql = r#"CREATE INDEX "idx(words)" ON "items(table)" (
+            "last, name" COLLATE /* keep comment invisible */ [RTRIM] DESC,
+            code/* comma, paren ), and COLLATE text stay in comment */COLLATE 'BINARY',
+            tag COLLATE DESC,
+            ord COLLATE [DESC] DESC
+        ) /* index tail */ WHERE active = 1"#;
+
+        let idx = parse_create_index_sql_to_schema("idx(words)", 7, sql).unwrap();
+
+        assert_eq!(
+            idx.columns,
+            vec![
+                "last, name".to_owned(),
+                "code".to_owned(),
+                "tag".to_owned(),
+                "ord".to_owned()
+            ]
+        );
+        assert_eq!(
+            idx.key_collations,
+            vec![
+                Some("RTRIM".to_owned()),
+                Some("BINARY".to_owned()),
+                Some("DESC".to_owned()),
+                Some("DESC".to_owned())
+            ]
+        );
+        assert_eq!(
+            idx.key_sort_directions,
+            vec![
+                SortDirection::Desc,
+                SortDirection::Asc,
+                SortDirection::Asc,
+                SortDirection::Desc
+            ]
+        );
+        assert_eq!(idx.where_clause.as_deref(), Some("active = 1"));
+    }
+
+    #[test]
+    fn test_parse_create_index_sql_preserves_expression_terms() {
+        let sql =
+            "CREATE UNIQUE INDEX uq_agents_name_ci ON agents(lower(name) DESC) WHERE is_active = 1";
+
+        let idx = parse_create_index_sql_to_schema("uq_agents_name_ci", 7, sql).unwrap();
+
+        assert!(idx.columns.is_empty());
+        assert_eq!(idx.key_expressions.len(), 1);
+        assert_eq!(idx.key_expressions[0].to_ascii_lowercase(), "lower(name)");
+        assert_eq!(idx.key_sort_directions, vec![SortDirection::Desc]);
+        assert_eq!(idx.where_clause.as_deref(), Some("is_active = 1"));
+        assert!(idx.is_unique);
     }
 
     #[test]
@@ -3494,6 +4506,173 @@ PRAGMA integrity_check;
         assert_eq!(
             sql,
             "CREATE UNIQUE INDEX \"idx\"\"q\" ON \"ta\"\"ble\" (\"na\"\"me\" COLLATE \"NO\"\"CASE\" DESC)"
+        );
+    }
+
+    #[test]
+    fn test_build_create_expression_index_sql_does_not_duplicate_collation() {
+        let expressions = vec!["lower(name) COLLATE NOCASE".to_owned()];
+        let collations = vec![Some("NOCASE".to_owned())];
+        let directions = vec![SortDirection::Desc];
+
+        let sql = build_create_expression_index_sql(
+            "idx_expr",
+            "agents",
+            false,
+            &expressions,
+            &collations,
+            &directions,
+            Some("is_active = 1"),
+        );
+
+        assert_eq!(
+            sql,
+            "CREATE INDEX \"idx_expr\" ON \"agents\" (lower(name) COLLATE NOCASE DESC) WHERE is_active = 1"
+        );
+    }
+
+    #[test]
+    fn test_persist_to_sqlite_keeps_expression_index_btree_and_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("expression-index-persist.db");
+        let cx = Cx::new();
+
+        let mut db = MemDatabase::new();
+        db.create_table_at(2, 3);
+        let table_data = db.get_table_mut(2).unwrap();
+        table_data.insert_row(
+            1,
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("Alpha".into()),
+                SqliteValue::Integer(1),
+            ],
+        );
+        table_data.insert_row(
+            2,
+            vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Text("Dormant".into()),
+                SqliteValue::Integer(0),
+            ],
+        );
+
+        let schema = vec![TableSchema {
+            name: "agents".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_owned(),
+                    affinity: 'D',
+                    is_ipk: true,
+                    type_name: Some("INTEGER".to_owned()),
+                    notnull: false,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+                ColumnInfo {
+                    name: "name".to_owned(),
+                    affinity: 'B',
+                    is_ipk: false,
+                    type_name: Some("TEXT".to_owned()),
+                    notnull: true,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+                ColumnInfo {
+                    name: "is_active".to_owned(),
+                    affinity: 'D',
+                    is_ipk: false,
+                    type_name: Some("INTEGER".to_owned()),
+                    notnull: true,
+                    unique: false,
+                    default_value: Some("1".to_owned()),
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+            ],
+            indexes: vec![IndexSchema {
+                name: "uq_agents_name_ci".to_owned(),
+                root_page: 3,
+                columns: Vec::new(),
+                key_expressions: vec!["lower(name)".to_owned()],
+                key_sort_directions: vec![SortDirection::Asc],
+                where_clause: Some("is_active = 1".to_owned()),
+                is_unique: true,
+                key_collations: vec![None],
+            }],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: vec![vec!["id".to_owned()]],
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }];
+        let header = DatabaseHeader {
+            page_size: DEFAULT_PAGE_SIZE,
+            schema_cookie: 1,
+            change_counter: 1,
+            version_valid_for: 1,
+            ..DatabaseHeader::default()
+        };
+        let mut original_ddl = HashMap::new();
+        original_ddl.insert(
+            "agents".to_owned(),
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1)"
+                .to_owned(),
+        );
+        original_ddl.insert(
+            "uq_agents_name_ci".to_owned(),
+            "CREATE UNIQUE INDEX uq_agents_name_ci ON agents(lower(name)) WHERE is_active = 1"
+                .to_owned(),
+        );
+
+        persist_to_sqlite_with_header_and_master_entries(
+            &cx,
+            &db_path,
+            &schema,
+            &db,
+            &header,
+            &[],
+            &original_ddl,
+        )
+        .unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let index_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_agents_name_ci';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            index_sql.to_ascii_lowercase().contains("lower(name)")
+                && index_sql
+                    .to_ascii_lowercase()
+                    .contains("where is_active = 1"),
+            "expression index SQL should be preserved: {index_sql}"
+        );
+        let duplicate = conn.execute(
+            "INSERT INTO agents(name, is_active) VALUES ('ALPHA', 1);",
+            [],
+        );
+        assert!(
+            duplicate.is_err(),
+            "persisted expression index should still enforce active-name uniqueness"
         );
     }
 
@@ -3646,6 +4825,36 @@ PRAGMA integrity_check;
             message.contains("supported range")
                 || message.contains("out-of-range")
                 || message.contains("2147483648"),
+            "unexpected load error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_load_from_sqlite_rejects_index_rootpage_above_supported_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compat_corrupt_index_rootpage_large.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r"
+                CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
+                CREATE INDEX docs_title_idx ON docs(title);
+                PRAGMA writable_schema = ON;
+                UPDATE sqlite_master SET rootpage = 2147483648 WHERE name = 'docs_title_idx';
+                PRAGMA writable_schema = OFF;
+                ",
+            )
+            .unwrap();
+        }
+
+        let err = match load_test_db(&db_path) {
+            Ok(_) => panic!("oversized index rootpage should fail load"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("docs_title_idx") && message.contains("2147483648"),
             "unexpected load error: {message}"
         );
     }

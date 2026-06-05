@@ -34,7 +34,7 @@ linux-asupersync-uring = ["native", "fsqlite-vfs/linux-asupersync-uring"]
 [dependencies]
 fsqlite-types = { path = "../fsqlite-types", version = "0.1.3", default-features = false }
 fsqlite-error = { workspace = true }
-fsqlite-vfs = { version = "0.1.4", path = "../fsqlite-vfs", default-features = false }
+fsqlite-vfs = { version = "0.1.5", path = "../fsqlite-vfs", default-features = false }
 fsqlite-pager = { version = "0.1.3", path = "../fsqlite-pager", default-features = false }
 fsqlite-wal = { version = "0.1.3", path = "../fsqlite-wal", default-features = false }
 fsqlite-mvcc = { version = "0.1.3", path = "../fsqlite-mvcc", default-features = false }

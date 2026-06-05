@@ -25,6 +25,19 @@ use std::sync::{Mutex, MutexGuard};
 
 static FAST_PATH_PROFILE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+struct FastPathProfileIsolationGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl FastPathProfileIsolationGuard {
+    fn new() -> Self {
+        let lock = FAST_PATH_PROFILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self { _lock: lock }
+    }
+}
+
 struct FastPathProfileTestGuard {
     _lock: MutexGuard<'static, ()>,
     previous_enabled: bool,
@@ -594,6 +607,7 @@ fn test_slow_path_schema_change_then_fast_path_recovery() {
 /// T5: Fast path works with all parameter types.
 #[test]
 fn test_fast_path_parameterized() {
+    let _profile_isolation = FastPathProfileIsolationGuard::new();
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, score REAL, data BLOB)")
         .unwrap();
@@ -651,6 +665,7 @@ fn test_slow_path_view_expansion() {
 /// T7: Complex queries (JOINs, subqueries) still produce correct results.
 #[test]
 fn test_no_regression_complex_queries() {
+    let _profile_isolation = FastPathProfileIsolationGuard::new();
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL)")
         .unwrap();
@@ -811,6 +826,52 @@ fn test_fast_path_prepared_update() {
     );
 }
 
+#[test]
+fn test_prepared_update_vdbe_constraint_error_restores_row_in_explicit_txn() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT NOT NULL)")
+        .unwrap();
+    conn.execute("CREATE TRIGGER t_update_noop AFTER UPDATE ON t BEGIN SELECT 1; END")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 'before')").unwrap();
+    conn.execute("BEGIN").unwrap();
+
+    let stmt = conn.prepare("UPDATE t SET val = ?1 WHERE id = ?2").unwrap();
+    reset_hot_path_profile();
+    let err = stmt
+        .execute_with_params(&[
+            fsqlite_types::SqliteValue::Null,
+            fsqlite_types::SqliteValue::Integer(1),
+        ])
+        .expect_err("NOT NULL violating prepared UPDATE should fail");
+    assert!(
+        err.to_string().contains("NOT NULL"),
+        "unexpected prepared UPDATE error: {err}"
+    );
+    let profile = hot_path_profile_snapshot();
+    assert_eq!(
+        profile.parser.fast_path_executions, 0,
+        "triggered table should force the prepared UPDATE through VDBE, not the direct lane"
+    );
+    assert_eq!(
+        profile.parser.slow_path_executions, 1,
+        "constraint regression must cover the VDBE-backed prepared UPDATE path"
+    );
+
+    let rows = conn.query("SELECT id, val FROM t ORDER BY id").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values(),
+        &[
+            fsqlite_types::SqliteValue::Integer(1),
+            fsqlite_types::SqliteValue::Text("before".into()),
+        ],
+        "VDBE-backed prepared UPDATE must restore the original row after a constraint error"
+    );
+    conn.execute("COMMIT").unwrap();
+}
+
 /// T10: Prepared DELETE uses fast lane on file-backed WAL (bd-db300.5.2.2.3).
 #[test]
 fn test_fast_path_prepared_delete() {
@@ -873,6 +934,7 @@ fn test_fast_path_prepared_delete() {
 /// the deferred path because FK enforcement requires post-statement checking.
 #[test]
 fn test_deferred_dml_no_publication_proof() {
+    let _profile_isolation = FastPathProfileIsolationGuard::new();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let path = tmp.path().to_str().unwrap();
     let conn = Connection::open(path).unwrap();
@@ -1087,7 +1149,7 @@ fn test_file_backed_publication_refresh_counts() {
         "INSERT should reuse prebound publication (≤1 refresh): got {insert_pub}"
     );
 
-    // Measure UPDATE (deferred-DML path — currently double-refreshes).
+    // Measure UPDATE (deferred-DML path; this used to double-refresh).
     reset_hot_path_profile();
     let before_upd = hot_path_profile_snapshot();
     update_stmt
@@ -1136,6 +1198,7 @@ fn test_file_backed_publication_refresh_counts() {
 /// (bd-db300.5.2.2.3 / bd-db300.5.2.2.4).
 #[test]
 fn test_entry_proof_no_publication_for_memory_update_delete() {
+    let _profile_isolation = FastPathProfileIsolationGuard::new();
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
@@ -1175,6 +1238,7 @@ fn test_entry_proof_no_publication_for_memory_update_delete() {
 /// without regression (bd-db300.5.2.2.3 / bd-db300.5.2.2.4).
 #[test]
 fn test_entry_proof_within_explicit_transaction() {
+    let _profile_isolation = FastPathProfileIsolationGuard::new();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let path = tmp.path().to_str().unwrap();
     let conn = Connection::open(path).unwrap();
@@ -1470,6 +1534,70 @@ fn test_fast_path_count_sum_and_covering_indexed_equality_shapes_stay_direct() {
 }
 
 #[test]
+fn test_count_in_list_respects_alias_qualifier_boundary() {
+    let _profile_isolation = FastPathProfileIsolationGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'alpha')").unwrap();
+
+    let err = conn
+        .query("SELECT COUNT(*) FROM t AS alias_t WHERE t.name IN ('alpha')")
+        .expect_err("original table qualifier should not bypass an alias");
+    assert!(
+        matches!(err, fsqlite_error::FrankenError::NoSuchColumn { ref name } if name == "t.name"),
+        "a hidden base-table qualifier should fail specifically as an unresolved column, not as a parser/internal error: {err:?}"
+    );
+}
+
+#[test]
+fn test_count_in_list_respects_non_binary_column_collation() {
+    let _profile_isolation = FastPathProfileIsolationGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'alpha'), (2, 'beta')")
+        .unwrap();
+
+    let rows = conn
+        .query("SELECT COUNT(*) FROM t WHERE name IN ('ALPHA')")
+        .unwrap();
+    assert_eq!(
+        rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Integer(1)),
+        "NOCASE column collation should be preserved when COUNT IN-list fast path declines"
+    );
+}
+
+#[test]
+fn test_count_in_list_applies_column_affinity_to_literals() {
+    let _profile_isolation = FastPathProfileIsolationGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER, label TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1, '1'), (2, 2, '2')")
+        .unwrap();
+
+    let numeric_rows = conn
+        .query("SELECT COUNT(*) FROM t WHERE n IN ('1')")
+        .unwrap();
+    assert_eq!(
+        numeric_rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Integer(1)),
+        "INTEGER affinity should coerce numeric-looking text literals before COUNT IN-list hashing"
+    );
+
+    let text_rows = conn
+        .query("SELECT COUNT(*) FROM t WHERE label IN (1)")
+        .unwrap();
+    assert_eq!(
+        text_rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Integer(1)),
+        "TEXT affinity should coerce numeric literals before COUNT IN-list hashing"
+    );
+}
+
+#[test]
 fn test_fast_path_count_star_sum_empty_table_returns_zero_and_null() {
     let _profile_guard = FastPathProfileTestGuard::new();
     let conn = Connection::open(":memory:").unwrap();
@@ -1548,6 +1676,45 @@ fn test_fast_path_count_star_sum_uses_trailing_column_defaults() {
     assert_eq!(
         slow_delta, 0,
         "trailing DEFAULT COUNT(*)+SUM() should not need slow-path execution"
+    );
+}
+
+#[test]
+fn test_rowid_alias_short_record_reload_preserves_trailing_default() {
+    let _profile_isolation = FastPathProfileIsolationGuard::new();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_str().unwrap();
+
+    {
+        let conn = Connection::open(path).unwrap();
+        conn.execute("CREATE TABLE t(marker TEXT, id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("INSERT INTO t(marker, id) VALUES ('alpha', 1)")
+            .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN score INTEGER DEFAULT 7")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    let conn = Connection::open(path).unwrap();
+    let rows = conn
+        .query("SELECT marker, id, score FROM t WHERE id = 1")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values(),
+        &[
+            fsqlite_types::SqliteValue::Text("alpha".into()),
+            fsqlite_types::SqliteValue::Integer(1),
+            fsqlite_types::SqliteValue::Integer(7),
+        ],
+        "rehydrating a short record should replace the INTEGER PRIMARY KEY alias slot without shifting the trailing default column"
+    );
+    let integrity_rows = conn.query("PRAGMA integrity_check").unwrap();
+    assert_eq!(
+        integrity_rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Text("ok".into())),
+        "integrity checking should use the same rowid-alias/default alignment"
     );
 }
 
@@ -1775,6 +1942,7 @@ fn test_fast_path_count_star_sum_sees_writes_after_repeated_overlay_reads()
 
 #[test]
 fn test_fast_path_group_by_rowid_bucket_sum_matches_sqlite_reference_rows() {
+    let _profile_isolation = FastPathProfileIsolationGuard::new();
     const CREATE_TABLE: &str =
         "CREATE TABLE bench(id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL NOT NULL)";
 
@@ -1799,6 +1967,7 @@ fn test_fast_path_group_by_rowid_bucket_sum_matches_sqlite_reference_rows() {
 
 #[test]
 fn test_track_s_insert_10k_matches_rusqlite_oracle() {
+    let _profile_isolation = FastPathProfileIsolationGuard::new();
     const ROW_COUNT: i64 = 10_000;
     const CREATE_TABLE: &str =
         "CREATE TABLE bench(id INTEGER PRIMARY KEY, label TEXT NOT NULL, score INTEGER NOT NULL)";
@@ -1842,6 +2011,7 @@ fn test_track_s_insert_10k_matches_rusqlite_oracle() {
 
 #[test]
 fn test_track_s_select_after_insert_matches_rusqlite_oracle() {
+    let _profile_isolation = FastPathProfileIsolationGuard::new();
     const CREATE_TABLE: &str =
         "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT NOT NULL, score INTEGER NOT NULL)";
     const INSERT_SQL: &str = "INSERT INTO t VALUES (?1, lower(?2), abs(?3))";

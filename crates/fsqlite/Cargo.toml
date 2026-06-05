@@ -12,7 +12,7 @@ asupersync = { workspace = true, optional = true }
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-core = { version = "0.1.3", path = "../fsqlite-core", default-features = false }
-fsqlite-vfs = { version = "0.1.4", path = "../fsqlite-vfs", default-features = false }
+fsqlite-vfs = { version = "0.1.5", path = "../fsqlite-vfs", default-features = false }
 fsqlite-ext-json = { workspace = true, optional = true }
 fsqlite-ext-fts5 = { workspace = true, optional = true }
 fsqlite-ext-fts3 = { workspace = true, optional = true }
@@ -40,8 +40,9 @@ mvcc = []
 
 [dev-dependencies]
 fsqlite-ast = { workspace = true }
+fsqlite-func = { workspace = true }
 rand = { workspace = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["functions"] }
 tempfile = { workspace = true }
 
 [lints]

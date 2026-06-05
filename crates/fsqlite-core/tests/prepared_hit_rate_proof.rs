@@ -301,6 +301,7 @@ fn test_prepared_full_reload_reuses_publication_after_cross_connection_ddl() {
 
 /// B3.4 Probe: Measure commit_txn_roundtrip_time_ns for :memory: autocommit INSERTs.
 /// Uses AUTO-ROWID inserts to test the implicit_rowid_hint fast path.
+// ubs:ignore false positive: generated test values are bound parameters, not SQL text.
 #[test]
 fn test_b3_4_memory_autocommit_commit_roundtrip_probe() {
     let _profile_guard = HotPathProfileTestGuard::new();
@@ -491,15 +492,14 @@ fn test_b3_small_3col_autocommit_direct_insert_profile_breakdown() {
 
 /// bd-wwqen.3: Proof test for column-list INSERT direct path eligibility.
 ///
-/// This test documents the current behavior where column-list INSERT syntax
-/// (e.g., `INSERT INTO t(col1, col2) VALUES(?, ?)`) bypasses the direct insert
-/// fast path. Once the bd-wwqen.3 fix is landed, this test should be updated
-/// to assert that direct_insert_executions equals n.
+/// This test proves that column-list INSERT syntax
+/// (e.g., `INSERT INTO t(col1, col2) VALUES(?, ?)`) stays eligible for the
+/// direct insert fast path, including reordered column lists.
 ///
 /// Key findings:
 /// 1. Without column list: `INSERT INTO t VALUES(?, ?)` → direct path
-/// 2. With column list: `INSERT INTO t(col1, col2) VALUES(?, ?)` → VDBE path
-/// 3. The fix should reorder VALUES to match table column order
+/// 2. With column list: `INSERT INTO t(col1, col2) VALUES(?, ?)` → direct path
+/// 3. Reordered VALUES are mapped back to table column order
 #[test]
 fn test_bd_wwqen_3_column_list_insert_direct_path_eligibility() {
     let _profile_guard = HotPathProfileTestGuard::new();
@@ -544,7 +544,7 @@ fn test_bd_wwqen_3_column_list_insert_direct_path_eligibility() {
     // Clear table for next test
     conn.execute("DELETE FROM col_order_test").unwrap();
 
-    // Test 2: With column list in SAME order (currently bypasses direct path)
+    // Test 2: With column list in SAME order.
     let stmt_same_order = conn
         .prepare("INSERT INTO col_order_test(id, name, value) VALUES(?1, ?2, ?3)")
         .unwrap();
@@ -570,22 +570,12 @@ fn test_bd_wwqen_3_column_list_insert_direct_path_eligibility() {
         snap_same_order.prepared_insert_fast_lane_hits
     );
 
-    // CURRENT BEHAVIOR: Column-list INSERT bypasses direct path
-    // TODO(bd-wwqen.3): After fix, change this to assert_eq!(..., 100)
-    eprintln!(
-        "NOTE: Column-list INSERT currently bypasses direct path (direct_insert_executions={})",
-        snap_same_order.prepared_direct_insert_executions
+    assert_eq!(
+        snap_same_order.prepared_direct_insert_executions, 100,
+        "same-order column-list INSERT should use the direct insert path"
     );
-    // Assert current behavior - will fail when fix is landed, signaling time to update
-    if snap_same_order.prepared_direct_insert_executions == 100 {
-        eprintln!("SUCCESS: bd-wwqen.3 fix is active - column-list INSERT now uses direct path!");
-    } else {
-        eprintln!(
-            "EXPECTED (pre-fix): Column-list INSERT uses VDBE path, direct_insert_executions=0"
-        );
-    }
 
-    // Test 3: With column list in DIFFERENT order (reordering needed)
+    // Test 3: With column list in DIFFERENT order.
     conn.execute("DELETE FROM col_order_test").unwrap();
     let stmt_diff_order = conn
         .prepare("INSERT INTO col_order_test(value, name, id) VALUES(?1, ?2, ?3)")
@@ -627,30 +617,327 @@ fn test_bd_wwqen_3_column_list_insert_direct_path_eligibility() {
     );
     // Verify reordering: value should be 50 * 2.5 = 125.0
     assert_eq!(sample[0].values()[2], SqliteValue::Float(125.0));
+    assert_eq!(
+        snap_diff_order.prepared_direct_insert_executions, 100,
+        "reordered column-list INSERT should use the direct insert path"
+    );
 
-    // Summary for post-fix validation
+    // Summary for regression validation.
     eprintln!("\n=== bd-wwqen.3 VALIDATION SUMMARY ===");
     eprintln!(
         "Test 1 (no col list):    direct_insert_executions = {} (expected: 100)",
         snap_no_cols.prepared_direct_insert_executions
     );
     eprintln!(
-        "Test 2 (same order):     direct_insert_executions = {} (expected after fix: 100)",
+        "Test 2 (same order):     direct_insert_executions = {} (expected: 100)",
         snap_same_order.prepared_direct_insert_executions
     );
     eprintln!(
-        "Test 3 (diff order):     direct_insert_executions = {} (expected after fix: 100)",
+        "Test 3 (diff order):     direct_insert_executions = {} (expected: 100)",
         snap_diff_order.prepared_direct_insert_executions
     );
-    let fix_active = snap_same_order.prepared_direct_insert_executions == 100
-        && snap_diff_order.prepared_direct_insert_executions == 100;
-    eprintln!(
-        "FIX STATUS: {}",
-        if fix_active {
-            "ACTIVE - column-list INSERT uses direct path"
-        } else {
-            "NOT YET - column-list INSERT still uses VDBE path"
-        }
-    );
     eprintln!("=== END bd-wwqen.3 eligibility test ===");
+}
+
+#[test]
+fn prepared_direct_delete_duplicate_and_absent_counts_match_sqlite() {
+    let _profile_guard = HotPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    let ddl = "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL);";
+    conn.execute(ddl).unwrap();
+    sqlite.execute(ddl, []).unwrap();
+
+    let insert = conn.prepare("INSERT INTO bench VALUES (?1, ?2);").unwrap();
+    let mut sqlite_insert = sqlite
+        .prepare("INSERT INTO bench VALUES (?1, ?2);")
+        .unwrap();
+    for rowid in 1_i64..=5_i64 {
+        let name = format!("user_{rowid}");
+        sqlite_insert
+            .execute(rusqlite::params![rowid, &name])
+            .unwrap();
+        insert
+            .execute_with_params(&[SqliteValue::Integer(rowid), SqliteValue::Text(name.into())])
+            .unwrap();
+    }
+    drop(sqlite_insert);
+
+    let delete = conn.prepare("DELETE FROM bench WHERE id = ?1;").unwrap();
+    let mut sqlite_delete = sqlite.prepare("DELETE FROM bench WHERE id = ?1;").unwrap();
+    conn.execute("BEGIN;").unwrap();
+    sqlite.execute("BEGIN;", []).unwrap();
+
+    for (rowid, expected_affected) in [(1_i64, 1), (1, 0), (2, 1), (99, 0), (3, 1), (2, 0)] {
+        let fsqlite_affected = conn
+            .execute_prepared_with_params(&delete, &[SqliteValue::Integer(rowid)])
+            .expect("prepared direct delete should execute");
+        let sqlite_affected = sqlite_delete
+            .execute(rusqlite::params![rowid])
+            .expect("sqlite delete should execute");
+        assert_eq!(
+            sqlite_affected, expected_affected,
+            "SQLite reference affected-count mismatch for rowid {rowid}"
+        );
+        assert_eq!(
+            fsqlite_affected, expected_affected,
+            "FrankenSQLite affected-count mismatch for rowid {rowid}"
+        );
+    }
+    drop(sqlite_delete);
+
+    let fsqlite_total = conn
+        .query_row("SELECT count(*) FROM bench;")
+        .expect("fsqlite read-your-writes count should execute");
+    let sqlite_total: i64 = sqlite
+        .query_row("SELECT count(*) FROM bench;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(sqlite_total, 2);
+    assert_eq!(
+        fsqlite_total.values()[0],
+        SqliteValue::Integer(sqlite_total)
+    );
+
+    let fsqlite_survivors = conn
+        .query_row("SELECT count(*) FROM bench WHERE id IN (4, 5);")
+        .expect("fsqlite survivor count should execute");
+    let sqlite_survivors: i64 = sqlite
+        .query_row(
+            "SELECT count(*) FROM bench WHERE id IN (4, 5);",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sqlite_survivors, 2);
+    assert_eq!(
+        fsqlite_survivors.values()[0],
+        SqliteValue::Integer(sqlite_survivors)
+    );
+
+    conn.execute("COMMIT;").unwrap();
+    sqlite.execute("COMMIT;", []).unwrap();
+
+    let fsqlite_remaining = conn
+        .query_row("SELECT count(*) FROM bench WHERE id <= 3;")
+        .expect("fsqlite post-commit deleted count should execute");
+    let sqlite_remaining: i64 = sqlite
+        .query_row("SELECT count(*) FROM bench WHERE id <= 3;", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(sqlite_remaining, 0);
+    assert_eq!(
+        fsqlite_remaining.values()[0],
+        SqliteValue::Integer(sqlite_remaining)
+    );
+
+    let profile = hot_path_profile_snapshot();
+    assert_eq!(
+        profile.prepared_direct_delete_executions, 6,
+        "every DELETE execution in this proof should stay on the prepared direct-delete path: {profile:?}"
+    );
+    assert!(
+        profile.prepared_direct_delete_leaf_run_start_hits >= 3,
+        "the successful row deletes should exercise the buffered leaf-run path: {profile:?}"
+    );
+    assert!(
+        profile.prepared_direct_delete_leaf_run_active_miss_already_deleted >= 1,
+        "duplicate rowids must be rejected by the active leaf-run before falling back to the physical tree: {profile:?}"
+    );
+    assert!(
+        profile.prepared_direct_delete_leaf_run_dirty_flushes >= 1,
+        "read/commit boundaries should flush buffered direct DELETE work: {profile:?}"
+    );
+}
+
+#[test]
+fn prepared_direct_delete_staged_only_absent_probe_records_active_miss() {
+    let _profile_guard = HotPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")
+        .unwrap();
+
+    let insert = conn.prepare("INSERT INTO bench VALUES (?1, ?2);").unwrap();
+    conn.execute("BEGIN;").unwrap();
+    for rowid in 1_i64..=1000_i64 {
+        conn.execute_prepared_with_params(
+            &insert,
+            &[
+                SqliteValue::Integer(rowid),
+                SqliteValue::Text(format!("user_{rowid:04}_{}", "x".repeat(256)).into()),
+            ],
+        )
+        .expect("setup insert should execute");
+    }
+    conn.execute("COMMIT;").unwrap();
+
+    let delete = conn.prepare("DELETE FROM bench WHERE id = ?1;").unwrap();
+    reset_hot_path_profile();
+    conn.execute("BEGIN;").unwrap();
+    assert_eq!(
+        conn.execute_prepared_with_params(&delete, &[SqliteValue::Integer(1)])
+            .expect("first delete should start a pending leaf run"),
+        1
+    );
+    assert_eq!(
+        conn.execute_prepared_with_params(&delete, &[SqliteValue::Integer(100_000)])
+            .expect("first absent high rowid should stage the current leaf run"),
+        0
+    );
+    assert_eq!(
+        conn.execute_prepared_with_params(&delete, &[SqliteValue::Integer(100_001)])
+            .expect("second absent high rowid should keep staged runs without flushing"),
+        0
+    );
+
+    let row = conn
+        .query_row("SELECT count(*) FROM bench;")
+        .expect("read should flush the staged delete run");
+    assert_eq!(row.values()[0], SqliteValue::Integer(999));
+    conn.execute("COMMIT;").unwrap();
+
+    let profile = hot_path_profile_snapshot();
+    assert_eq!(
+        profile.prepared_direct_delete_executions, 3,
+        "proof DELETE statements should stay on the prepared direct-delete path: {profile:?}"
+    );
+    assert_eq!(
+        profile.prepared_direct_delete_leaf_run_active_attempts,
+        profile
+            .prepared_direct_delete_leaf_run_active_hits
+            .saturating_add(profile.prepared_direct_delete_leaf_run_active_misses),
+        "active DELETE-run probes should account every attempt as a hit or miss: {profile:?}"
+    );
+    assert!(
+        profile.prepared_direct_delete_leaf_run_active_misses >= 2,
+        "both absent high-rowid probes should be visible as active misses: {profile:?}"
+    );
+    assert!(
+        profile.prepared_direct_delete_leaf_run_active_miss_staged_runs >= 1,
+        "staged-only probes should not be misclassified as shape mismatches: {profile:?}"
+    );
+    assert_eq!(
+        profile.prepared_direct_delete_leaf_run_active_miss_shape_mismatches, 0,
+        "same-shape staged-only probes should not inflate shape mismatch counters: {profile:?}"
+    );
+}
+
+#[test]
+fn prepared_direct_delete_savepoint_boundary_matches_sqlite() {
+    let _profile_guard = HotPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    let ddl = "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL);";
+    conn.execute(ddl).unwrap();
+    sqlite.execute(ddl, []).unwrap();
+
+    let insert = conn.prepare("INSERT INTO bench VALUES (?1, ?2);").unwrap();
+    let mut sqlite_insert = sqlite
+        .prepare("INSERT INTO bench VALUES (?1, ?2);")
+        .unwrap();
+    for rowid in 1_i64..=6_i64 {
+        let name = format!("user_{rowid}");
+        sqlite_insert
+            .execute(rusqlite::params![rowid, &name])
+            .unwrap();
+        insert
+            .execute_with_params(&[SqliteValue::Integer(rowid), SqliteValue::Text(name.into())])
+            .unwrap();
+    }
+    drop(sqlite_insert);
+
+    let delete = conn.prepare("DELETE FROM bench WHERE id = ?1;").unwrap();
+    let mut sqlite_delete = sqlite.prepare("DELETE FROM bench WHERE id = ?1;").unwrap();
+    conn.execute("BEGIN;").unwrap();
+    sqlite.execute("BEGIN;", []).unwrap();
+
+    for rowid in [2_i64, 4_i64] {
+        let fsqlite_affected = conn
+            .execute_prepared_with_params(&delete, &[SqliteValue::Integer(rowid)])
+            .unwrap();
+        let sqlite_affected = sqlite_delete.execute(rusqlite::params![rowid]).unwrap();
+        assert_eq!(fsqlite_affected, sqlite_affected);
+        assert_eq!(fsqlite_affected, 1);
+    }
+
+    conn.execute("SAVEPOINT sp;").unwrap();
+    sqlite.execute("SAVEPOINT sp;", []).unwrap();
+    let profile_after_savepoint = hot_path_profile_snapshot();
+    assert!(
+        profile_after_savepoint.prepared_direct_delete_leaf_run_dirty_flushes >= 1,
+        "SAVEPOINT must flush pending direct DELETE work before the savepoint boundary: {profile_after_savepoint:?}"
+    );
+
+    let fsqlite_mid = conn
+        .query("SELECT id, name FROM bench ORDER BY id;")
+        .unwrap();
+    let sqlite_mid = sqlite_rows(&sqlite);
+    assert_eq!(franken_rows(&fsqlite_mid), sqlite_mid);
+
+    for rowid in [3_i64, 5_i64] {
+        let fsqlite_affected = conn
+            .execute_prepared_with_params(&delete, &[SqliteValue::Integer(rowid)])
+            .unwrap();
+        let sqlite_affected = sqlite_delete.execute(rusqlite::params![rowid]).unwrap();
+        assert_eq!(fsqlite_affected, sqlite_affected);
+        assert_eq!(fsqlite_affected, 1);
+    }
+    conn.execute("ROLLBACK TO sp;").unwrap();
+    sqlite.execute("ROLLBACK TO sp;", []).unwrap();
+    conn.execute("RELEASE sp;").unwrap();
+    sqlite.execute("RELEASE sp;", []).unwrap();
+    drop(sqlite_delete);
+
+    let fsqlite_after_rollback = conn
+        .query("SELECT id, name FROM bench ORDER BY id;")
+        .unwrap();
+    let sqlite_after_rollback = sqlite_rows(&sqlite);
+    assert_eq!(franken_rows(&fsqlite_after_rollback), sqlite_after_rollback);
+    assert_eq!(
+        sqlite_after_rollback,
+        vec![
+            vec![SqliteValue::Integer(1), SqliteValue::Text("user_1".into())],
+            vec![SqliteValue::Integer(3), SqliteValue::Text("user_3".into())],
+            vec![SqliteValue::Integer(5), SqliteValue::Text("user_5".into())],
+            vec![SqliteValue::Integer(6), SqliteValue::Text("user_6".into())],
+        ]
+    );
+
+    conn.execute("COMMIT;").unwrap();
+    sqlite.execute("COMMIT;", []).unwrap();
+    let fsqlite_final = conn
+        .query("SELECT id, name FROM bench ORDER BY id;")
+        .unwrap();
+    assert_eq!(franken_rows(&fsqlite_final), sqlite_rows(&sqlite));
+
+    let profile = hot_path_profile_snapshot();
+    assert_eq!(
+        profile.prepared_direct_delete_executions, 4,
+        "all proof DELETE statements should stay on the direct-delete path: {profile:?}"
+    );
+    assert!(
+        profile.prepared_direct_delete_leaf_run_dirty_flushes >= 1,
+        "savepoint boundary must publish pending direct DELETE work: {profile:?}"
+    );
+}
+
+fn franken_rows(rows: &[fsqlite_core::connection::Row]) -> Vec<Vec<SqliteValue>> {
+    rows.iter().map(|row| row.values().to_vec()).collect()
+}
+
+fn sqlite_rows(sqlite: &rusqlite::Connection) -> Vec<Vec<SqliteValue>> {
+    let mut stmt = sqlite
+        .prepare("SELECT id, name FROM bench ORDER BY id;")
+        .unwrap();
+    stmt.query_map([], |row| {
+        let id = row.get(0)?;
+        let name: String = row.get(1)?;
+        Ok(vec![
+            SqliteValue::Integer(id),
+            SqliteValue::Text(name.into()),
+        ])
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .unwrap()
 }

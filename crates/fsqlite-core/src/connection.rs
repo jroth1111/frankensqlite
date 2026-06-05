@@ -103,7 +103,7 @@ use fsqlite_parser::{Parser, StatementParseScratch, parse_statements_with_scratc
 use fsqlite_planner::{
     AccessPathKind as PlannerAccessPathKind, IndexInfo as PlannerIndexInfo, PlannerFeatureFlags,
     StatsSource as PlannerStatsSource, TableStats as PlannerTableStats, WhereTermKind,
-    best_access_path, classify_where_term, decompose_where,
+    best_access_path_with_hints, classify_where_term, decompose_where,
 };
 use fsqlite_types::DATABASE_HEADER_SIZE;
 use fsqlite_types::cx::{CancelReason, Cx};
@@ -458,6 +458,7 @@ static FSQLITE_GROUP_BY_STREAMING_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_GROUP_BY_PROJECTION_PRUNE_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_GROUP_BY_MEM_SCAN_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_JOIN_PAGER_SCAN_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RECURSIVE_CTE_DIRECT_EVAL_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RECURSIVE_CTE_PRECOMPILED_ARM_HITS: AtomicU64 = AtomicU64::new(0);
@@ -543,6 +544,16 @@ static FSQLITE_DIRECT_COUNT_INDEXED_ROWID_PROBE_QUERY_ROW_HITS: AtomicU64 = Atom
 static FSQLITE_PREPARED_DIRECT_INSERT_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_UPDATE_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_START_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_START_HITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_START_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_HITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_MISSES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_FLUSHES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_DIRTY_FLUSHES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_FLUSH_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_TIME_NS: AtomicU64 = AtomicU64::new(0);
@@ -550,6 +561,8 @@ static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_ATTEMPTS: AtomicU64 = Atom
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_SHAPE_MISMATCHES: AtomicU64 =
+    AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_STAGED_RUNS: AtomicU64 =
     AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_ROWID_NOT_IN_LEAF: AtomicU64 =
     AtomicU64::new(0);
@@ -567,12 +580,23 @@ static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_TIME_NS: AtomicU64 = Atomi
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_FLUSHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_DIRTY_FLUSHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_FLUSH_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_DELETE_PREFLUSH_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_DELETE_ROWID_LOOKUP_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_DELETE_ACTIVE_LEAF_PROBE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_DELETE_CURSOR_SETUP_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_DELETE_MEMDB_ABANDON_CALLS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_DELETE_MEMDB_ABANDON_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_DELETE_MEMORY_SYNC_CALLS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_DELETE_MEMORY_SYNC_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_QF_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_SEEK_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_PHYSICAL_DELETE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_INSERT_ROW_BUILD_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_CELL_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_EVAL_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_AFFINITY_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_LAYOUT_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_ENCODE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_INSERT_ROW_VALUE_BUILD_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_INSERT_CURSOR_SETUP_TIME_NS: AtomicU64 = AtomicU64::new(0);
@@ -732,6 +756,16 @@ pub struct HotPathProfileSnapshot {
     pub prepared_direct_insert_executions: u64,
     pub prepared_direct_update_executions: u64,
     pub prepared_direct_delete_executions: u64,
+    pub prepared_direct_update_leaf_patch_run_start_attempts: u64,
+    pub prepared_direct_update_leaf_patch_run_start_hits: u64,
+    pub prepared_direct_update_leaf_patch_run_start_time_ns: u64,
+    pub prepared_direct_update_leaf_patch_run_active_attempts: u64,
+    pub prepared_direct_update_leaf_patch_run_active_hits: u64,
+    pub prepared_direct_update_leaf_patch_run_active_misses: u64,
+    pub prepared_direct_update_leaf_patch_run_active_time_ns: u64,
+    pub prepared_direct_update_leaf_patch_run_flushes: u64,
+    pub prepared_direct_update_leaf_patch_run_dirty_flushes: u64,
+    pub prepared_direct_update_leaf_patch_run_flush_time_ns: u64,
     pub prepared_direct_delete_leaf_run_start_attempts: u64,
     pub prepared_direct_delete_leaf_run_start_hits: u64,
     pub prepared_direct_delete_leaf_run_start_time_ns: u64,
@@ -739,6 +773,7 @@ pub struct HotPathProfileSnapshot {
     pub prepared_direct_delete_leaf_run_active_hits: u64,
     pub prepared_direct_delete_leaf_run_active_misses: u64,
     pub prepared_direct_delete_leaf_run_active_miss_shape_mismatches: u64,
+    pub prepared_direct_delete_leaf_run_active_miss_staged_runs: u64,
     pub prepared_direct_delete_leaf_run_active_miss_rowid_not_in_leaf: u64,
     pub prepared_direct_delete_leaf_run_active_miss_already_deleted: u64,
     pub prepared_direct_delete_leaf_run_active_miss_nonroot_would_empty_leaf: u64,
@@ -749,12 +784,23 @@ pub struct HotPathProfileSnapshot {
     pub prepared_direct_delete_leaf_run_flushes: u64,
     pub prepared_direct_delete_leaf_run_dirty_flushes: u64,
     pub prepared_direct_delete_leaf_run_flush_time_ns: u64,
+    pub prepared_direct_delete_preflush_time_ns: u64,
+    pub prepared_direct_delete_rowid_lookup_time_ns: u64,
+    pub prepared_direct_delete_active_leaf_probe_time_ns: u64,
+    pub prepared_direct_delete_cursor_setup_time_ns: u64,
+    pub prepared_direct_delete_memdb_abandon_calls: u64,
+    pub prepared_direct_delete_memdb_abandon_time_ns: u64,
+    pub prepared_direct_delete_memory_sync_calls: u64,
+    pub prepared_direct_delete_memory_sync_time_ns: u64,
     pub prepared_direct_delete_qf_time_ns: u64,
     pub prepared_direct_delete_seek_time_ns: u64,
     pub prepared_direct_delete_physical_delete_time_ns: u64,
     pub prepared_direct_insert_row_build_time_ns: u64,
     pub prepared_direct_insert_preserialize_time_ns: u64,
     pub prepared_direct_insert_preserialize_cell_time_ns: u64,
+    pub prepared_direct_insert_preserialize_eval_time_ns: u64,
+    pub prepared_direct_insert_preserialize_affinity_time_ns: u64,
+    pub prepared_direct_insert_preserialize_layout_time_ns: u64,
     pub prepared_direct_insert_preserialize_encode_time_ns: u64,
     pub prepared_direct_insert_row_value_build_time_ns: u64,
     pub prepared_direct_insert_cursor_setup_time_ns: u64,
@@ -847,11 +893,19 @@ pub fn set_hot_path_profile_enabled(enabled: bool) {
 
 #[inline]
 fn record_hot_path_duration(metric: &AtomicU64, start: Option<Instant>) {
-    if let Some(start) = start {
-        metric.fetch_add(
-            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            AtomicOrdering::Relaxed,
-        );
+    record_hot_path_elapsed_ns(metric, hot_path_elapsed_ns(start));
+}
+
+#[inline]
+fn hot_path_elapsed_ns(start: Option<Instant>) -> Option<u64> {
+    let start = start?;
+    Some(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX))
+}
+
+#[inline]
+fn record_hot_path_elapsed_ns(metric: &AtomicU64, elapsed_ns: Option<u64>) {
+    if let Some(elapsed_ns) = elapsed_ns {
+        metric.fetch_add(elapsed_ns, AtomicOrdering::Relaxed);
     }
 }
 
@@ -1043,6 +1097,16 @@ pub fn reset_hot_path_profile() {
     FSQLITE_PREPARED_DIRECT_INSERT_EXECUTIONS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_UPDATE_EXECUTIONS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_DELETE_EXECUTIONS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_START_ATTEMPTS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_START_HITS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_START_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_ATTEMPTS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_HITS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_MISSES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_FLUSHES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_DIRTY_FLUSHES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_FLUSH_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_ATTEMPTS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_HITS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_TIME_NS.store(0, AtomicOrdering::Relaxed);
@@ -1050,6 +1114,8 @@ pub fn reset_hot_path_profile() {
     FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_HITS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_SHAPE_MISMATCHES
+        .store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_STAGED_RUNS
         .store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_ROWID_NOT_IN_LEAF
         .store(0, AtomicOrdering::Relaxed);
@@ -1067,12 +1133,23 @@ pub fn reset_hot_path_profile() {
     FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_FLUSHES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_DIRTY_FLUSHES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_FLUSH_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_DELETE_PREFLUSH_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_DELETE_ROWID_LOOKUP_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_DELETE_ACTIVE_LEAF_PROBE_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_DELETE_CURSOR_SETUP_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_DELETE_MEMDB_ABANDON_CALLS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_DELETE_MEMDB_ABANDON_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_DELETE_MEMORY_SYNC_CALLS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_DELETE_MEMORY_SYNC_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_DELETE_QF_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_DELETE_SEEK_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_DELETE_PHYSICAL_DELETE_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_INSERT_ROW_BUILD_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_CELL_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_EVAL_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_AFFINITY_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_LAYOUT_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_ENCODE_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_INSERT_ROW_VALUE_BUILD_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_DIRECT_INSERT_CURSOR_SETUP_TIME_NS.store(0, AtomicOrdering::Relaxed);
@@ -1271,6 +1348,33 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
             .load(AtomicOrdering::Relaxed),
         prepared_direct_delete_executions: FSQLITE_PREPARED_DIRECT_DELETE_EXECUTIONS
             .load(AtomicOrdering::Relaxed),
+        prepared_direct_update_leaf_patch_run_start_attempts:
+            FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_START_ATTEMPTS
+                .load(AtomicOrdering::Relaxed),
+        prepared_direct_update_leaf_patch_run_start_hits:
+            FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_START_HITS.load(AtomicOrdering::Relaxed),
+        prepared_direct_update_leaf_patch_run_start_time_ns:
+            FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_START_TIME_NS
+                .load(AtomicOrdering::Relaxed),
+        prepared_direct_update_leaf_patch_run_active_attempts:
+            FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_ATTEMPTS
+                .load(AtomicOrdering::Relaxed),
+        prepared_direct_update_leaf_patch_run_active_hits:
+            FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_HITS.load(AtomicOrdering::Relaxed),
+        prepared_direct_update_leaf_patch_run_active_misses:
+            FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_MISSES
+                .load(AtomicOrdering::Relaxed),
+        prepared_direct_update_leaf_patch_run_active_time_ns:
+            FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_TIME_NS
+                .load(AtomicOrdering::Relaxed),
+        prepared_direct_update_leaf_patch_run_flushes:
+            FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_FLUSHES.load(AtomicOrdering::Relaxed),
+        prepared_direct_update_leaf_patch_run_dirty_flushes:
+            FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_DIRTY_FLUSHES
+                .load(AtomicOrdering::Relaxed),
+        prepared_direct_update_leaf_patch_run_flush_time_ns:
+            FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_FLUSH_TIME_NS
+                .load(AtomicOrdering::Relaxed),
         prepared_direct_delete_leaf_run_start_attempts:
             FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_ATTEMPTS.load(AtomicOrdering::Relaxed),
         prepared_direct_delete_leaf_run_start_hits:
@@ -1285,6 +1389,9 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
             FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISSES.load(AtomicOrdering::Relaxed),
         prepared_direct_delete_leaf_run_active_miss_shape_mismatches:
             FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_SHAPE_MISMATCHES
+                .load(AtomicOrdering::Relaxed),
+        prepared_direct_delete_leaf_run_active_miss_staged_runs:
+            FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_STAGED_RUNS
                 .load(AtomicOrdering::Relaxed),
         prepared_direct_delete_leaf_run_active_miss_rowid_not_in_leaf:
             FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_ROWID_NOT_IN_LEAF
@@ -1312,6 +1419,22 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
             FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_DIRTY_FLUSHES.load(AtomicOrdering::Relaxed),
         prepared_direct_delete_leaf_run_flush_time_ns:
             FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_FLUSH_TIME_NS.load(AtomicOrdering::Relaxed),
+        prepared_direct_delete_preflush_time_ns: FSQLITE_PREPARED_DIRECT_DELETE_PREFLUSH_TIME_NS
+            .load(AtomicOrdering::Relaxed),
+        prepared_direct_delete_rowid_lookup_time_ns:
+            FSQLITE_PREPARED_DIRECT_DELETE_ROWID_LOOKUP_TIME_NS.load(AtomicOrdering::Relaxed),
+        prepared_direct_delete_active_leaf_probe_time_ns:
+            FSQLITE_PREPARED_DIRECT_DELETE_ACTIVE_LEAF_PROBE_TIME_NS.load(AtomicOrdering::Relaxed),
+        prepared_direct_delete_cursor_setup_time_ns:
+            FSQLITE_PREPARED_DIRECT_DELETE_CURSOR_SETUP_TIME_NS.load(AtomicOrdering::Relaxed),
+        prepared_direct_delete_memdb_abandon_calls:
+            FSQLITE_PREPARED_DIRECT_DELETE_MEMDB_ABANDON_CALLS.load(AtomicOrdering::Relaxed),
+        prepared_direct_delete_memdb_abandon_time_ns:
+            FSQLITE_PREPARED_DIRECT_DELETE_MEMDB_ABANDON_TIME_NS.load(AtomicOrdering::Relaxed),
+        prepared_direct_delete_memory_sync_calls: FSQLITE_PREPARED_DIRECT_DELETE_MEMORY_SYNC_CALLS
+            .load(AtomicOrdering::Relaxed),
+        prepared_direct_delete_memory_sync_time_ns:
+            FSQLITE_PREPARED_DIRECT_DELETE_MEMORY_SYNC_TIME_NS.load(AtomicOrdering::Relaxed),
         prepared_direct_delete_qf_time_ns: FSQLITE_PREPARED_DIRECT_DELETE_QF_TIME_NS
             .load(AtomicOrdering::Relaxed),
         prepared_direct_delete_seek_time_ns: FSQLITE_PREPARED_DIRECT_DELETE_SEEK_TIME_NS
@@ -1324,6 +1447,13 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
             FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_TIME_NS.load(AtomicOrdering::Relaxed),
         prepared_direct_insert_preserialize_cell_time_ns:
             FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_CELL_TIME_NS.load(AtomicOrdering::Relaxed),
+        prepared_direct_insert_preserialize_eval_time_ns:
+            FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_EVAL_TIME_NS.load(AtomicOrdering::Relaxed),
+        prepared_direct_insert_preserialize_affinity_time_ns:
+            FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_AFFINITY_TIME_NS
+                .load(AtomicOrdering::Relaxed),
+        prepared_direct_insert_preserialize_layout_time_ns:
+            FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_LAYOUT_TIME_NS.load(AtomicOrdering::Relaxed),
         prepared_direct_insert_preserialize_encode_time_ns:
             FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_ENCODE_TIME_NS.load(AtomicOrdering::Relaxed),
         prepared_direct_insert_row_value_build_time_ns:
@@ -1848,6 +1978,14 @@ pub struct ConnectionEnv {
     page_buffer_max: Option<usize>,
     /// Explicit MemoryVfs growth policy for `:memory:` / imported in-memory databases.
     memory_vfs_config: Option<MemoryVfsConfig>,
+    /// Strict multi-process mode. When enabled, the connection refuses
+    /// to silently proceed past ambiguous concurrency states (open-time
+    /// freelist drift, F_SETLK timeout, WAL checkpoint contention).
+    /// Default off — preserves the existing best-effort behavior for
+    /// single-process callers. See frankensqlite#81. Opting in
+    /// converts otherwise-silent corruption symptoms into actionable
+    /// `FrankenError::MultiProcessContractViolation` errors.
+    strict_multi_process: bool,
 }
 
 impl ConnectionEnv {
@@ -1858,7 +1996,25 @@ impl ConnectionEnv {
             runtime,
             page_buffer_max: None,
             memory_vfs_config: None,
+            strict_multi_process: false,
         }
+    }
+
+    /// Enable strict multi-process mode for this connection env. With
+    /// strict mode on, the connection refuses to silently proceed past
+    /// concurrency contract violations (F_SETLK timeout, freelist
+    /// trunk page past db_size, WAL checkpoint contention at open) and
+    /// returns `FrankenError::MultiProcessContractViolation` instead.
+    /// See frankensqlite#81.
+    pub fn set_strict_multi_process(&mut self, strict: bool) {
+        self.strict_multi_process = strict;
+    }
+
+    /// Returns whether strict multi-process refusal is enabled. See
+    /// frankensqlite#81.
+    #[must_use]
+    pub fn strict_multi_process(&self) -> bool {
+        self.strict_multi_process
     }
 
     /// Access the runtime context that will back newly opened connections.
@@ -1906,6 +2062,7 @@ impl Default for ConnectionEnv {
             runtime: RuntimeContext::global(),
             page_buffer_max: None,
             memory_vfs_config: None,
+            strict_multi_process: false,
         }
     }
 }
@@ -7590,6 +7747,13 @@ struct PendingDirectDeleteLeafRun {
     run: TableLeafDeleteRun,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingDirectDeleteLeafRunProbeMiss {
+    ShapeMismatch,
+    StagedRuns,
+    RunDeclined(TableLeafDeleteRunMissReason),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparedDirectInsertAppendHint {
     root_page: i32,
@@ -8337,6 +8501,25 @@ impl Connection {
     /// are supported.
     pub fn open(path: impl Into<String>) -> Result<Self> {
         Self::open_with_env(path, ConnectionEnv::default())
+    }
+
+    /// Open a connection with strict multi-process refusal enabled.
+    ///
+    /// Convenience shortcut for callers (CI harnesses, multi-agent
+    /// workloads) that want loud failures on ambiguous concurrency
+    /// states rather than silent corruption. Equivalent to:
+    ///
+    /// ```ignore
+    /// let mut env = ConnectionEnv::default();
+    /// env.set_strict_multi_process(true);
+    /// Connection::open_with_env(path, env)
+    /// ```
+    ///
+    /// See frankensqlite#81 and `ConnectionEnv::set_strict_multi_process`.
+    pub fn open_strict_multi_process(path: impl Into<String>) -> Result<Self> {
+        let mut env = ConnectionEnv::default();
+        env.set_strict_multi_process(true);
+        Self::open_with_env(path, env)
     }
 
     /// Open a connection while requesting a specific page size for newly created databases.
@@ -9528,6 +9711,51 @@ impl Connection {
                     .map(Some)
                 }
             }
+            Statement::CreateIndex(create_index) => {
+                let Some(target_schema) = self.attached_target_schema(&create_index.name)? else {
+                    return Ok(None);
+                };
+                self.reject_attached_target_write_in_explicit_transaction(
+                    "CREATE INDEX",
+                    create_index
+                        .name
+                        .schema
+                        .as_deref()
+                        .unwrap_or(&target_schema),
+                )?;
+                let mut rewritten = create_index.clone();
+                rewritten.name.schema = None;
+                tracing::debug!(
+                    schema = %target_schema,
+                    index = %create_index.name.name,
+                    table = %create_index.table,
+                    "delegating attached-schema CREATE INDEX to attached connection"
+                );
+                self.with_attached_connection(&target_schema, |conn| {
+                    conn.execute_statement(&Statement::CreateIndex(rewritten), params)
+                })
+                .map(Some)
+            }
+            Statement::CreateView(create_view) => {
+                let Some(target_schema) = self.attached_target_schema(&create_view.name)? else {
+                    return Ok(None);
+                };
+                self.reject_attached_target_write_in_explicit_transaction(
+                    "CREATE VIEW",
+                    create_view.name.schema.as_deref().unwrap_or(&target_schema),
+                )?;
+                let mut rewritten = create_view.clone();
+                rewritten.name.schema = None;
+                tracing::debug!(
+                    schema = %target_schema,
+                    view = %create_view.name.name,
+                    "delegating attached-schema CREATE VIEW target"
+                );
+                self.with_attached_connection(&target_schema, |conn| {
+                    conn.execute_statement(&Statement::CreateView(rewritten), params)
+                })
+                .map(Some)
+            }
             Statement::Insert(insert) => {
                 let Some(target_schema) = self.attached_target_schema(&insert.table)? else {
                     return Ok(None);
@@ -9719,6 +9947,26 @@ impl Connection {
                 self.reset_statement_change_count();
                 self.record_statement_changes(changes);
                 Ok(Some(rows))
+            }
+            Statement::Drop(drop_stmt) => {
+                let Some(target_schema) = self.attached_target_schema(&drop_stmt.name)? else {
+                    return Ok(None);
+                };
+                self.reject_attached_target_write_in_explicit_transaction(
+                    "DROP",
+                    drop_stmt.name.schema.as_deref().unwrap_or(&target_schema),
+                )?;
+                let mut rewritten = drop_stmt.clone();
+                rewritten.name.schema = None;
+                tracing::debug!(
+                    schema = %target_schema,
+                    object = %drop_stmt.name.name,
+                    "delegating attached-schema DROP target"
+                );
+                self.with_attached_connection(&target_schema, |conn| {
+                    conn.execute_statement(&Statement::Drop(rewritten), params)
+                })
+                .map(Some)
             }
             _ => Ok(None),
         }
@@ -10910,13 +11158,187 @@ impl Connection {
         self.pager.is_file_backed() && !self.time_travel_active.get()
     }
 
-    fn log_aggregate_window_storage_substrate_dispatch(
+    #[must_use]
+    fn select_group_by_storage_substrate_is_vdbe_eligible(&self, select: &SelectStatement) -> bool {
+        if !self.can_execute_aggregate_window_storage_substrate()
+            || select.with.is_some()
+            || !select.body.compounds.is_empty()
+            || has_ordered_aggregate(select)
+            || has_window_functions(select)
+            || has_fallback_from_source(select)
+            || has_table_function_source(select)
+            || select_contains_match_operator(select)
+            || select_contains_rewritable_subquery(select)
+            || select_has_correlated_join_subquery(select)
+        {
+            return false;
+        }
+
+        let SelectCore::Select {
+            columns,
+            from: Some(from),
+            group_by,
+            windows,
+            ..
+        } = &select.body.select
+        else {
+            return false;
+        };
+
+        if group_by.is_empty()
+            || !windows.is_empty()
+            || !from.joins.is_empty()
+            || !Self::select_order_by_matches_group_by_prefix(select, group_by)
+        {
+            return false;
+        }
+
+        let TableOrSubquery::Table {
+            time_travel: None, ..
+        } = &from.source
+        else {
+            return false;
+        };
+
+        columns.iter().any(|column| {
+            matches!(
+                column,
+                ResultColumn::Expr { expr, .. } if expr_has_aggregate(expr)
+            )
+        })
+    }
+
+    fn select_order_by_matches_group_by_prefix(
+        select: &SelectStatement,
+        group_by: &[Expr],
+    ) -> bool {
+        select.order_by.is_empty()
+            || (select.order_by.len() <= group_by.len()
+                && select
+                    .order_by
+                    .iter()
+                    .zip(group_by.iter())
+                    .all(|(term, key)| {
+                        term.nulls.is_none()
+                            && !matches!(term.direction, Some(SortDirection::Desc))
+                            && &term.expr == key
+                    }))
+    }
+
+    fn try_execute_group_by_storage_substrate(
+        &self,
+        cx: &Cx,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+        decision_reason: &'static str,
+    ) -> Result<Option<Vec<Row>>> {
+        if !self.select_group_by_storage_substrate_is_vdbe_eligible(select) {
+            return Ok(None);
+        }
+
+        let program = match self.compile_table_select(select) {
+            Ok(program) => program,
+            Err(err) if *self.reject_mem_fallback_strict.borrow() => return Err(err),
+            Err(_) => return Ok(None),
+        };
+
+        if program.requires_attached_memdb() {
+            if *self.reject_mem_fallback_strict.borrow() {
+                return Err(FrankenError::not_implemented(
+                    "aggregate/window storage substrate unexpectedly requires MemDatabase",
+                ));
+            }
+            return Ok(None);
+        }
+
+        let started = Instant::now();
+        let (rows, _, _) = self.execute_table_program_with_cx(
+            &program,
+            params,
+            false,
+            TableExecutionRuntimeRequirements::read_path(),
+            cx,
+            false,
+        )?;
+        let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.log_aggregate_window_storage_substrate_complete(
+            select,
+            decision_reason,
+            Self::aggregate_kind_set(select).as_str(),
+            rows.len(),
+            elapsed_ns,
+        );
+        Ok(Some(rows))
+    }
+
+    fn log_aggregate_window_storage_substrate_complete(
         &self,
         select: &SelectStatement,
         decision_reason: &'static str,
+        aggregate_kind_set: &str,
+        rows_out: usize,
+        elapsed_ns: u64,
     ) {
         let mode = self.backend_mode_label();
-        let (group_key_count, window_stage_count) = match &select.body.select {
+        let (run_id, scenario_id) = statement_reuse_log_context_from_env();
+        let (group_key_count, window_stage_count) = Self::aggregate_window_stage_counts(select);
+        let rows_out = u64::try_from(rows_out).unwrap_or(u64::MAX);
+        tracing::debug!(
+            target: "fsqlite.storage_wiring",
+            trace_id = self.root_cx.trace_id(),
+            run_id = %run_id.as_str(),
+            scenario_id = %scenario_id.as_str(),
+            backend_kind = self.pager_backend_label(),
+            backend_identity = %self.backend_identity(),
+            mode,
+            fallback_policy = mode,
+            statement_kind = "select",
+            decision_reason,
+            group_key_count,
+            aggregate_kind_set,
+            window_stage_count,
+            temp_store_strategy = "vdbe_sorter",
+            spill_bytes = 0_u64,
+            rows_in = 0_u64,
+            rows_in_known = false,
+            rows_out,
+            elapsed_ns,
+            first_failure_diag = "none",
+            "execute_statement_dispatch: completed pager-backed aggregate/window substrate"
+        );
+    }
+
+    fn aggregate_kind_set(select: &SelectStatement) -> String {
+        let mut names = BTreeSet::new();
+        if let SelectCore::Select {
+            columns,
+            group_by,
+            having,
+            ..
+        } = &select.body.select
+        {
+            for column in columns {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    collect_aggregate_kind_names(expr, &mut names);
+                }
+            }
+            for expr in group_by {
+                collect_aggregate_kind_names(expr, &mut names);
+            }
+            if let Some(having) = having {
+                collect_aggregate_kind_names(having, &mut names);
+            }
+        }
+
+        if names.is_empty() {
+            "none".to_owned()
+        } else {
+            names.into_iter().collect::<Vec<_>>().join(",")
+        }
+    }
+
+    fn aggregate_window_stage_counts(select: &SelectStatement) -> (usize, usize) {
+        match &select.body.select {
             SelectCore::Select {
                 columns,
                 group_by,
@@ -10936,9 +11358,28 @@ impl Connection {
                     .saturating_add(windows.len()),
             ),
             _ => (0, 0),
+        }
+    }
+
+    fn log_aggregate_window_storage_substrate_dispatch(
+        &self,
+        select: &SelectStatement,
+        decision_reason: &'static str,
+    ) {
+        let mode = self.backend_mode_label();
+        let (run_id, scenario_id) = statement_reuse_log_context_from_env();
+        let (group_key_count, window_stage_count) = Self::aggregate_window_stage_counts(select);
+        let aggregate_kind_set = Self::aggregate_kind_set(select);
+        let temp_store_strategy = if group_key_count > 0 {
+            "vdbe_sorter"
+        } else {
+            "window_pipeline"
         };
         tracing::debug!(
             target: "fsqlite.storage_wiring",
+            trace_id = self.root_cx.trace_id(),
+            run_id = %run_id.as_str(),
+            scenario_id = %scenario_id.as_str(),
             backend_kind = self.pager_backend_label(),
             backend_identity = %self.backend_identity(),
             mode,
@@ -10946,8 +11387,17 @@ impl Connection {
             statement_kind = "select",
             decision_reason,
             group_key_count,
+            aggregate_kind_set = %aggregate_kind_set.as_str(),
             window_stage_count,
+            temp_store_strategy,
+            spill_bytes = 0_u64,
             temp_materialization_mode = "connection_aggregate_window_substrate",
+            rows_in = 0_u64,
+            rows_in_known = false,
+            rows_out = 0_u64,
+            rows_out_known = false,
+            elapsed_ns = 0_u64,
+            first_failure_diag = "none",
             "execute_statement_dispatch: using pager-backed aggregate/window substrate"
         );
     }
@@ -10972,6 +11422,41 @@ impl Connection {
             rows_out,
             elapsed_ns,
             "execute_statement_dispatch: completed pager-backed join/derived dispatch"
+        );
+    }
+
+    fn log_vdbe_join_storage_dispatch(
+        &self,
+        select: &SelectStatement,
+        decision_reason: &'static str,
+        rows_out: usize,
+        elapsed_ns: u64,
+    ) {
+        let mode = self.backend_mode_label();
+        let (run_id, scenario_id) = statement_reuse_log_context_from_env();
+        let join_shape = join_shape_label(select);
+        let join_order = join_order_label(select);
+        let derived_source_count = count_derived_sources(select);
+        let rows_out = u64::try_from(rows_out).unwrap_or(u64::MAX);
+        tracing::debug!(
+            target: "fsqlite.storage_wiring",
+            trace_id = self.root_cx.trace_id(),
+            run_id = %run_id.as_str(),
+            scenario_id = %scenario_id.as_str(),
+            backend_kind = self.pager_backend_label(),
+            backend_identity = %self.backend_identity(),
+            mode,
+            fallback_policy = mode,
+            statement_kind = "select",
+            decision_reason,
+            join_shape = %join_shape,
+            join_order = %join_order,
+            derived_source_count,
+            temp_materialization_mode = "vdbe_storage_cursors",
+            rows_out,
+            elapsed_ns,
+            first_failure_diag = "none",
+            "execute_statement_dispatch: completed pager-backed VDBE join/derived dispatch"
         );
     }
 
@@ -14009,92 +14494,18 @@ impl Connection {
             )));
         }
 
-        let mut values = parse_record(payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+        let values = parse_record(payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
             detail: format!(
                 "table `{}` rowid {rowid} payload is not a valid SQLite record",
                 table.name
             ),
         })?;
-        let num_columns = table.columns.len();
-
-        if let Some(ipk_idx) = rowid_alias_column_index {
-            match values.len() {
-                len if len + 1 == num_columns => {
-                    values.insert(ipk_idx, SqliteValue::Integer(rowid));
-                }
-                len if len == num_columns => match values.get_mut(ipk_idx) {
-                    Some(slot @ SqliteValue::Null) => {
-                        *slot = SqliteValue::Integer(rowid);
-                    }
-                    Some(SqliteValue::Integer(encoded_rowid)) if *encoded_rowid == rowid => {}
-                    Some(SqliteValue::Integer(encoded_rowid)) => {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "table `{}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}",
-                                table.name
-                            ),
-                        });
-                    }
-                    Some(other) => {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "table `{}` rowid {rowid} stores non-integer INTEGER PRIMARY KEY alias value {other:?}",
-                                table.name
-                            ),
-                        });
-                    }
-                    None => {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "table `{}` rowid {rowid} payload is missing INTEGER PRIMARY KEY alias column",
-                                table.name
-                            ),
-                        });
-                    }
-                },
-                len if len < num_columns => {
-                    let ipk_in_payload = ipk_idx < len
-                        && matches!(&values[ipk_idx], SqliteValue::Integer(v) if *v == rowid);
-                    if !ipk_in_payload && ipk_idx <= len {
-                        values.insert(ipk_idx, SqliteValue::Integer(rowid));
-                    } else if !ipk_in_payload {
-                        while values.len() < ipk_idx {
-                            values.push(SqliteValue::Null);
-                        }
-                        values.insert(ipk_idx, SqliteValue::Integer(rowid));
-                    }
-                }
-                len => {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "table `{}` rowid {rowid} payload has {len} columns; expected at most {num_columns}",
-                            table.name
-                        ),
-                    });
-                }
-            }
-        } else if values.len() > num_columns {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "table `{}` rowid {rowid} payload has {} columns; expected at most {num_columns}",
-                    table.name,
-                    values.len()
-                ),
-            });
-        }
-
-        while values.len() < num_columns {
-            let column_index = values.len();
-            let default_value = table
-                .columns
-                .get(column_index)
-                .and_then(|column| column.default_value.as_ref())
-                .map_or(SqliteValue::Null, |default_sql| {
-                    Self::parse_column_default_value(default_sql)
-                });
-            values.push(default_value);
-        }
-        Ok(values)
+        self.inflate_table_row_values_for_storage_reload(
+            table,
+            rowid,
+            &values,
+            rowid_alias_column_index,
+        )
     }
 
     fn numeric_column_value_from_sqlite_value(value: SqliteValue) -> NumericColumnValue {
@@ -14218,13 +14629,14 @@ impl Connection {
             });
         }
 
-        let default_value = table
+        let default_value = match table
             .columns
             .get(column_index)
             .and_then(|column| column.default_value.as_ref())
-            .map_or(SqliteValue::Null, |default_sql| {
-                Self::parse_column_default_value(default_sql)
-            });
+        {
+            Some(default_sql) => self.evaluate_column_default_value(Some(default_sql))?,
+            None => SqliteValue::Null,
+        };
         Ok(Self::numeric_column_value_from_sqlite_value(default_value))
     }
 
@@ -14336,13 +14748,14 @@ impl Connection {
                 });
         }
 
-        let default_value = table
+        let default_value = match table
             .columns
             .get(column_index)
             .and_then(|column| column.default_value.as_ref())
-            .map_or(SqliteValue::Null, |default_sql| {
-                Self::parse_column_default_value(default_sql)
-            });
+        {
+            Some(default_sql) => self.evaluate_column_default_value(Some(default_sql))?,
+            None => SqliteValue::Null,
+        };
         Ok(default_value)
     }
 
@@ -18315,21 +18728,43 @@ impl Connection {
             return Ok(None);
         }
 
-        if self.can_defer_prepared_direct_update_leaf_patch_run()
-            && let Some(mut run) = cursor.table_leaf_payload_patch_run_current(rowid)?
-        {
-            let (usable_size, _) = Self::btree_cursor_sizes_from_header(
-                direct.cursor_page_size,
-                direct.cursor_reserved_per_page,
+        if self.can_defer_prepared_direct_update_leaf_patch_run() {
+            let profile_update_leaf_patch_run = hot_path_profile_enabled();
+            if profile_update_leaf_patch_run {
+                FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_START_ATTEMPTS
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            let update_leaf_patch_start = profile_update_leaf_patch_run.then(Instant::now);
+            let start_result = (|| -> Result<Option<TableLeafPayloadPatchRun>> {
+                let Some(mut run) = cursor.table_leaf_payload_patch_run_current(rowid)? else {
+                    return Ok(None);
+                };
+                let (usable_size, _) = Self::btree_cursor_sizes_from_header(
+                    direct.cursor_page_size,
+                    direct.cursor_reserved_per_page,
+                );
+                if run.patch_fixed_width_real(
+                    execution_cx,
+                    rowid,
+                    patch.column_index,
+                    direct.columns.len(),
+                    next_value,
+                    usable_size,
+                )? {
+                    Ok(Some(run))
+                } else {
+                    Ok(None)
+                }
+            })();
+            record_hot_path_duration(
+                &FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_START_TIME_NS,
+                update_leaf_patch_start,
             );
-            if run.patch_fixed_width_real(
-                execution_cx,
-                rowid,
-                patch.column_index,
-                direct.columns.len(),
-                next_value,
-                usable_size,
-            )? {
+            if let Some(run) = start_result? {
+                if profile_update_leaf_patch_run {
+                    FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_START_HITS
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
                 self.store_pending_direct_update_leaf_patch_run(direct, patch.column_index, run);
                 self.retained_autocommit_count_sum_cache_note_update(direct.root_page, None, None);
                 return Ok(Some((1, true)));
@@ -18391,35 +18826,45 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<usize> {
         let _lookaside_growth = StatementLookasideGrowthGuard::new(self);
-        self.flush_pending_direct_update_leaf_patch_run(execution_cx)?;
-        self.flush_pending_direct_insert_page_run(execution_cx)?;
+        let profile_direct_delete = hot_path_profile_enabled();
+        let preflush_start = profile_direct_delete.then(Instant::now);
+        let preflush_result = (|| -> Result<()> {
+            self.flush_pending_direct_update_leaf_patch_run(execution_cx)?;
+            self.flush_pending_direct_insert_page_run(execution_cx)
+        })();
+        record_hot_path_duration(
+            &FSQLITE_PREPARED_DIRECT_DELETE_PREFLUSH_TIME_NS,
+            preflush_start,
+        );
+        preflush_result?;
 
-        let rowid_value =
-            Self::prepared_direct_simple_insert_param(params, direct.rowid_param_one_based)?;
-        let Some(rowid) = Self::coerce_rowid_lookup_value(rowid_value) else {
+        let rowid_lookup_start = profile_direct_delete.then(Instant::now);
+        let rowid_result = (|| -> Result<Option<i64>> {
+            let rowid_value =
+                Self::prepared_direct_simple_insert_param(params, direct.rowid_param_one_based)?;
+            Ok(Self::coerce_rowid_lookup_value(rowid_value))
+        })();
+        record_hot_path_duration(
+            &FSQLITE_PREPARED_DIRECT_DELETE_ROWID_LOOKUP_TIME_NS,
+            rowid_lookup_start,
+        );
+        let Some(rowid) = rowid_result? else {
             return Ok(0);
         };
 
-        if let Some((affected, abandon_memdb)) = self
-            .try_execute_prepared_direct_simple_delete_active_leaf_run(
-                execution_cx,
-                direct,
-                rowid,
-            )?
-        {
-            if abandon_memdb {
-                self.clear_prepared_direct_insert_append_hint();
-                self.abandon_exact_memdb_row_mirror();
-            }
-            if affected > 0 {
-                self.sync_memory_concurrent_pending_write_pages(direct.root_page)?;
-            }
-            return Ok(affected);
+        let active_leaf_result = self.try_execute_prepared_direct_simple_delete_active_leaf_run(
+            execution_cx,
+            direct,
+            rowid,
+        );
+        if let Some((affected, abandon_memdb)) = active_leaf_result? {
+            return self.finish_prepared_direct_simple_delete(direct, affected, abandon_memdb);
         }
 
         let root = page_number_from_schema_root(direct.root_page, "<direct-delete>", "table")?;
         let concurrent_ctx = self.concurrent_page_io_context()?;
         let (affected, abandon_memdb) = if let Some(concurrent_ctx) = concurrent_ctx {
+            let cursor_setup_start = profile_direct_delete.then(Instant::now);
             let txn = self.active_txn.borrow_mut().take().ok_or_else(|| {
                 FrankenError::internal("prepared direct delete missing active transaction")
             })?;
@@ -18439,6 +18884,10 @@ impl Connection {
                 let mut cursor =
                     fsqlite_btree::BtCursor::new(page_io.clone(), root, usable_size, true);
                 Self::configure_btree_cursor_page_size(&mut cursor, usable_size, page_size);
+                record_hot_path_duration(
+                    &FSQLITE_PREPARED_DIRECT_DELETE_CURSOR_SETUP_TIME_NS,
+                    cursor_setup_start,
+                );
                 self.execute_prepared_direct_simple_delete_with_cursor(
                     execution_cx,
                     direct,
@@ -18450,6 +18899,7 @@ impl Connection {
             *self.active_txn.borrow_mut() = Some(txn_back);
             result?
         } else {
+            let cursor_setup_start = profile_direct_delete.then(Instant::now);
             let mut active_txn = self.active_txn.borrow_mut();
             let txn = active_txn.as_mut().ok_or_else(|| {
                 FrankenError::internal("prepared direct delete missing active transaction")
@@ -18460,6 +18910,10 @@ impl Connection {
                 direct.cursor_page_size,
                 direct.cursor_reserved_per_page,
                 true,
+            );
+            record_hot_path_duration(
+                &FSQLITE_PREPARED_DIRECT_DELETE_CURSOR_SETUP_TIME_NS,
+                cursor_setup_start,
             );
             // Inline a scope so the `active_txn` mutable borrow is not
             // held across a `self.` call that may re-borrow Connection
@@ -18473,12 +18927,41 @@ impl Connection {
             )?
         };
 
+        self.finish_prepared_direct_simple_delete(direct, affected, abandon_memdb)
+    }
+
+    fn finish_prepared_direct_simple_delete(
+        &self,
+        direct: &PreparedDirectSimpleDelete,
+        affected: usize,
+        abandon_memdb: bool,
+    ) -> Result<usize> {
+        let profile_direct_delete = hot_path_profile_enabled();
         if abandon_memdb {
+            if profile_direct_delete {
+                FSQLITE_PREPARED_DIRECT_DELETE_MEMDB_ABANDON_CALLS
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            let abandon_start = profile_direct_delete.then(Instant::now);
             self.clear_prepared_direct_insert_append_hint();
             self.abandon_exact_memdb_row_mirror();
+            record_hot_path_duration(
+                &FSQLITE_PREPARED_DIRECT_DELETE_MEMDB_ABANDON_TIME_NS,
+                abandon_start,
+            );
         }
         if affected > 0 {
-            self.sync_memory_concurrent_pending_write_pages(direct.root_page)?;
+            if profile_direct_delete {
+                FSQLITE_PREPARED_DIRECT_DELETE_MEMORY_SYNC_CALLS
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            let sync_start = profile_direct_delete.then(Instant::now);
+            let sync_result = self.sync_memory_concurrent_pending_write_pages(direct.root_page);
+            record_hot_path_duration(
+                &FSQLITE_PREPARED_DIRECT_DELETE_MEMORY_SYNC_TIME_NS,
+                sync_start,
+            );
+            sync_result?;
         }
         Ok(affected)
     }
@@ -18490,12 +18973,12 @@ impl Connection {
         rowid: i64,
         cursor: &mut fsqlite_btree::BtCursor<P>,
     ) -> Result<(usize, bool)> {
+        let profile_direct_delete = hot_path_profile_enabled();
         let root_page = direct.root_page;
         // IMPL-9a: absent-rowid short-circuit BEFORE the B-tree descent.
         // See `execute_prepared_direct_simple_update_with_cursor` for
         // safety argument (filter is consulted only when built and
         // coherent with the committed state).
-        let profile_direct_delete = hot_path_profile_enabled();
         let qf_start = profile_direct_delete.then(Instant::now);
         let qf_result =
             self.qf_maybe_short_circuit_for_rowid(execution_cx, root_page, rowid, cursor);
@@ -18518,30 +19001,34 @@ impl Connection {
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
             let delete_leaf_run_start = profile_delete_leaf_run.then(Instant::now);
-            if let Some(mut run) = cursor.table_leaf_delete_run_current(rowid)? {
+            let delete_leaf_run_result = (|| -> Result<Option<TableLeafDeleteRun>> {
+                let Some(mut run) = cursor.table_leaf_delete_run_current(rowid)? else {
+                    return Ok(None);
+                };
                 let (usable_size, _) = Self::btree_cursor_sizes_from_header(
                     direct.cursor_page_size,
                     direct.cursor_reserved_per_page,
                 );
                 if run.delete_rowid(execution_cx, rowid, usable_size)? {
-                    if profile_delete_leaf_run {
-                        FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_HITS
-                            .fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    record_hot_path_duration(
-                        &FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_TIME_NS,
-                        delete_leaf_run_start,
-                    );
-                    self.store_pending_direct_delete_leaf_run(direct, run);
-                    self.qf_record_delete(root_page, rowid);
-                    self.retained_autocommit_count_sum_cache_note_delete(root_page, None);
-                    return Ok((1, true));
+                    Ok(Some(run))
+                } else {
+                    Ok(None)
                 }
-            }
+            })();
             record_hot_path_duration(
                 &FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_TIME_NS,
                 delete_leaf_run_start,
             );
+            if let Some(run) = delete_leaf_run_result? {
+                if profile_delete_leaf_run {
+                    FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_HITS
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                self.store_pending_direct_delete_leaf_run(direct, run);
+                self.qf_record_delete(root_page, rowid);
+                self.retained_autocommit_count_sum_cache_note_delete(root_page, None);
+                return Ok((1, true));
+            }
         }
 
         self.maybe_seed_retained_autocommit_count_sum_cache_from_clean_memdb(root_page);
@@ -19014,12 +19501,11 @@ impl Connection {
                     ))
                 }
             },
-            TypeAffinity::Numeric => match value {
-                PreparedDirectInsertRecordValue::TextBorrowed(_)
-                | PreparedDirectInsertRecordValue::TextScratch { .. } => None,
-                _ => Some(value),
-            },
-            TypeAffinity::Integer => match value {
+            // NUMERIC and INTEGER affinity coerce identically for storage (they
+            // differ only inside CAST): text falls back to the slow path, and a
+            // REAL with an integral, in-range value is reduced to INTEGER so
+            // e.g. `4.0` is stored as the integer `4`.
+            TypeAffinity::Numeric | TypeAffinity::Integer => match value {
                 PreparedDirectInsertRecordValue::TextBorrowed(_)
                 | PreparedDirectInsertRecordValue::TextScratch { .. } => None,
                 PreparedDirectInsertRecordValue::Float(float)
@@ -19325,6 +19811,9 @@ impl Connection {
             SmallVec::with_capacity(direct.columns.len());
         let mut header_content_size = 0usize;
         let mut body_size = 0usize;
+        let mut eval_time_ns = 0u64;
+        let mut affinity_time_ns = 0u64;
+        let mut layout_time_ns = 0u64;
         for (col_idx, (column, expr)) in direct
             .columns
             .iter()
@@ -19333,47 +19822,85 @@ impl Connection {
         {
             let is_rowid_alias = column.is_ipk || direct.rowid_alias_col_idx == Some(col_idx);
             if is_rowid_alias {
+                let eval_start = profile_enabled.then(Instant::now);
                 let raw_value = Self::eval_prepared_direct_simple_insert_expr(expr, params, None)?;
+                if let Some(elapsed_ns) = hot_path_elapsed_ns(eval_start) {
+                    eval_time_ns = eval_time_ns.saturating_add(elapsed_ns);
+                }
                 explicit_rowid = Self::coerce_insert_rowid_value(&raw_value)?;
+                let layout_start = profile_enabled.then(Instant::now);
                 let cell =
                     Self::prepared_direct_insert_record_cell(PreparedDirectInsertRecordValue::Null);
                 header_content_size += varint_len(cell.serial_type);
                 body_size += cell.payload_len;
                 cells.push(cell);
+                if let Some(elapsed_ns) = hot_path_elapsed_ns(layout_start) {
+                    layout_time_ns = layout_time_ns.saturating_add(elapsed_ns);
+                }
                 continue;
             }
 
-            let Some(raw_value) = Self::try_eval_prepared_direct_insert_record_value(
+            let eval_start = profile_enabled.then(Instant::now);
+            let raw_value = Self::try_eval_prepared_direct_insert_record_value(
                 expr,
                 params,
                 text_scratch,
                 cached_param_one_integer_text,
-            )?
-            else {
+            )?;
+            let Some(raw_value) = raw_value else {
                 return Ok(PreparedDirectInsertRecordBuild::Fallback);
             };
+            let eval_elapsed_ns = hot_path_elapsed_ns(eval_start);
             if column.notnull && raw_value.is_null() {
                 return Err(FrankenError::NotNullViolation {
                     column: format!("{table_name}.{}", column.name),
                 });
             }
             let affinity = Self::type_affinity_for_direct_insert(column.affinity);
-            let Some(value) = Self::apply_prepared_direct_insert_record_affinity(
+            let affinity_start = profile_enabled.then(Instant::now);
+            let value = Self::apply_prepared_direct_insert_record_affinity(
                 raw_value,
                 affinity,
                 text_scratch,
-            ) else {
+            );
+            let affinity_elapsed_ns = hot_path_elapsed_ns(affinity_start);
+            let Some(value) = value else {
                 return Ok(PreparedDirectInsertRecordBuild::Fallback);
             };
+            if let Some(elapsed_ns) = eval_elapsed_ns {
+                eval_time_ns = eval_time_ns.saturating_add(elapsed_ns);
+            }
+            if let Some(elapsed_ns) = affinity_elapsed_ns {
+                affinity_time_ns = affinity_time_ns.saturating_add(elapsed_ns);
+            }
+            let layout_start = profile_enabled.then(Instant::now);
             let cell = Self::prepared_direct_insert_record_cell(value);
             header_content_size += varint_len(cell.serial_type);
             body_size += cell.payload_len;
             cells.push(cell);
+            if let Some(elapsed_ns) = hot_path_elapsed_ns(layout_start) {
+                layout_time_ns = layout_time_ns.saturating_add(elapsed_ns);
+            }
         }
 
-        record_hot_path_duration(
+        let cell_build_elapsed_ns = hot_path_elapsed_ns(cell_build_start);
+        if profile_enabled {
+            record_hot_path_elapsed_ns(
+                &FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_EVAL_TIME_NS,
+                Some(eval_time_ns),
+            );
+            record_hot_path_elapsed_ns(
+                &FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_AFFINITY_TIME_NS,
+                Some(affinity_time_ns),
+            );
+            record_hot_path_elapsed_ns(
+                &FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_LAYOUT_TIME_NS,
+                Some(layout_time_ns),
+            );
+        }
+        record_hot_path_elapsed_ns(
             &FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_CELL_TIME_NS,
-            cell_build_start,
+            cell_build_elapsed_ns,
         );
         let encode_start = profile_enabled.then(Instant::now);
         Self::serialize_prepared_direct_insert_record_cells_into(
@@ -21340,6 +21867,12 @@ impl Connection {
         }
         let execution_started = (statement_reuse_enabled || compat_trace_profile_enabled)
             .then(fsqlite_types::sync_primitives::Instant::now);
+        let derived_storage_log_select = match statement {
+            Statement::Select(select) if flatten_simple_from_subquery_select(select).is_some() => {
+                Some(select.clone())
+            }
+            _ => None,
+        };
         let statement = {
             let parse_span = parse_trace_enabled.then(|| {
                 let span = tracing::span!(
@@ -21497,10 +22030,17 @@ impl Connection {
                     statement.as_ref(),
                     params,
                     precompiled,
+                    derived_storage_log_select.as_ref(),
                 )
             })
         } else {
-            self.execute_statement_dispatch_impl(&op_cx, statement.as_ref(), params, precompiled)
+            self.execute_statement_dispatch_impl(
+                &op_cx,
+                statement.as_ref(),
+                params,
+                precompiled,
+                derived_storage_log_select.as_ref(),
+            )
         };
         record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
         let result = match result {
@@ -21604,7 +22144,7 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         let op_cx = self.op_cx()?;
-        self.execute_statement_dispatch_impl(&op_cx, statement, params, None)
+        self.execute_statement_dispatch_impl(&op_cx, statement, params, None, None)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -21614,6 +22154,7 @@ impl Connection {
         statement: &Statement,
         params: Option<&[SqliteValue]>,
         precompiled: Option<&VdbeProgram>,
+        derived_storage_log_select: Option<&SelectStatement>,
     ) -> Result<Vec<Row>> {
         if let Some(rows) = self.maybe_execute_attached_target_statement(statement, params)? {
             return Ok(rows);
@@ -21811,18 +22352,27 @@ impl Connection {
                 } else if (has_group_by(select) || ordered_aggregate)
                     && !self.select_grouped_inner_join_count_sum_is_vdbe_eligible(select)
                 {
-                    // Fallback path: eagerly rewrite IN subqueries.
-                    if self.can_execute_aggregate_window_storage_substrate() {
-                        self.log_aggregate_window_storage_substrate_dispatch(
-                            select,
-                            "group_by_storage_substrate",
-                        );
-                    } else {
-                        self.log_mem_execution_fallback("select", "group_by_fallback")?;
-                    }
+                    // Eagerly rewrite IN subqueries before choosing the storage-compatible
+                    // grouped-aggregate substrate or the connection-level fallback.
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
+                    if let Some(mut rows) = self.try_execute_group_by_storage_substrate(
+                        cx,
+                        &bound,
+                        None,
+                        "group_by_storage_substrate",
+                    )? {
+                        if distinct {
+                            dedup_rows_collated(
+                                &mut rows,
+                                &distinct_collations,
+                                &distinct_coll_snap,
+                            );
+                        }
+                        return Ok(rows);
+                    }
+                    self.log_mem_execution_fallback("select", "group_by_fallback")?;
                     let limit_clause = bound.limit.take();
                     let mut rows = self.execute_group_by_select(&bound, None)?;
                     if distinct {
@@ -21861,19 +22411,6 @@ impl Connection {
                     // scans through the connection fallback, which can drive
                     // the registered vtab instance directly.
                     self.log_mem_execution_fallback("select", "live_vtab_select_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
-                    let mut bound =
-                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_join_select(&bound, None)?;
-                    if let Some(limit) = limit_clause {
-                        apply_limit_clause(&mut rows, &limit);
-                    }
-                    Ok(rows)
-                } else if select_contains_match_operator(select) {
-                    // The VDBE path does not yet support MATCH/REGEXP in this
-                    // connection path. Route through fallback evaluation.
-                    self.log_mem_execution_fallback("select", "match_operator_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
@@ -22010,6 +22547,15 @@ impl Connection {
                         &arc_prog
                     };
 
+                    let vdbe_storage_log_select = if select_join_is_vdbe_eligible(select) {
+                        Some((select, "join_vdbe_storage_cursors"))
+                    } else {
+                        derived_storage_log_select
+                            .map(|source| (source, "derived_source_flattened_vdbe_storage_cursors"))
+                    };
+                    let vdbe_storage_started = vdbe_storage_log_select
+                        .is_some()
+                        .then(std::time::Instant::now);
                     let (mut rows, _, _) = self.execute_table_program_with_cx(
                         program,
                         params,
@@ -22018,6 +22564,17 @@ impl Connection {
                         cx,
                         false,
                     )?;
+                    if let (Some((log_select, decision_reason)), Some(started)) =
+                        (vdbe_storage_log_select, vdbe_storage_started)
+                    {
+                        let elapsed_ns = hot_path_elapsed_ns(Some(started)).unwrap_or(u64::MAX);
+                        self.log_vdbe_join_storage_dispatch(
+                            log_select,
+                            decision_reason,
+                            rows.len(),
+                            elapsed_ns,
+                        );
+                    }
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                         if let Some(limit_clause) = limit_clause.as_ref() {
@@ -22135,16 +22692,24 @@ impl Connection {
                     // per-row INSERT ... VALUES operations. Those inner
                     // statements already handle trigger firing and change
                     // tracking, so route around the outer trigger path here.
-                    let needs_row_by_row_replay = insert.returning.is_empty()
-                        && (has_before_insert || has_after_insert || self.fk_enforcement_enabled());
-                    if insert.returning.is_empty() && (!is_simple_values || needs_row_by_row_replay)
+                    let needs_row_by_row_replay =
+                        has_before_insert || has_after_insert || self.fk_enforcement_enabled();
+                    if !is_simple_values || (insert.returning.is_empty() && needs_row_by_row_replay)
                     {
                         self.log_mem_execution_fallback(
                             "insert_select",
                             "insert_select_row_by_row_fallback",
                         )?;
-                        let _ = self.execute_insert_select_fallback(insert, select_stmt, params)?;
-                        return Ok(Vec::new());
+                        if insert.returning.is_empty() {
+                            let _ =
+                                self.execute_insert_select_fallback(insert, select_stmt, params)?;
+                            return Ok(Vec::new());
+                        }
+                        return self.execute_insert_select_fallback_returning(
+                            insert,
+                            select_stmt,
+                            params,
+                        );
                     }
                 }
                 if !is_live_vtab
@@ -23095,8 +23660,30 @@ impl Connection {
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<usize> {
+        Ok(self
+            .execute_insert_select_fallback_outcome(insert, select_stmt, params)?
+            .changes)
+    }
+
+    fn execute_insert_select_fallback_returning(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        select_stmt: &fsqlite_ast::SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        Ok(self
+            .execute_insert_select_fallback_outcome(insert, select_stmt, params)?
+            .returning_rows)
+    }
+
+    fn execute_insert_select_fallback_outcome(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        select_stmt: &fsqlite_ast::SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<InsertSelectReplayOutcome> {
         if let Some(changes) =
-            self.try_execute_streaming_insert_select_fallback(insert, select_stmt, params)?
+            self.try_execute_streaming_insert_select_fallback_outcome(insert, select_stmt, params)?
         {
             return Ok(changes);
         }
@@ -23117,12 +23704,12 @@ impl Connection {
         } {
             let source_rows =
                 self.materialize_insert_select_source_rows(insert, select_stmt, params)?;
-            return self.execute_insert_select_materialized_rows(insert, &source_rows);
+            return self.execute_insert_select_materialized_rows_outcome(insert, &source_rows);
         }
         // Chunked materialization: wrap the source SELECT with LIMIT/OFFSET
         // and process in bounded batches to avoid OOM on large result sets.
         // Safe here because the source and destination tables are disjoint.
-        let mut total_changes = 0usize;
+        let mut total_outcome = InsertSelectReplayOutcome::default();
         let mut offset: i64 = 0;
         loop {
             let mut chunked_select = select_stmt.clone();
@@ -23143,14 +23730,19 @@ impl Connection {
             let source_rows =
                 self.materialize_insert_select_source_rows(insert, &chunked_select, params)?;
             let chunk_len = source_rows.len();
-            total_changes += self.execute_insert_select_materialized_rows(insert, &source_rows)?;
+            let chunk_outcome =
+                self.execute_insert_select_materialized_rows_outcome(insert, &source_rows)?;
+            total_outcome.changes = total_outcome.changes.saturating_add(chunk_outcome.changes);
+            total_outcome
+                .returning_rows
+                .extend(chunk_outcome.returning_rows);
             // source_rows is dropped here, freeing memory before the next chunk.
             if (chunk_len as i64) < Self::INSERT_SELECT_CHUNK_SIZE {
                 break;
             }
             offset += Self::INSERT_SELECT_CHUNK_SIZE;
         }
-        Ok(total_changes)
+        Ok(total_outcome)
     }
 
     fn execute_materialized_insert_select_statement(
@@ -23331,6 +23923,16 @@ impl Connection {
         insert: &fsqlite_ast::InsertStatement,
         source_rows: &[Row],
     ) -> Result<usize> {
+        Ok(self
+            .execute_insert_select_materialized_rows_outcome(insert, source_rows)?
+            .changes)
+    }
+
+    fn execute_insert_select_materialized_rows_outcome(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        source_rows: &[Row],
+    ) -> Result<InsertSelectReplayOutcome> {
         self.execute_insert_select_row_stream(insert, |emit_row| {
             for row in source_rows {
                 emit_row(row.values())?;
@@ -23376,10 +23978,6 @@ impl Connection {
         insert: &fsqlite_ast::InsertStatement,
         layout: &InsertTargetLayout,
     ) -> String {
-        if !insert.returning.is_empty() {
-            // The caller validates RETURNING before invoking this helper.
-            debug_assert!(insert.returning.is_empty());
-        }
         let qualified_table = quote_qualified_name(&insert.table);
         let placeholders = (1..=layout.table_columns.len()).map(|idx| format!("?{idx}"));
         let conflict_clause = match &insert.or_conflict {
@@ -23390,6 +23988,19 @@ impl Connection {
             Some(fsqlite_ast::ConflictAction::Rollback) => "OR ROLLBACK ",
             None => "",
         };
+        let returning_clause = if insert.returning.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " RETURNING {}",
+                insert
+                    .returning
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         let insert_sql = if insert.columns.is_empty() {
             let placeholders = placeholders.collect::<Vec<_>>().join(", ");
             let upsert_sql = insert
@@ -23399,10 +24010,12 @@ impl Connection {
                 .collect::<Vec<_>>()
                 .join(" ");
             if upsert_sql.is_empty() {
-                format!("INSERT {conflict_clause}INTO {qualified_table} VALUES ({placeholders});")
+                format!(
+                    "INSERT {conflict_clause}INTO {qualified_table} VALUES ({placeholders}){returning_clause};"
+                )
             } else {
                 format!(
-                    "INSERT {conflict_clause}INTO {qualified_table} VALUES ({placeholders}) {upsert_sql};"
+                    "INSERT {conflict_clause}INTO {qualified_table} VALUES ({placeholders}) {upsert_sql}{returning_clause};"
                 )
             }
         } else {
@@ -23424,11 +24037,11 @@ impl Connection {
                 .join(" ");
             if upsert_sql.is_empty() {
                 format!(
-                    "INSERT {conflict_clause}INTO {qualified_table} ({quoted_targets}) VALUES ({placeholders});"
+                    "INSERT {conflict_clause}INTO {qualified_table} ({quoted_targets}) VALUES ({placeholders}){returning_clause};"
                 )
             } else {
                 format!(
-                    "INSERT {conflict_clause}INTO {qualified_table} ({quoted_targets}) VALUES ({placeholders}) {upsert_sql};"
+                    "INSERT {conflict_clause}INTO {qualified_table} ({quoted_targets}) VALUES ({placeholders}) {upsert_sql}{returning_clause};"
                 )
             }
         };
@@ -23440,15 +24053,10 @@ impl Connection {
         &self,
         insert: &fsqlite_ast::InsertStatement,
         mut producer: F,
-    ) -> Result<usize>
+    ) -> Result<InsertSelectReplayOutcome>
     where
         F: FnMut(&mut dyn FnMut(&[SqliteValue]) -> Result<()>) -> Result<()>,
     {
-        if !insert.returning.is_empty() {
-            return Err(FrankenError::NotImplemented(
-                "INSERT ... SELECT fallback does not support RETURNING".to_owned(),
-            ));
-        }
         let layout = self.resolve_insert_target_layout(insert)?;
         if layout.table_columns.is_empty() {
             return Err(FrankenError::Internal(format!(
@@ -23458,15 +24066,26 @@ impl Connection {
         }
         let source_column_count = layout.targets.len();
         let insert_sql = self.build_insert_select_replay_sql(insert, &layout);
+        let collect_returning = !insert.returning.is_empty();
         let preserve_prior_changes_on_constraint_violation =
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
         let previous_total_changes = self.total_changes.get();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
-        let mut execute_rows = || -> Result<usize> {
+        let mut execute_rows = || -> Result<InsertSelectReplayOutcome> {
             let _fk_parent_validation_cache =
                 self.enter_fk_parent_validation_cache_scope(&insert.table.name);
-            let prepared = self.prepare_after_background_status(&insert_sql)?;
+            let prepared = if collect_returning {
+                None
+            } else {
+                Some(self.prepare_after_background_status(&insert_sql)?)
+            };
+            let returning_statement = if collect_returning {
+                Some(parse_single_statement(&insert_sql)?)
+            } else {
+                None
+            };
             let mut statement_changes = 0usize;
+            let mut returning_rows = Vec::new();
             let mut produced_rows = 0usize;
             let mut error_state_recorded = false;
             let record_error_state = |statement_changes: usize| {
@@ -23493,9 +24112,28 @@ impl Connection {
                         row_values.len()
                     )));
                 }
-                match self
-                    .execute_prepared_with_params_after_background_status(&prepared, row_values)
-                {
+                let row_result = if let Some(returning_statement) = returning_statement.as_ref() {
+                    self.execute_statement_impl_after_background_status(
+                        returning_statement,
+                        Some(row_values),
+                        None,
+                    )
+                    .map(|rows| {
+                        let affected = self.last_changes.get();
+                        returning_rows.extend(rows);
+                        affected
+                    })
+                } else {
+                    self.execute_prepared_with_params_after_background_status(
+                        prepared.as_ref().ok_or_else(|| {
+                            FrankenError::internal(
+                                "INSERT ... SELECT replay missing prepared statement",
+                            )
+                        })?,
+                        row_values,
+                    )
+                };
+                match row_result {
                     Ok(affected) => {
                         statement_changes = statement_changes.saturating_add(affected);
                         Ok(())
@@ -23514,7 +24152,10 @@ impl Connection {
                 return Err(error);
             }
             self.set_statement_change_count(statement_changes);
-            Ok(statement_changes)
+            Ok(InsertSelectReplayOutcome {
+                changes: statement_changes,
+                returning_rows,
+            })
         };
 
         if !preserve_prior_changes_on_constraint_violation
@@ -23527,17 +24168,17 @@ impl Connection {
         }
     }
 
-    fn try_execute_streaming_insert_select_fallback(
+    fn try_execute_streaming_insert_select_fallback_outcome(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
-    ) -> Result<Option<usize>> {
+    ) -> Result<Option<InsertSelectReplayOutcome>> {
         if insert.with.is_some() {
             return Ok(None);
         }
         let mut streamed = false;
-        let changes = self.execute_insert_select_row_stream(insert, |emit_row| {
+        let outcome = self.execute_insert_select_row_stream(insert, |emit_row| {
             streamed =
                 self.try_stream_simple_join_select_rows(select_stmt, params, |source_row| {
                     emit_row(source_row)
@@ -23545,7 +24186,7 @@ impl Connection {
             Ok(())
         })?;
         if streamed {
-            Ok(Some(changes))
+            Ok(Some(outcome))
         } else {
             Ok(None)
         }
@@ -24015,6 +24656,9 @@ impl Connection {
                 if let Some(row_data) = self.try_scan_join_source_from_memdb(source) {
                     return Ok(Some(row_data));
                 }
+                if let Some(result) = self.try_scan_join_source_from_pager(source) {
+                    return Ok(Some(result?));
+                }
                 let scan_sql = build_join_scan_sql(source);
                 let rows = self.query(&scan_sql)?;
                 Ok(Some(rows_into_value_vectors(rows)))
@@ -24161,6 +24805,11 @@ impl Connection {
             }
 
             let mut db = self.db.borrow_mut();
+            if db.get_table(root_page).is_none() {
+                return Err(FrankenError::Internal(format!(
+                    "table not found at root page {root_page}"
+                )));
+            }
 
             // Check UNIQUE constraints on columns.
             let mut unique_violation_col: Option<String> = None;
@@ -24270,11 +24919,8 @@ impl Connection {
 
             // For REPLACE: delete rows that conflict on non-IPK UNIQUE columns.
             if *conflict == ConflictAction::Replace && !conflicting_rowids.is_empty() {
-                let table = db.get_table_mut(root_page).ok_or_else(|| {
-                    FrankenError::Internal(format!("table not found at root page {root_page}"))
-                })?;
                 for rid in conflicting_rowids {
-                    table.delete_by_rowid(rid);
+                    db.delete_rowid(root_page, rid);
                 }
             }
 
@@ -24286,31 +24932,19 @@ impl Connection {
 
                 match conflict {
                     ConflictAction::Replace => {
-                        // insert_row delegates to insert() which has upsert
-                        // semantics: replaces if rowid already exists.
-                        let table = db.get_table_mut(root_page).ok_or_else(|| {
-                            FrankenError::Internal(format!(
-                                "table not found at root page {root_page}"
-                            ))
-                        })?;
                         if let Some(ipk_idx) = ipk_col_idx {
                             col_values[ipk_idx] = SqliteValue::Integer(rowid);
                         }
-                        table.insert_row(rowid, col_values);
+                        db.upsert_row(root_page, rowid, col_values);
                         self.record_last_insert_rowid(rowid);
                         affected += 1;
                     }
                     ConflictAction::Ignore => {
                         if !exists {
-                            let table = db.get_table_mut(root_page).ok_or_else(|| {
-                                FrankenError::Internal(format!(
-                                    "table not found at root page {root_page}"
-                                ))
-                            })?;
                             if let Some(ipk_idx) = ipk_col_idx {
                                 col_values[ipk_idx] = SqliteValue::Integer(rowid);
                             }
-                            table.insert_row(rowid, col_values);
+                            db.upsert_row(root_page, rowid, col_values);
                             self.record_last_insert_rowid(rowid);
                             affected += 1;
                         }
@@ -24322,15 +24956,10 @@ impl Connection {
                                 columns: format!("{table_name}.rowid"),
                             });
                         }
-                        let table = db.get_table_mut(root_page).ok_or_else(|| {
-                            FrankenError::Internal(format!(
-                                "table not found at root page {root_page}"
-                            ))
-                        })?;
                         if let Some(ipk_idx) = ipk_col_idx {
                             col_values[ipk_idx] = SqliteValue::Integer(rowid);
                         }
-                        table.insert_row(rowid, col_values);
+                        db.upsert_row(root_page, rowid, col_values);
                         self.record_last_insert_rowid(rowid);
                         affected += 1;
                     }
@@ -24338,14 +24967,11 @@ impl Connection {
             } else {
                 // No explicit rowid; auto-allocate.  Conflict on auto-generated
                 // rowid is practically impossible.
-                let table = db.get_table_mut(root_page).ok_or_else(|| {
-                    FrankenError::Internal(format!("table not found at root page {root_page}"))
-                })?;
-                let new_rowid = table.alloc_rowid();
-                if let Some(ipk_idx) = ipk_col_idx {
-                    col_values[ipk_idx] = SqliteValue::Integer(new_rowid);
-                }
-                table.insert_row(new_rowid, col_values);
+                let new_rowid = db
+                    .insert_auto_row(root_page, col_values, ipk_col_idx)
+                    .ok_or_else(|| {
+                        FrankenError::Internal(format!("table not found at root page {root_page}"))
+                    })?;
                 self.record_last_insert_rowid(new_rowid);
                 affected += 1;
             }
@@ -24842,8 +25468,37 @@ impl Connection {
                     })
                 }
             }
+            Statement::Pragma(pragma) if pragma.value.is_some() => self.wrap_deferred_prepared_dml(
+                sql,
+                statement,
+                registry,
+                prepared_column_names,
+                may_observe_change_tracking,
+            ),
+            Statement::Pragma(_) => Ok(PreparedStatement {
+                sql: Rc::<str>::from(sql),
+                program: build_placeholder_program()?,
+                func_registry: registry,
+                expression_postprocess: None,
+                distinct: false,
+                distinct_collations: Vec::new(),
+                db: None,
+                post_distinct_limit: None,
+                schema_cookie: self.schema_cookie(),
+                schema_generation: self.schema_generation(),
+                function_registry_generation: self.function_registry_generation(),
+                dml_dispatch: None,
+                prepared_update_delete_fast_path: None,
+                deferred_query_statement: Some(Arc::new(statement.clone())),
+                deferred_query_column_count: None,
+                column_names: prepared_column_names,
+                prepared_query_fast_path: None,
+                may_observe_change_tracking,
+                conn: self,
+            }),
             _ => Err(FrankenError::NotImplemented(
-                "prepare() supports SELECT, INSERT, UPDATE, and DELETE statements only".to_owned(),
+                "prepare() supports SELECT, INSERT, UPDATE, DELETE, and PRAGMA statements only"
+                    .to_owned(),
             )),
         }
     }
@@ -26930,6 +27585,8 @@ impl Connection {
         let has_vdbe_eligible_join = has_joins(select) && select_join_is_vdbe_eligible(select);
         let has_vdbe_eligible_grouped_join =
             self.select_grouped_inner_join_count_sum_is_vdbe_eligible(select);
+        let has_vdbe_eligible_group_by =
+            self.select_group_by_storage_substrate_is_vdbe_eligible(select);
         let has_dispatch_only_subquery = select_contains_prepared_dispatch_subquery(select, self);
         let prefer_memdb_hash_join_dispatch = self.prefer_memdb_hash_join_dispatch(select);
         let prefer_memdb_hash_grouped_join_dispatch =
@@ -26946,10 +27603,11 @@ impl Connection {
             || (expression_only && has_implicit_aggregation(select))
             || (expression_only && expression_only_has_subquery(select))
             || (has_grouping && has_join_like_source && !has_vdbe_eligible_grouped_join)
-            || (has_group_by(select) && !has_vdbe_eligible_grouped_join)
+            || (has_group_by(select)
+                && !has_vdbe_eligible_grouped_join
+                && !has_vdbe_eligible_group_by)
             || has_ordered_aggregate
             || has_window_functions(select)
-            || select_contains_match_operator(select)
             || (has_join_like_source && !has_vdbe_eligible_join && !has_vdbe_eligible_grouped_join)
             || select_has_correlated_join_subquery(select)
     }
@@ -29302,6 +29960,9 @@ impl Connection {
                 if let Some(row_data) = self.try_scan_join_source_from_memdb(source) {
                     return Ok(Some(row_data));
                 }
+                if let Some(result) = self.try_scan_join_source_from_pager(source) {
+                    return Ok(Some(result?));
+                }
                 let scan_sql = build_join_scan_sql(source);
                 let rows = self.query(&scan_sql)?;
                 Ok(Some(rows_into_value_vectors(rows)))
@@ -29750,6 +30411,13 @@ impl Connection {
             return Ok(SqliteValue::Null);
         }
 
+        let literal_sql = Self::strip_wrapping_default_parens(trimmed);
+        if let Some(value) = Self::parse_wrapped_default_text(literal_sql, '\'')
+            .or_else(|| Self::parse_wrapped_default_text(literal_sql, '"'))
+        {
+            return Ok(value);
+        }
+
         let sql = format!("SELECT {trimmed}");
         let statement = parse_single_statement(&sql)?;
         if let Statement::Select(select) = &statement
@@ -29798,6 +30466,11 @@ impl Connection {
                     .and_then(|row| row.values().first())
                     .cloned()
                     .unwrap_or(SqliteValue::Null));
+            }
+            if let Expr::Column(col_ref, _) = expr
+                && col_ref.table.is_none()
+            {
+                return Ok(SqliteValue::Text(col_ref.column.clone().into()));
             }
         }
 
@@ -31972,6 +32645,16 @@ impl Connection {
             .expect("active pending direct update leaf patch-run should exist after preflight");
         let restore_on_error = run.clone();
         self.pending_direct_update_leaf_patch_run_active.set(false);
+        let profile_update_leaf_patch_run = hot_path_profile_enabled();
+        if profile_update_leaf_patch_run {
+            FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_FLUSHES
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            if run.run.is_dirty() {
+                FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_DIRTY_FLUSHES
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+        let update_leaf_patch_flush_start = profile_update_leaf_patch_run.then(Instant::now);
         let result = if let Some(concurrent_ctx) = concurrent_ctx {
             let txn = self.active_txn.borrow_mut().take();
             if let Some(txn) = txn {
@@ -32026,6 +32709,10 @@ impl Connection {
                 ))
             }
         };
+        record_hot_path_duration(
+            &FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_FLUSH_TIME_NS,
+            update_leaf_patch_flush_start,
+        );
         if result.is_err() {
             *self.pending_direct_update_leaf_patch_run.borrow_mut() = Some(restore_on_error);
             self.pending_direct_update_leaf_patch_run_active.set(true);
@@ -32043,6 +32730,24 @@ impl Connection {
     ) -> Result<()> {
         cursor.flush_table_leaf_delete_run_in_place(cx, &mut run.run)?;
         Ok(())
+    }
+
+    fn pending_direct_delete_leaf_runs_common_shape(
+        runs: &[PendingDirectDeleteLeafRun],
+    ) -> Option<(i32, PageSize, u8)> {
+        let first = runs.first()?;
+        let shape = (
+            first.root_page,
+            first.cursor_page_size,
+            first.cursor_reserved_per_page,
+        );
+        runs.iter()
+            .all(|run| {
+                run.root_page == shape.0
+                    && run.cursor_page_size == shape.1
+                    && run.cursor_reserved_per_page == shape.2
+            })
+            .then_some(shape)
     }
 
     fn restore_pending_direct_delete_leaf_runs(
@@ -32110,36 +32815,85 @@ impl Connection {
                     concurrent_ctx.busy_timeout_ms,
                 );
                 let result = {
-                    let mut result = Ok(());
-                    for run in &mut runs {
-                        let root = match page_number_from_schema_root(
-                            run.root_page,
+                    if let Some((root_page, cursor_page_size, cursor_reserved_per_page)) =
+                        Self::pending_direct_delete_leaf_runs_common_shape(&runs)
+                    {
+                        match page_number_from_schema_root(
+                            root_page,
                             "<pending-direct-delete-leaf-run>",
                             "table",
                         ) {
-                            Ok(root) => root,
-                            Err(error) => {
-                                result = Err(error);
+                            Ok(root) => {
+                                let (usable_size, page_size) = Self::btree_cursor_sizes_from_header(
+                                    cursor_page_size,
+                                    cursor_reserved_per_page,
+                                );
+                                let mut cursor = fsqlite_btree::BtCursor::new(
+                                    page_io.clone(),
+                                    root,
+                                    usable_size,
+                                    true,
+                                );
+                                Self::configure_btree_cursor_page_size(
+                                    &mut cursor,
+                                    usable_size,
+                                    page_size,
+                                );
+                                let mut result = Ok(());
+                                for run in &mut runs {
+                                    result = self.flush_pending_direct_delete_leaf_run_with_cursor(
+                                        cx,
+                                        &mut cursor,
+                                        run,
+                                    );
+                                    if result.is_err() {
+                                        break;
+                                    }
+                                }
+                                result
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        let mut result = Ok(());
+                        for run in &mut runs {
+                            let root = match page_number_from_schema_root(
+                                run.root_page,
+                                "<pending-direct-delete-leaf-run>",
+                                "table",
+                            ) {
+                                Ok(root) => root,
+                                Err(error) => {
+                                    result = Err(error);
+                                    break;
+                                }
+                            };
+                            let (usable_size, page_size) = Self::btree_cursor_sizes_from_header(
+                                run.cursor_page_size,
+                                run.cursor_reserved_per_page,
+                            );
+                            let mut cursor = fsqlite_btree::BtCursor::new(
+                                page_io.clone(),
+                                root,
+                                usable_size,
+                                true,
+                            );
+                            Self::configure_btree_cursor_page_size(
+                                &mut cursor,
+                                usable_size,
+                                page_size,
+                            );
+                            result = self.flush_pending_direct_delete_leaf_run_with_cursor(
+                                cx,
+                                &mut cursor,
+                                run,
+                            );
+                            if result.is_err() {
                                 break;
                             }
-                        };
-                        let (usable_size, page_size) = Self::btree_cursor_sizes_from_header(
-                            run.cursor_page_size,
-                            run.cursor_reserved_per_page,
-                        );
-                        let mut cursor =
-                            fsqlite_btree::BtCursor::new(page_io.clone(), root, usable_size, true);
-                        Self::configure_btree_cursor_page_size(&mut cursor, usable_size, page_size);
-                        result = self.flush_pending_direct_delete_leaf_run_with_cursor(
-                            cx,
-                            &mut cursor,
-                            run,
-                        );
-                        if result.is_err() {
-                            break;
                         }
+                        result
                     }
-                    result
                 };
                 match page_io.into_inner() {
                     Ok(txn_back) => {
@@ -32156,33 +32910,69 @@ impl Connection {
         } else {
             let mut active_txn = self.active_txn.borrow_mut();
             if let Some(txn) = active_txn.as_mut() {
-                let mut result = Ok(());
-                for run in &mut runs {
-                    let root = match page_number_from_schema_root(
-                        run.root_page,
+                if let Some((root_page, cursor_page_size, cursor_reserved_per_page)) =
+                    Self::pending_direct_delete_leaf_runs_common_shape(&runs)
+                {
+                    match page_number_from_schema_root(
+                        root_page,
                         "<pending-direct-delete-leaf-run>",
                         "table",
                     ) {
-                        Ok(root) => root,
-                        Err(error) => {
-                            result = Err(error);
+                        Ok(root) => {
+                            let mut cursor = Self::new_header_btree_cursor(
+                                txn,
+                                root,
+                                cursor_page_size,
+                                cursor_reserved_per_page,
+                                true,
+                            );
+                            let mut result = Ok(());
+                            for run in &mut runs {
+                                result = self.flush_pending_direct_delete_leaf_run_with_cursor(
+                                    cx,
+                                    &mut cursor,
+                                    run,
+                                );
+                                if result.is_err() {
+                                    break;
+                                }
+                            }
+                            result
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    let mut result = Ok(());
+                    for run in &mut runs {
+                        let root = match page_number_from_schema_root(
+                            run.root_page,
+                            "<pending-direct-delete-leaf-run>",
+                            "table",
+                        ) {
+                            Ok(root) => root,
+                            Err(error) => {
+                                result = Err(error);
+                                break;
+                            }
+                        };
+                        let mut cursor = Self::new_header_btree_cursor(
+                            txn,
+                            root,
+                            run.cursor_page_size,
+                            run.cursor_reserved_per_page,
+                            true,
+                        );
+                        result = self.flush_pending_direct_delete_leaf_run_with_cursor(
+                            cx,
+                            &mut cursor,
+                            run,
+                        );
+                        if result.is_err() {
                             break;
                         }
-                    };
-                    let mut cursor = Self::new_header_btree_cursor(
-                        txn,
-                        root,
-                        run.cursor_page_size,
-                        run.cursor_reserved_per_page,
-                        true,
-                    );
-                    result =
-                        self.flush_pending_direct_delete_leaf_run_with_cursor(cx, &mut cursor, run);
-                    if result.is_err() {
-                        break;
                     }
+                    result
                 }
-                result
             } else {
                 Err(FrankenError::internal(
                     "pending direct delete leaf-run missing active transaction",
@@ -32322,34 +33112,50 @@ impl Connection {
     }
 
     fn record_prepared_direct_delete_leaf_run_active_miss(
-        reason: Option<TableLeafDeleteRunMissReason>,
+        reason: PendingDirectDeleteLeafRunProbeMiss,
     ) {
         match reason {
-            None => {
+            PendingDirectDeleteLeafRunProbeMiss::ShapeMismatch => {
                 FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_SHAPE_MISMATCHES
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
-            Some(TableLeafDeleteRunMissReason::RowidNotInLeaf) => {
+            PendingDirectDeleteLeafRunProbeMiss::StagedRuns => {
+                FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_STAGED_RUNS
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            PendingDirectDeleteLeafRunProbeMiss::RunDeclined(
+                TableLeafDeleteRunMissReason::RowidNotInLeaf,
+            ) => {
                 FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_ROWID_NOT_IN_LEAF
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
-            Some(TableLeafDeleteRunMissReason::AlreadyDeleted) => {
+            PendingDirectDeleteLeafRunProbeMiss::RunDeclined(
+                TableLeafDeleteRunMissReason::AlreadyDeleted,
+            ) => {
                 FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_ALREADY_DELETED
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
-            Some(TableLeafDeleteRunMissReason::NonRootWouldEmptyLeaf) => {
+            PendingDirectDeleteLeafRunProbeMiss::RunDeclined(
+                TableLeafDeleteRunMissReason::NonRootWouldEmptyLeaf,
+            ) => {
                 FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_NONROOT_WOULD_EMPTY_LEAF
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
-            Some(TableLeafDeleteRunMissReason::NonRootLastCell) => {
+            PendingDirectDeleteLeafRunProbeMiss::RunDeclined(
+                TableLeafDeleteRunMissReason::NonRootLastCell,
+            ) => {
                 FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_NONROOT_LAST_CELL
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
-            Some(TableLeafDeleteRunMissReason::NonCompactCellArea) => {
+            PendingDirectDeleteLeafRunProbeMiss::RunDeclined(
+                TableLeafDeleteRunMissReason::NonCompactCellArea,
+            ) => {
                 FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_NONCOMPACT_CELL_AREA
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
-            Some(TableLeafDeleteRunMissReason::CellShapeOrOverflow) => {
+            PendingDirectDeleteLeafRunProbeMiss::RunDeclined(
+                TableLeafDeleteRunMissReason::CellShapeOrOverflow,
+            ) => {
                 FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISS_CELL_SHAPE_OR_OVERFLOW
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
@@ -32375,53 +33181,76 @@ impl Connection {
             direct.cursor_page_size,
             direct.cursor_reserved_per_page,
         );
-        let (deleted, miss_reason, can_stage_current_run) = {
+        let probe_result = (|| -> Result<(bool, Option<PendingDirectDeleteLeafRunProbeMiss>, bool, bool)> {
             let mut pending = self.pending_direct_delete_leaf_run.borrow_mut();
-            let Some(run) = pending.as_mut() else {
-                if self.staged_direct_delete_leaf_runs_accept(direct, rowid) {
-                    return Ok(None);
+            Ok(match pending.as_mut() {
+                None => {
+                    let should_flush_runs =
+                        !self.staged_direct_delete_leaf_runs_accept(direct, rowid);
+                    (
+                        false,
+                        Some(PendingDirectDeleteLeafRunProbeMiss::StagedRuns),
+                        false,
+                        should_flush_runs,
+                    )
                 }
-                drop(pending);
-                self.flush_pending_direct_delete_leaf_run(execution_cx)?;
-                return Ok(None);
-            };
-            if run.root_page != direct.root_page
-                || run.cursor_page_size != direct.cursor_page_size
-                || run.cursor_reserved_per_page != direct.cursor_reserved_per_page
-            {
-                (false, None, false)
-            } else {
-                match run
-                    .run
-                    .delete_rowid_with_reason(execution_cx, rowid, usable_size)?
+                Some(run)
+                    if run.root_page != direct.root_page
+                        || run.cursor_page_size != direct.cursor_page_size
+                        || run.cursor_reserved_per_page != direct.cursor_reserved_per_page =>
                 {
-                    TableLeafDeleteRunDelete::Deleted => (true, None, false),
-                    TableLeafDeleteRunDelete::Miss(reason) => {
-                        let leaf_max_rowid =
-                            if reason == TableLeafDeleteRunMissReason::RowidNotInLeaf {
-                                let leaf_max_rowid = match run.leaf_max_rowid {
-                                    Some(leaf_max_rowid) => leaf_max_rowid,
-                                    None => {
-                                        let leaf_max_rowid = run.run.max_rowid()?;
-                                        run.leaf_max_rowid = Some(leaf_max_rowid);
-                                        leaf_max_rowid
-                                    }
+                    (
+                        false,
+                        Some(PendingDirectDeleteLeafRunProbeMiss::ShapeMismatch),
+                        false,
+                        true,
+                    )
+                }
+                Some(run) => {
+                    match run
+                        .run
+                        .delete_rowid_with_reason(execution_cx, rowid, usable_size)?
+                    {
+                        TableLeafDeleteRunDelete::Deleted => (true, None, false, false),
+                        TableLeafDeleteRunDelete::Miss(reason) => {
+                            let leaf_max_rowid =
+                                if reason == TableLeafDeleteRunMissReason::RowidNotInLeaf {
+                                    let leaf_max_rowid = match run.leaf_max_rowid {
+                                        Some(leaf_max_rowid) => leaf_max_rowid,
+                                        None => {
+                                            let leaf_max_rowid = run.run.max_rowid()?;
+                                            run.leaf_max_rowid = Some(leaf_max_rowid);
+                                            leaf_max_rowid
+                                        }
+                                    };
+                                    Some(leaf_max_rowid)
+                                } else {
+                                    None
                                 };
-                                Some(leaf_max_rowid)
-                            } else {
-                                None
-                            };
-                        let can_stage = reason == TableLeafDeleteRunMissReason::RowidNotInLeaf
-                            && leaf_max_rowid.is_some_and(|leaf_max_rowid| rowid > leaf_max_rowid);
-                        (false, Some(reason), can_stage)
+                            let can_stage = reason == TableLeafDeleteRunMissReason::RowidNotInLeaf
+                                && leaf_max_rowid
+                                    .is_some_and(|leaf_max_rowid| rowid > leaf_max_rowid);
+                            (
+                                false,
+                                Some(PendingDirectDeleteLeafRunProbeMiss::RunDeclined(reason)),
+                                can_stage,
+                                !can_stage,
+                            )
+                        }
                     }
                 }
-            }
-        };
-        record_hot_path_duration(
+            })
+        })();
+        let delete_leaf_run_active_elapsed_ns = hot_path_elapsed_ns(delete_leaf_run_active_start);
+        record_hot_path_elapsed_ns(
             &FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_TIME_NS,
-            delete_leaf_run_active_start,
+            delete_leaf_run_active_elapsed_ns,
         );
+        record_hot_path_elapsed_ns(
+            &FSQLITE_PREPARED_DIRECT_DELETE_ACTIVE_LEAF_PROBE_TIME_NS,
+            delete_leaf_run_active_elapsed_ns,
+        );
+        let (deleted, miss_reason, can_stage_current_run, should_flush_runs) = probe_result?;
         if deleted {
             if profile_delete_leaf_run {
                 FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_HITS
@@ -32434,11 +33263,13 @@ impl Connection {
             if profile_delete_leaf_run {
                 FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_ACTIVE_MISSES
                     .fetch_add(1, AtomicOrdering::Relaxed);
-                Self::record_prepared_direct_delete_leaf_run_active_miss(miss_reason);
+                if let Some(miss_reason) = miss_reason {
+                    Self::record_prepared_direct_delete_leaf_run_active_miss(miss_reason);
+                }
             }
             if can_stage_current_run {
                 self.stage_pending_direct_delete_leaf_run();
-            } else {
+            } else if should_flush_runs {
                 self.flush_pending_direct_delete_leaf_run(execution_cx)?;
             }
             Ok(None)
@@ -32455,9 +33286,31 @@ impl Connection {
         if !self.pending_direct_update_leaf_patch_run_active.get() {
             return Ok(None);
         }
-        let Some((column_index, next_value)) =
-            Self::prepared_direct_update_leaf_patch_value(direct, params)?
-        else {
+        let profile_update_leaf_patch_run = hot_path_profile_enabled();
+        if profile_update_leaf_patch_run {
+            FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_ATTEMPTS
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        let update_leaf_patch_active_start = profile_update_leaf_patch_run.then(Instant::now);
+        let leaf_patch_value = match Self::prepared_direct_update_leaf_patch_value(direct, params) {
+            Ok(value) => value,
+            Err(error) => {
+                record_hot_path_duration(
+                    &FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_TIME_NS,
+                    update_leaf_patch_active_start,
+                );
+                return Err(error);
+            }
+        };
+        let Some((column_index, next_value)) = leaf_patch_value else {
+            record_hot_path_duration(
+                &FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_TIME_NS,
+                update_leaf_patch_active_start,
+            );
+            if profile_update_leaf_patch_run {
+                FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_MISSES
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
             self.flush_pending_direct_update_leaf_patch_run(execution_cx)?;
             return Ok(None);
         };
@@ -32465,13 +33318,13 @@ impl Connection {
             direct.cursor_page_size,
             direct.cursor_reserved_per_page,
         );
-        let patched = {
+        let patched_result = (|| -> Result<Option<bool>> {
             let mut pending = self.pending_direct_update_leaf_patch_run.borrow_mut();
             let Some(run) = pending.as_mut() else {
                 self.pending_direct_update_leaf_patch_run_active.set(false);
                 return Ok(None);
             };
-            if run.root_page != direct.root_page
+            let patched = if run.root_page != direct.root_page
                 || run.cursor_page_size != direct.cursor_page_size
                 || run.cursor_reserved_per_page != direct.cursor_reserved_per_page
                 || run.column_index != column_index
@@ -32487,12 +33340,28 @@ impl Connection {
                     next_value,
                     usable_size,
                 )?
-            }
+            };
+            Ok(Some(patched))
+        })();
+        record_hot_path_duration(
+            &FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_TIME_NS,
+            update_leaf_patch_active_start,
+        );
+        let Some(patched) = patched_result? else {
+            return Ok(None);
         };
         if patched {
+            if profile_update_leaf_patch_run {
+                FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_HITS
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
             self.retained_autocommit_count_sum_cache_note_update(direct.root_page, None, None);
             Ok(Some((1, true)))
         } else {
+            if profile_update_leaf_patch_run {
+                FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_MISSES
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
             self.flush_pending_direct_update_leaf_patch_run(execution_cx)?;
             Ok(None)
         }
@@ -33594,7 +34463,12 @@ impl Connection {
             cursor.table_insert(cx, rowid, &record)
         })?;
         // Cache original DDL text for sqlite_master sql column queries.
-        if let Some(sql) = sql {
+        // Triggers are intentionally excluded: SQLite allows trigger names to
+        // collide with table/view names, while this cache is keyed by name
+        // only. Trigger display uses `TriggerDef::create_sql` directly.
+        if let Some(sql) = sql
+            && !type_.eq_ignore_ascii_case("trigger")
+        {
             self.original_ddl_sql
                 .borrow_mut()
                 .insert(name.to_ascii_lowercase(), sql.to_owned());
@@ -33658,6 +34532,11 @@ impl Connection {
     }
 
     fn remove_original_ddl_cache_for_sqlite_master_row(&self, row: &[SqliteValue]) {
+        if let Some(SqliteValue::Text(type_)) = row.first()
+            && type_.eq_ignore_ascii_case("trigger")
+        {
+            return;
+        }
         if let Some(SqliteValue::Text(name)) = row.get(1) {
             self.original_ddl_sql
                 .borrow_mut()
@@ -33666,6 +34545,11 @@ impl Connection {
     }
 
     fn cache_original_ddl_from_sqlite_master_row(&self, row: &[SqliteValue]) {
+        if let Some(SqliteValue::Text(type_)) = row.first()
+            && type_.eq_ignore_ascii_case("trigger")
+        {
+            return;
+        }
         let Some(SqliteValue::Text(name)) = row.get(1) else {
             return;
         };
@@ -33956,7 +34840,16 @@ impl Connection {
 
     /// Delete the sqlite_master row whose `name` column matches the given
     /// object name (case-insensitive scan of the page 1 B-tree).
+    #[cfg(test)]
     fn delete_sqlite_master_row(&self, name: &str) -> Result<()> {
+        self.delete_sqlite_master_row_matching(None, name)
+    }
+
+    fn delete_sqlite_master_typed_row(&self, type_: &str, name: &str) -> Result<()> {
+        self.delete_sqlite_master_row_matching(Some(type_), name)
+    }
+
+    fn delete_sqlite_master_row_matching(&self, type_: Option<&str>, name: &str) -> Result<()> {
         self.with_pager_write_txn(|cx, txn| {
             let mut deleted_any = false;
             loop {
@@ -33975,8 +34868,14 @@ impl Connection {
                                 "sqlite_master row {rowid} payload is not a valid SQLite record"
                             ),
                         })?;
+                    let type_matches = type_.is_none_or(|expected| {
+                        values.first().is_some_and(|value| {
+                            matches!(value, SqliteValue::Text(row_type) if row_type.eq_ignore_ascii_case(expected))
+                        })
+                    });
                     // Column index 1 is the `name` column.
                     if let Some(SqliteValue::Text(row_name)) = values.get(1)
+                        && type_matches
                         && row_name.eq_ignore_ascii_case(name)
                     {
                         cursor.delete(cx)?;
@@ -33997,20 +34896,102 @@ impl Connection {
             if deleted_any {
                 Ok(())
             } else {
+                let type_prefix = type_.map_or(String::new(), |type_| format!("{type_} "));
                 Err(FrankenError::Internal(format!(
-                    "sqlite_master entry not found: {name}"
+                    "sqlite_master entry not found: {type_prefix}{name}"
                 )))
             }
+        })?;
+        if !type_.is_some_and(|type_| type_.eq_ignore_ascii_case("trigger")) {
+            self.original_ddl_sql
+                .borrow_mut()
+                .remove(&name.to_ascii_lowercase());
+        }
+        Ok(())
+    }
+
+    fn sqlite_master_rootpage_for_typed_row(&self, type_: &str, name: &str) -> Result<Option<i64>> {
+        self.with_integrity_txn(|cx, txn| {
+            let page1 = txn.get_page(cx, PageNumber::ONE)?;
+            let page1_bytes = page1.as_ref();
+            if page1_bytes.iter().all(|&b| b == 0) || page1_bytes.len() < DATABASE_HEADER_SIZE {
+                return Ok(None);
+            }
+
+            let header = parse_database_header_checked(page1_bytes)?;
+            let rows = Self::read_sqlite_master_rows_in_txn(
+                cx,
+                txn,
+                header.page_size,
+                header.reserved_per_page,
+            )?;
+            for row in rows {
+                let (entry_type, entry_name, _, rootpage) = sqlite_master_signature(&row)?;
+                if entry_type.eq_ignore_ascii_case(type_) && entry_name.eq_ignore_ascii_case(name) {
+                    return Ok(Some(rootpage));
+                }
+            }
+            Ok(None)
         })
     }
 
-    /// Update the `sql` column of an existing sqlite_master row in-place,
-    /// preserving the original rowid.  This is critical for ALTER TABLE
-    /// ADD COLUMN / DROP COLUMN: standard SQLite reads sqlite_master in
-    /// rowid order and expects table entries to appear before their index
-    /// entries.  A delete-then-reinsert would assign a new (higher) rowid,
-    /// corrupting the schema when the table already has indexes.
-    fn update_sqlite_master_sql(&self, name: &str, new_sql: &str) -> Result<()> {
+    fn update_sqlite_master_typed_sql(&self, type_: &str, name: &str, new_sql: &str) -> Result<()> {
+        self.with_pager_write_txn(|cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true)?;
+            if !cursor.first(cx)? {
+                return Err(FrankenError::Internal(format!(
+                    "sqlite_master {type_} entry not found: {name}"
+                )));
+            }
+            loop {
+                let rowid = cursor.rowid(cx)?;
+                let payload = cursor.payload(cx)?;
+                let values =
+                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master row {rowid} payload is not a valid SQLite record"
+                        ),
+                    })?;
+                if let (Some(SqliteValue::Text(row_type)), Some(SqliteValue::Text(row_name))) =
+                    (values.first(), values.get(1))
+                    && row_type.eq_ignore_ascii_case(type_)
+                    && row_name.eq_ignore_ascii_case(name)
+                {
+                    let original_rowid = rowid;
+                    let mut updated = values.clone();
+                    if updated.len() < 5 {
+                        updated.resize(5, SqliteValue::Null);
+                    }
+                    updated[4] = SqliteValue::Text(new_sql.into());
+                    let record = serialize_record(&updated);
+
+                    cursor.delete(cx)?;
+                    cursor.table_insert(cx, original_rowid, &record)?;
+                    return Ok(());
+                }
+                if !cursor.next(cx)? {
+                    break;
+                }
+            }
+            Err(FrankenError::Internal(format!(
+                "sqlite_master {type_} entry not found: {name}"
+            )))
+        })?;
+        if !type_.eq_ignore_ascii_case("trigger") {
+            self.original_ddl_sql
+                .borrow_mut()
+                .insert(name.to_ascii_lowercase(), new_sql.to_owned());
+        }
+        Ok(())
+    }
+
+    fn update_sqlite_master_typed_tbl_name_and_sql(
+        &self,
+        type_: &str,
+        name: &str,
+        new_tbl_name: &str,
+        new_sql: Option<&str>,
+    ) -> Result<()> {
         self.with_pager_write_txn(|cx, txn| {
             let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true)?;
             if !cursor.first(cx)? {
@@ -34027,24 +35008,21 @@ impl Connection {
                             "sqlite_master row {rowid} payload is not a valid SQLite record"
                         ),
                     })?;
-                if let Some(SqliteValue::Text(row_name)) = values.get(1)
+                if let (Some(SqliteValue::Text(row_type)), Some(SqliteValue::Text(row_name))) =
+                    (values.first(), values.get(1))
+                    && row_type.eq_ignore_ascii_case(type_)
                     && row_name.eq_ignore_ascii_case(name)
                 {
-                    // Preserve the original rowid so the table entry
-                    // stays before any index entries in rowid order.
                     let original_rowid = rowid;
-
-                    // Build updated record keeping type, name,
-                    // tbl_name, and rootpage from the existing row,
-                    // only replacing the sql column (index 4).
                     let mut updated = values.clone();
                     if updated.len() < 5 {
                         updated.resize(5, SqliteValue::Null);
                     }
-                    updated[4] = SqliteValue::Text(new_sql.into());
+                    updated[2] = SqliteValue::Text(new_tbl_name.into());
+                    updated[4] =
+                        new_sql.map_or(SqliteValue::Null, |sql| SqliteValue::Text(sql.into()));
                     let record = serialize_record(&updated);
 
-                    // Delete old row then re-insert at the same rowid.
                     cursor.delete(cx)?;
                     cursor.table_insert(cx, original_rowid, &record)?;
                     return Ok(());
@@ -34057,10 +35035,14 @@ impl Connection {
                 "sqlite_master entry not found: {name}"
             )))
         })?;
-        // Update the cached DDL text.
-        self.original_ddl_sql
-            .borrow_mut()
-            .insert(name.to_ascii_lowercase(), new_sql.to_owned());
+        if !type_.eq_ignore_ascii_case("trigger") {
+            let mut ddl_cache = self.original_ddl_sql.borrow_mut();
+            if let Some(sql) = new_sql {
+                ddl_cache.insert(name.to_ascii_lowercase(), sql.to_owned());
+            } else {
+                ddl_cache.remove(&name.to_ascii_lowercase());
+            }
+        }
         Ok(())
     }
 
@@ -35199,7 +36181,7 @@ impl Connection {
                             ),
                             root_page: idx_root,
                             columns: vec![col.name.clone()],
-                            key_expressions: vec![col.name.clone()],
+                            key_expressions: Vec::new(),
                             key_sort_directions: vec![SortDirection::Asc],
                             where_clause: None,
                             is_unique: true,
@@ -35249,10 +36231,7 @@ impl Connection {
                                 ),
                                 root_page: idx_root,
                                 columns: col_names,
-                                key_expressions: idx_cols
-                                    .iter()
-                                    .map(|indexed| indexed.expr.to_string())
-                                    .collect(),
+                                key_expressions: Vec::new(),
                                 key_sort_directions: normalized_terms
                                     .iter()
                                     .map(|term| term.direction.unwrap_or(SortDirection::Asc))
@@ -35631,6 +36610,30 @@ impl Connection {
             }
         };
         let obj_name = &drop_stmt.name.name;
+        // For DROP TABLE on a legacy stock-SQLite virtual table whose module
+        // ships shadow tables (FTS5, FTS3, FTS4, R-Tree), compute the shadow
+        // table names before running the drop. At that point
+        // `original_ddl_sql` still has the CREATE VIRTUAL TABLE entry; we lose
+        // it during post-drop bookkeeping
+        // (`original_ddl_sql.remove(...)`). After the main drop completes we
+        // re-enter `execute_drop` for each shadow with `IF EXISTS` semantics.
+        // Without this cascade, dropping an FTS5 vtab leaves behind a
+        // populated WITHOUT ROWID `<name>_idx` table whose subsequent reload
+        // hits the "reloading populated WITHOUT ROWID table into MemDatabase"
+        // not-implemented guard. See frankensqlite#87.
+        let pending_shadow_drops: Vec<String> =
+            if matches!(drop_stmt.object_type, DropObjectType::Table)
+                && self.sqlite_master_rootpage_for_typed_row("table", obj_name)? == Some(0)
+            {
+                let ddl_map = self.original_ddl_sql.borrow();
+                let sql_opt = ddl_map.get(&obj_name.to_ascii_lowercase()).cloned();
+                drop(ddl_map);
+                sql_opt.as_deref().map_or_else(Vec::new, |sql| {
+                    virtual_table_shadow_drop_names(obj_name, sql)
+                })
+            } else {
+                Vec::new()
+            };
         let dropped = match drop_stmt.object_type {
             DropObjectType::Table => {
                 let mut schema = self.schema.borrow_mut();
@@ -35659,7 +36662,8 @@ impl Connection {
                     self.db.borrow_mut().destroy_table(table.root_page);
                     for index in &table.indexes {
                         self.db.borrow_mut().destroy_table(index.root_page);
-                        if let Err(err) = self.delete_sqlite_master_row(&index.name) {
+                        if let Err(err) = self.delete_sqlite_master_typed_row("index", &index.name)
+                        {
                             swallow_missing_master(err)?;
                         }
                     }
@@ -35691,7 +36695,9 @@ impl Connection {
                         }
                     }
                     for trigger_name in triggers_to_drop {
-                        if let Err(err) = self.delete_sqlite_master_row(&trigger_name) {
+                        if let Err(err) =
+                            self.delete_sqlite_master_typed_row("trigger", &trigger_name)
+                        {
                             swallow_missing_master(err)?;
                         }
                     }
@@ -35703,7 +36709,7 @@ impl Connection {
                         self.stage_dropped_live_vtab(obj_name, instance, &cx)?;
                     }
 
-                    if let Err(err) = self.delete_sqlite_master_row(obj_name) {
+                    if let Err(err) = self.delete_sqlite_master_typed_row("table", obj_name) {
                         swallow_missing_master(err)?;
                     }
                     true
@@ -35745,7 +36751,7 @@ impl Connection {
                     self.free_btree_pages(root_page, false)?;
                     self.db.borrow_mut().destroy_table(root_page);
                 }
-                if let Err(err) = self.delete_sqlite_master_row(obj_name) {
+                if let Err(err) = self.delete_sqlite_master_typed_row("index", obj_name) {
                     swallow_missing_master(err)?;
                 }
                 true
@@ -35775,12 +36781,14 @@ impl Connection {
                         }
                     }
                     for trigger_name in triggers_to_drop {
-                        if let Err(err) = self.delete_sqlite_master_row(&trigger_name) {
+                        if let Err(err) =
+                            self.delete_sqlite_master_typed_row("trigger", &trigger_name)
+                        {
                             swallow_missing_master(err)?;
                         }
                     }
 
-                    if let Err(err) = self.delete_sqlite_master_row(obj_name) {
+                    if let Err(err) = self.delete_sqlite_master_typed_row("view", obj_name) {
                         swallow_missing_master(err)?;
                     }
                     true
@@ -35808,7 +36816,7 @@ impl Connection {
                     let trigger = triggers.remove(idx);
                     drop(triggers);
                     if !trigger.temporary {
-                        if let Err(err) = self.delete_sqlite_master_row(obj_name) {
+                        if let Err(err) = self.delete_sqlite_master_typed_row("trigger", obj_name) {
                             swallow_missing_master(err)?;
                         }
                     }
@@ -35824,12 +36832,32 @@ impl Connection {
             }
         };
         if dropped {
-            self.original_ddl_sql
-                .borrow_mut()
-                .remove(&obj_name.to_ascii_lowercase());
+            if !matches!(drop_stmt.object_type, DropObjectType::Trigger) {
+                self.original_ddl_sql
+                    .borrow_mut()
+                    .remove(&obj_name.to_ascii_lowercase());
+            }
             self.rebuild_schema_indices();
             self.validate_schema_index();
             self.increment_schema_cookie()?;
+
+            // Cascade shadow-table drops for legacy rootpage-zero FTS5 /
+            // R-Tree virtual tables. We re-enter `execute_drop` with
+            // `IF EXISTS` semantics because individual shadows may have
+            // been pre-dropped by the caller, or may not exist for the
+            // specific module variant (e.g. FTS5 with `content=` skips
+            // the `_content` shadow). The shadows themselves are NOT
+            // virtual (FTS5 idx is WITHOUT ROWID; R-Tree nodes are
+            // regular tables) so the recursion is bounded:
+            // `pending_shadow_drops` is empty on each re-entry.
+            for shadow_name in pending_shadow_drops {
+                let shadow_drop = fsqlite_ast::DropStatement {
+                    object_type: DropObjectType::Table,
+                    if_exists: true,
+                    name: fsqlite_ast::QualifiedName::bare(shadow_name),
+                };
+                self.execute_drop(&shadow_drop)?;
+            }
         }
         Ok(())
     }
@@ -35843,61 +36871,165 @@ impl Connection {
             return Err(FrankenError::Unsupported);
         }
         let old_name = table_name.clone();
+        let mut dependent_table_schema_updates = Vec::new();
+        let mut dependent_view_sql_updates = Vec::new();
+        let mut dependent_trigger_sql_updates = Vec::new();
+        let mut renamed_autoindex_master_rows = Vec::new();
         let new_schema = match &alter.action {
             AlterTableAction::RenameTo(new_name) => {
                 let mut schema = self.schema.borrow_mut();
-                let table = schema
-                    .iter_mut()
-                    .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                let table_idx = schema
+                    .iter()
+                    .position(|t| t.name.eq_ignore_ascii_case(table_name))
                     .ok_or_else(|| FrankenError::NoSuchTable {
                         name: table_name.clone(),
                     })?;
-                table.name.clone_from(new_name);
-                table.clone()
+                let views = self.views.borrow();
+                let name_conflicts =
+                    schema_table_index_or_view_name_exists(&schema, &views, new_name);
+                drop(views);
+                if name_conflicts {
+                    return Err(FrankenError::Internal(format!(
+                        "table, index, or view {new_name} already exists"
+                    )));
+                }
+                let mut renamed_table = schema[table_idx].clone();
+                for fk in &mut renamed_table.foreign_keys {
+                    rename_fk_parent_table(fk, &old_name, new_name);
+                }
+                renamed_table.name.clone_from(new_name);
+                for index in &mut renamed_table.indexes {
+                    let Some(ordinal) = parse_autoindex_ordinal(&index.name, &old_name) else {
+                        continue;
+                    };
+                    let old_index_name = std::mem::replace(
+                        &mut index.name,
+                        format!("sqlite_autoindex_{new_name}_{ordinal}"),
+                    );
+                    renamed_autoindex_master_rows.push((
+                        old_index_name,
+                        index.name.clone(),
+                        index.root_page,
+                    ));
+                }
+                for (idx, dependent_table) in schema.iter().enumerate() {
+                    if idx == table_idx {
+                        continue;
+                    }
+                    let mut updated_table = dependent_table.clone();
+                    let mut changed = false;
+                    for fk in &mut updated_table.foreign_keys {
+                        changed |= rename_fk_parent_table(fk, &old_name, new_name);
+                    }
+                    if changed {
+                        dependent_table_schema_updates.push((idx, updated_table));
+                    }
+                }
+                schema[table_idx] = renamed_table.clone();
+                for (idx, updated_table) in &dependent_table_schema_updates {
+                    schema[*idx] = updated_table.clone();
+                }
+                drop(schema);
+                dependent_view_sql_updates =
+                    self.rename_dependent_views_for_table_rename(&old_name, new_name);
+                dependent_trigger_sql_updates =
+                    self.rename_dependent_triggers_for_table_rename(&old_name, new_name);
+                renamed_table
             }
             AlterTableAction::RenameColumn { old, new } => {
                 let mut schema = self.schema.borrow_mut();
-                let table = schema
-                    .iter_mut()
-                    .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                let table_idx = schema
+                    .iter()
+                    .position(|t| t.name.eq_ignore_ascii_case(table_name))
                     .ok_or_else(|| FrankenError::NoSuchTable {
                         name: table_name.clone(),
                     })?;
-                let col = table
+                let table = &schema[table_idx];
+                let col_idx = table
                     .columns
-                    .iter_mut()
-                    .find(|c| c.name.eq_ignore_ascii_case(old))
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(old))
                     .ok_or_else(|| FrankenError::Internal(format!("no such column: {old}")))?;
-                col.name.clone_from(new);
-                for pk in &mut table.primary_key_constraints {
+                if table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .any(|(idx, column)| idx != col_idx && column.name.eq_ignore_ascii_case(new))
+                {
+                    return Err(FrankenError::Internal(format!(
+                        "duplicate column name: {new}"
+                    )));
+                }
+                let mut renamed_table = table.clone();
+                renamed_table.columns[col_idx].name.clone_from(new);
+                for column in &mut renamed_table.columns {
+                    if let Some(generated_expr) = &mut column.generated_expr {
+                        rename_column_refs_in_stored_expr_sql(generated_expr, old, new)?;
+                    }
+                }
+                for check_expr in &mut renamed_table.check_constraints {
+                    rename_column_refs_in_stored_expr_sql(check_expr, old, new)?;
+                }
+                for pk in &mut renamed_table.primary_key_constraints {
                     for pk_col in pk {
                         if pk_col.eq_ignore_ascii_case(old) {
                             pk_col.clone_from(new);
                         }
                     }
                 }
-                for index in &mut table.indexes {
+                for index in &mut renamed_table.indexes {
                     for index_column in &mut index.columns {
                         if index_column.eq_ignore_ascii_case(old) {
                             index_column.clone_from(new);
                         }
                     }
                     for key_expression in &mut index.key_expressions {
-                        if key_expression.eq_ignore_ascii_case(old) {
-                            key_expression.clone_from(new);
+                        if let Some(renamed) =
+                            rename_column_refs_in_expr_sql(key_expression, old, new)?
+                        {
+                            *key_expression = renamed;
                         }
                     }
-                }
-                for fk in &mut table.foreign_keys {
-                    if fk.parent_table.eq_ignore_ascii_case(&table.name) {
-                        for parent_column in &mut fk.parent_columns {
-                            if parent_column.eq_ignore_ascii_case(old) {
-                                parent_column.clone_from(new);
-                            }
-                        }
+                    if let Some(where_clause) = &mut index.where_clause {
+                        rename_column_refs_in_stored_expr_sql(where_clause, old, new)?;
                     }
                 }
-                table.clone()
+                for fk in &mut renamed_table.foreign_keys {
+                    rename_fk_parent_columns(fk, &renamed_table.name, old, new);
+                }
+                for (idx, dependent_table) in schema.iter().enumerate() {
+                    if idx == table_idx {
+                        continue;
+                    }
+                    let mut updated_table = dependent_table.clone();
+                    let mut changed = false;
+                    for fk in &mut updated_table.foreign_keys {
+                        changed |= rename_fk_parent_columns(fk, &renamed_table.name, old, new);
+                    }
+                    if changed {
+                        dependent_table_schema_updates.push((idx, updated_table));
+                    }
+                }
+                schema[table_idx] = renamed_table.clone();
+                for (idx, updated_table) in &dependent_table_schema_updates {
+                    schema[*idx] = updated_table.clone();
+                }
+                drop(schema);
+                let mut column_source_catalog =
+                    self.column_rename_source_catalog(&renamed_table.name, old);
+                dependent_view_sql_updates = self.rename_dependent_views_for_column_rename(
+                    &renamed_table.name,
+                    old,
+                    new,
+                    &mut column_source_catalog,
+                );
+                dependent_trigger_sql_updates = self.rename_dependent_triggers_for_column_rename(
+                    &renamed_table.name,
+                    old,
+                    new,
+                    &column_source_catalog,
+                );
+                renamed_table
             }
             AlterTableAction::AddColumn(col_def) => {
                 if col_def.constraints.iter().any(|constraint| {
@@ -35976,6 +37108,10 @@ impl Connection {
                         "Cannot add a NOT NULL column without a default value".to_owned(),
                     ));
                 }
+                let default_for_existing_rows = default_value.as_deref().map_or_else(
+                    || Ok(SqliteValue::Null),
+                    |default_sql| self.evaluate_column_default_value(Some(default_sql)),
+                )?;
                 let mut schema = self.schema.borrow_mut();
                 let table = schema
                     .iter_mut()
@@ -36050,32 +37186,16 @@ impl Connection {
                 // FIX: Pad existing MemDB rows with the default value for the
                 // new column. Without this, SELECT * returns NULL instead of the
                 // DEFAULT value for pre-existing rows (column_index >= values.len()).
-                let default_val = table.columns[new_column_index]
-                    .default_value
-                    .as_ref()
-                    .map_or(SqliteValue::Null, |dv| {
-                        // Parse constant default: integer, float, string, or NULL
-                        if dv.eq_ignore_ascii_case("NULL") {
-                            SqliteValue::Null
-                        } else if let Ok(i) = dv.parse::<i64>() {
-                            SqliteValue::Integer(i)
-                        } else if let Ok(f) = dv.parse::<f64>() {
-                            SqliteValue::Float(f)
-                        } else if dv.starts_with('\'') && dv.ends_with('\'') {
-                            SqliteValue::Text(fsqlite_types::SmallText::from_string(
-                                dv[1..dv.len() - 1].replace("''", "'"),
-                            ))
-                        } else {
-                            SqliteValue::Text(fsqlite_types::SmallText::from_string(dv.as_str()))
-                        }
-                    });
                 let root_page = table.root_page;
                 let table_clone = table.clone();
                 drop(schema);
                 {
                     let mut db = self.db.borrow_mut();
                     if let Some(mem_table) = db.get_table_mut(root_page) {
-                        mem_table.pad_rows_to_column_count(table_clone.columns.len(), &default_val);
+                        mem_table.pad_rows_to_column_count(
+                            table_clone.columns.len(),
+                            &default_for_existing_rows,
+                        );
                     }
                 }
                 table_clone
@@ -36150,7 +37270,7 @@ impl Connection {
                     }
                 }
                 for idx_name in &dropped_indexes {
-                    let _ = self.delete_sqlite_master_row(idx_name);
+                    let _ = self.delete_sqlite_master_typed_row("index", idx_name);
                 }
                 table_clone
             }
@@ -36186,7 +37306,7 @@ impl Connection {
         if matches!(alter.action, AlterTableAction::RenameTo(_)) {
             // RENAME TO changes the name/tbl_name columns, so we must
             // delete the old row and insert a new one.
-            self.delete_sqlite_master_row(&old_name)?;
+            self.delete_sqlite_master_typed_row("table", &old_name)?;
             self.insert_sqlite_master_row(
                 "table",
                 &new_schema.name,
@@ -36197,18 +37317,27 @@ impl Connection {
 
             // Also update sqlite_master tbl_name for indexes.
             if let AlterTableAction::RenameTo(new_name) = &alter.action {
+                for (old_index_name, new_index_name, root_page) in &renamed_autoindex_master_rows {
+                    self.delete_sqlite_master_typed_row("index", old_index_name)?;
+                    self.insert_sqlite_master_row_with_sql(
+                        "index",
+                        new_index_name,
+                        new_name,
+                        *root_page,
+                        None,
+                    )?;
+                }
                 for index in &new_schema.indexes {
-                    // Delete old index entry and re-insert with new tbl_name.
-                    if self.delete_sqlite_master_row(&index.name).is_ok() {
-                        let idx_sql = render_create_index_sql(index, new_name);
-                        let _ = self.insert_sqlite_master_row(
-                            "index",
-                            &index.name,
-                            new_name,
-                            index.root_page,
-                            &idx_sql,
-                        );
+                    if is_implicit_autoindex_name(&index.name) {
+                        continue;
                     }
+                    let idx_sql = render_create_index_sql(index, new_name);
+                    self.update_sqlite_master_typed_tbl_name_and_sql(
+                        "index",
+                        &index.name,
+                        new_name,
+                        Some(&idx_sql),
+                    )?;
                 }
             }
         } else {
@@ -36218,16 +37347,34 @@ impl Connection {
             // expects table entries to appear before their index entries.
             // A delete+reinsert would assign a new (higher) rowid,
             // corrupting the schema for tables that already have indexes.
-            self.update_sqlite_master_sql(&old_name, &create_sql)?;
+            self.update_sqlite_master_typed_sql("table", &old_name, &create_sql)?;
             if matches!(alter.action, AlterTableAction::RenameColumn { .. }) {
                 for index in &new_schema.indexes {
                     if is_implicit_autoindex_name(&index.name) {
                         continue;
                     }
                     let idx_sql = render_create_index_sql(index, &new_schema.name);
-                    self.update_sqlite_master_sql(&index.name, &idx_sql)?;
+                    self.update_sqlite_master_typed_sql("index", &index.name, &idx_sql)?;
                 }
             }
+        }
+        for (_, dependent_table) in &dependent_table_schema_updates {
+            let create_sql = render_create_table_sql(
+                dependent_table,
+                self.is_autoincrement_table(&dependent_table.name),
+            );
+            self.update_sqlite_master_typed_sql("table", &dependent_table.name, &create_sql)?;
+        }
+        for (view_name, view_sql) in &dependent_view_sql_updates {
+            self.update_sqlite_master_typed_sql("view", view_name, view_sql)?;
+        }
+        for (trigger_name, table_name, trigger_sql) in &dependent_trigger_sql_updates {
+            self.update_sqlite_master_typed_tbl_name_and_sql(
+                "trigger",
+                trigger_name,
+                table_name,
+                Some(trigger_sql),
+            )?;
         }
 
         // ALTER TABLE may have renamed the table or changed its column list.
@@ -36236,6 +37383,206 @@ impl Connection {
         self.validate_schema_index();
         self.increment_schema_cookie()?;
         Ok(())
+    }
+
+    fn rename_dependent_views_for_table_rename(
+        &self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Vec<(String, String)> {
+        let mut updates = Vec::new();
+        let mut views = self.views.borrow_mut();
+        for view in views.iter_mut() {
+            if rename_table_refs_in_select(&mut view.query, old_name, new_name) {
+                updates.push((view.name.clone(), render_create_view_sql(view)));
+            }
+        }
+        updates
+    }
+
+    fn rename_dependent_triggers_for_table_rename(
+        &self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Vec<(String, String, String)> {
+        let mut updates = Vec::new();
+        let mut triggers = self.triggers.borrow_mut();
+        for trigger in triggers.iter_mut() {
+            let mut changed = if trigger.table_name.eq_ignore_ascii_case(old_name) {
+                trigger.table_name.clear();
+                trigger.table_name.push_str(new_name);
+                true
+            } else {
+                false
+            };
+            if let Some(when_clause) = &mut trigger.when_clause {
+                changed |= rename_table_refs_in_expr(
+                    when_clause,
+                    old_name,
+                    new_name,
+                    &HashSet::new(),
+                    false,
+                );
+            }
+            for statement in &mut trigger.body {
+                changed |= rename_table_refs_in_statement(statement, old_name, new_name);
+            }
+            if changed {
+                trigger.create_sql = render_create_trigger_sql(trigger);
+                if !trigger.temporary {
+                    updates.push((
+                        trigger.name.clone(),
+                        trigger.table_name.clone(),
+                        trigger.create_sql.clone(),
+                    ));
+                }
+            }
+        }
+        updates
+    }
+
+    fn rename_dependent_views_for_column_rename(
+        &self,
+        table_name: &str,
+        old_column: &str,
+        new_column: &str,
+        source_catalog: &mut ColumnRenameSourceCatalog,
+    ) -> Vec<(String, String)> {
+        let mut views = self.views.borrow_mut();
+        for view in views.iter() {
+            source_catalog.set_view_output_status(
+                &view.name,
+                view_column_rename_initial_output_status(view, old_column),
+            );
+        }
+
+        let mut changed_views = HashSet::new();
+        for _ in 0..=views.len() {
+            let mut pass_changed = false;
+            for view in views.iter_mut() {
+                let view_changed = rename_column_refs_in_select_for_table(
+                    &mut view.query,
+                    table_name,
+                    old_column,
+                    new_column,
+                    source_catalog,
+                );
+                pass_changed |= view_changed;
+                let output_status =
+                    view_column_rename_output_status(view, old_column, new_column, source_catalog);
+                let status_changed =
+                    source_catalog.set_view_output_status(&view.name, output_status);
+                pass_changed |= status_changed;
+                if view_changed {
+                    changed_views.insert(view.name.to_ascii_lowercase());
+                }
+            }
+            if !pass_changed {
+                break;
+            }
+        }
+
+        views
+            .iter()
+            .filter(|view| changed_views.contains(&view.name.to_ascii_lowercase()))
+            .map(|view| (view.name.clone(), render_create_view_sql(view)))
+            .collect()
+    }
+
+    fn rename_dependent_triggers_for_column_rename(
+        &self,
+        table_name: &str,
+        old_column: &str,
+        new_column: &str,
+        source_catalog: &ColumnRenameSourceCatalog,
+    ) -> Vec<(String, String, String)> {
+        let mut updates = Vec::new();
+        let mut triggers = self.triggers.borrow_mut();
+        for trigger in triggers.iter_mut() {
+            let mut changed = false;
+            let trigger_target_matches = trigger.table_name.eq_ignore_ascii_case(table_name);
+            if trigger_target_matches {
+                changed |= rename_trigger_event_columns(&mut trigger.event, old_column, new_column);
+            }
+            if let Some(when_clause) = &mut trigger.when_clause {
+                let mut target_bindings = ColumnRenameBindings::default();
+                if trigger_target_matches {
+                    target_bindings.add_matching_binding(table_name);
+                }
+                changed |= rename_column_refs_in_expr_for_table(
+                    when_clause,
+                    table_name,
+                    old_column,
+                    new_column,
+                    &target_bindings,
+                    trigger_target_matches,
+                    source_catalog,
+                );
+                if trigger_target_matches {
+                    changed |= rename_trigger_row_column_refs_in_expr(
+                        when_clause,
+                        old_column,
+                        new_column,
+                        source_catalog,
+                    );
+                }
+            }
+            for statement in &mut trigger.body {
+                changed |= rename_column_refs_in_statement_for_table(
+                    statement,
+                    table_name,
+                    old_column,
+                    new_column,
+                    source_catalog,
+                );
+                if trigger_target_matches {
+                    changed |= rename_trigger_row_column_refs_in_statement(
+                        statement,
+                        old_column,
+                        new_column,
+                        source_catalog,
+                    );
+                }
+            }
+            if changed {
+                trigger.create_sql = render_create_trigger_sql(trigger);
+                if !trigger.temporary {
+                    updates.push((
+                        trigger.name.clone(),
+                        trigger.table_name.clone(),
+                        trigger.create_sql.clone(),
+                    ));
+                }
+            }
+        }
+        updates
+    }
+
+    fn column_rename_source_catalog(
+        &self,
+        table_name: &str,
+        old_column: &str,
+    ) -> ColumnRenameSourceCatalog {
+        let mut known_tables = HashSet::new();
+        let mut tables_with_old_column = HashSet::from([table_name.to_ascii_lowercase()]);
+        let schema = self.schema.borrow();
+        for table in schema.iter() {
+            let key = table.name.to_ascii_lowercase();
+            known_tables.insert(key.clone());
+            if table
+                .columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(old_column))
+            {
+                tables_with_old_column.insert(key);
+            }
+        }
+        ColumnRenameSourceCatalog {
+            renamed_table: table_name.to_ascii_lowercase(),
+            known_tables,
+            tables_with_old_column,
+            view_outputs: HashMap::new(),
+        }
     }
 
     fn resolve_analyze_plan(&self, target: Option<&QualifiedName>) -> Result<AnalyzePlan> {
@@ -36440,9 +37787,30 @@ impl Connection {
         if let Some(schema) = vacuum_stmt.schema.as_deref()
             && !schema.eq_ignore_ascii_case("main")
         {
-            return Err(FrankenError::not_implemented(
-                crate::vacuum::ATTACHED_SCHEMA_UNSUPPORTED,
-            ));
+            if self.in_transaction.get() || !self.savepoints.borrow().is_empty() {
+                return Err(FrankenError::VacuumWithinTransaction);
+            }
+            let attached_schema = {
+                let registry = self.attached_schemas.borrow();
+                registry
+                    .find(schema)
+                    .map(|attached| attached.schema.clone())
+            };
+            let Some(attached_schema) = attached_schema else {
+                return Err(FrankenError::not_implemented(
+                    crate::vacuum::ATTACHED_SCHEMA_UNSUPPORTED,
+                ));
+            };
+            let mut rewritten = vacuum_stmt.clone();
+            rewritten.schema = None;
+            tracing::debug!(
+                schema = %attached_schema,
+                has_into = vacuum_stmt.into.is_some(),
+                "delegating attached-schema VACUUM target"
+            );
+            return self.with_attached_connection(&attached_schema, |conn| {
+                conn.execute_vacuum(&rewritten, params)
+            });
         }
         if self.in_transaction.get() || !self.savepoints.borrow().is_empty() {
             return Err(FrankenError::VacuumWithinTransaction);
@@ -36671,7 +38039,14 @@ impl Connection {
             }
             (col_names, sort_dirs, collations, has_expr)
         };
-        let _ = has_expression_term; // suppress unused warning; used implicitly via col_names
+        let key_expressions = if has_expression_term {
+            stmt.columns
+                .iter()
+                .map(|indexed| indexed.expr.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Phase 3: Allocate index B-tree root page (no borrow held)
         let root_page = self.allocate_index_root_page()?;
@@ -36692,11 +38067,7 @@ impl Connection {
             table.indexes.push(IndexSchema {
                 name: index_name.clone(),
                 columns: col_names,
-                key_expressions: stmt
-                    .columns
-                    .iter()
-                    .map(|indexed| indexed.expr.to_string())
-                    .collect(),
+                key_expressions,
                 key_sort_directions,
                 where_clause: stmt.where_clause.as_ref().map(|e| e.to_string()),
                 root_page,
@@ -38315,17 +39686,22 @@ impl Connection {
             ]);
 
             for index in &table.indexes {
-                // Prefer cached original SQL for indexes too.
-                let index_sql = ddl_cache
-                    .get(&index.name.to_ascii_lowercase())
-                    .cloned()
-                    .unwrap_or_else(|| render_create_index_sql(index, &table.name));
+                let index_sql = if is_implicit_autoindex_name(&index.name) {
+                    SqliteValue::Null
+                } else {
+                    // Prefer cached original SQL for explicit indexes.
+                    let sql = ddl_cache
+                        .get(&index.name.to_ascii_lowercase())
+                        .cloned()
+                        .unwrap_or_else(|| render_create_index_sql(index, &table.name));
+                    SqliteValue::Text(sql.into())
+                };
                 rows.push(vec![
                     SqliteValue::Text("index".into()),
                     SqliteValue::Text(index.name.clone().into()),
                     SqliteValue::Text(table.name.clone().into()),
                     SqliteValue::Integer(i64::from(index.root_page)),
-                    SqliteValue::Text(index_sql.into()),
+                    index_sql,
                 ]);
             }
         }
@@ -38355,6 +39731,26 @@ impl Connection {
         }
 
         rows
+    }
+
+    #[cfg(test)]
+    fn catalog_shadow_owner_for_table(&self, table_name: &str) -> Option<String> {
+        let schema = self.schema.borrow();
+        let ddl_cache = self.original_ddl_sql.borrow();
+
+        schema
+            .iter()
+            .filter(|table| table.root_page == 0)
+            .find_map(|table| {
+                let sql = ddl_cache.get(&table.name.to_ascii_lowercase())?;
+                if !is_virtual_table_sql(sql) {
+                    return None;
+                }
+                virtual_table_shadow_drop_names(&table.name, sql)
+                    .iter()
+                    .any(|shadow| shadow.eq_ignore_ascii_case(table_name))
+                    .then(|| table.name.clone())
+            })
     }
 
     fn execute_select_via_memdb_fallback(
@@ -38430,10 +39826,37 @@ impl Connection {
     /// Restore a snapshot, replacing the current database + schema state.
     fn restore_snapshot(&self, cx: &Cx, snap: &DbSnapshot) -> Result<()> {
         self.db.borrow_mut().rollback_to(snap.db_version);
+        // bd-e6zfc: rebuild the case-insensitive side indices from the snapshot
+        // (positions match the about-to-be-cloned Vecs) and publish each data
+        // Vec paired with its index, so `schema_by_name`/`views_by_name`/
+        // `triggers_by_name` never lag their backing Vecs. The previous
+        // "clone all three Vecs, then `rebuild_schema_indices()`" sequence left
+        // a window where a reentrant schema lookup could observe stale indices.
+        let new_schema_by_name: HashMap<String, usize> = snap
+            .schema
+            .iter()
+            .enumerate()
+            .map(|(i, table)| (table.name.to_ascii_lowercase(), i))
+            .collect();
+        let new_views_by_name: HashMap<String, usize> = snap
+            .views
+            .iter()
+            .enumerate()
+            .map(|(i, view)| (view.name.to_ascii_lowercase(), i))
+            .collect();
+        let new_triggers_by_name: HashMap<String, usize> = snap
+            .triggers
+            .iter()
+            .enumerate()
+            .map(|(i, trigger)| (trigger.name.to_ascii_lowercase(), i))
+            .collect();
         (*self.schema.borrow_mut()).clone_from(&snap.schema);
+        *self.schema_by_name.borrow_mut() = new_schema_by_name;
         (*self.views.borrow_mut()).clone_from(&snap.views);
+        *self.views_by_name.borrow_mut() = new_views_by_name;
         (*self.triggers.borrow_mut()).clone_from(&snap.triggers);
-        self.rebuild_schema_indices();
+        *self.triggers_by_name.borrow_mut() = new_triggers_by_name;
+        self.validate_schema_index();
         (*self.rowid_alias_columns.borrow_mut()).clone_from(&snap.rowid_alias_columns);
         (*self.autoincrement_tables.borrow_mut()).clone_from(&snap.autoincrement_tables);
         (*self.sqlite_sequence_cache.borrow_mut()).clone_from(&snap.sqlite_sequence_cache);
@@ -39198,6 +40621,12 @@ impl Connection {
 
     fn execute_commit_with_cx(&self, cx: &Cx) -> Result<()> {
         if !self.in_transaction.get() {
+            if self.retained_autocommit_txn.borrow().is_some() {
+                self.stmt_microbatch_flush();
+                self.discard_cached_vdbe_engine();
+                self.clear_prepared_direct_insert_append_hint();
+                self.flush_retained_autocommit_txn(cx)?;
+            }
             return Err(FrankenError::Internal(
                 "cannot commit - no transaction is active".to_owned(),
             ));
@@ -40125,26 +41554,205 @@ impl Connection {
         rowid_alias_col_idx: Option<usize>,
         defaults: Option<&[Option<SqliteValue>]>,
     ) -> Result<Vec<SqliteValue>> {
-        let payload_includes_rowid_alias = if let Some(ipk_idx) = rowid_alias_col_idx {
-            match payload_values.len() {
-                len if len == table.columns.len() => true,
-                len if len.checked_add(1) == Some(table.columns.len()) => {
-                    matches!(payload_values.get(ipk_idx), Some(SqliteValue::Null))
-                }
-                len => {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "table `{}` rowid {rowid} payload has {len} columns; expected {} or {}",
-                            table.name,
-                            table.columns.len().saturating_sub(1),
-                            table.columns.len()
-                        ),
-                    });
-                }
+        Self::inflate_table_row_values_from_payload_values(
+            table,
+            rowid,
+            payload_values,
+            rowid_alias_col_idx,
+            |col_idx| {
+                Ok(defaults
+                    .and_then(|entries| entries.get(col_idx))
+                    .and_then(Option::as_ref)
+                    .cloned())
+            },
+        )
+    }
+
+    fn inflate_table_row_values_for_storage_reload(
+        &self,
+        table: &TableSchema,
+        rowid: i64,
+        payload_values: &[SqliteValue],
+        rowid_alias_col_idx: Option<usize>,
+    ) -> Result<Vec<SqliteValue>> {
+        Self::inflate_table_row_values_from_payload_values(
+            table,
+            rowid,
+            payload_values,
+            rowid_alias_col_idx,
+            |col_idx| {
+                let Some(default_sql) = table
+                    .columns
+                    .get(col_idx)
+                    .and_then(|column| column.default_value.as_ref())
+                else {
+                    return Ok(None);
+                };
+                self.evaluate_column_default_value(Some(default_sql))
+                    .map(Some)
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn inflate_table_row_values_for_storage_reload_for_test(
+        table: &TableSchema,
+        rowid: i64,
+        payload_values: &[SqliteValue],
+        rowid_alias_col_idx: Option<usize>,
+    ) -> Result<Vec<SqliteValue>> {
+        Self::inflate_table_row_values_from_payload_values(
+            table,
+            rowid,
+            payload_values,
+            rowid_alias_col_idx,
+            |col_idx| {
+                Ok(table
+                    .columns
+                    .get(col_idx)
+                    .and_then(|column| column.default_value.as_ref())
+                    .map(|default_sql| Self::parse_column_default_value(default_sql)))
+            },
+        )
+    }
+
+    fn inflate_table_row_values_from_payload_values(
+        table: &TableSchema,
+        rowid: i64,
+        payload_values: &[SqliteValue],
+        rowid_alias_col_idx: Option<usize>,
+        mut default_value_at: impl FnMut(usize) -> Result<Option<SqliteValue>>,
+    ) -> Result<Vec<SqliteValue>> {
+        if payload_values.len() > table.columns.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table `{}` rowid {rowid} stores {} payload columns but schema allows at most {}",
+                    table.name,
+                    payload_values.len(),
+                    table.columns.len()
+                ),
+            });
+        }
+        if let Some(ipk_idx) = rowid_alias_col_idx
+            && ipk_idx >= table.columns.len()
+        {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table `{}` rowid {rowid} has invalid INTEGER PRIMARY KEY alias column index {ipk_idx}",
+                    table.name
+                ),
+            });
+        }
+
+        let mut default_cache = vec![None; table.columns.len()];
+        let mut default_loaded = vec![false; table.columns.len()];
+        let mut cached_default_value_at = |col_idx: usize| -> Result<Option<SqliteValue>> {
+            if !default_loaded[col_idx] {
+                default_cache[col_idx] = default_value_at(col_idx)?;
+                default_loaded[col_idx] = true;
             }
-        } else {
-            false
+            Ok(default_cache[col_idx].clone())
         };
+
+        let Some(ipk_idx) = rowid_alias_col_idx else {
+            return Self::inflate_table_row_values_with_alias_alignment(
+                table,
+                rowid,
+                payload_values,
+                None,
+                false,
+                &mut cached_default_value_at,
+            );
+        };
+
+        if payload_values.len() == table.columns.len() {
+            return Self::inflate_table_row_values_with_alias_alignment(
+                table,
+                rowid,
+                payload_values,
+                Some(ipk_idx),
+                true,
+                &mut cached_default_value_at,
+            );
+        }
+
+        let Some(value_at_alias_position) = payload_values.get(ipk_idx) else {
+            return Self::inflate_table_row_values_with_alias_alignment(
+                table,
+                rowid,
+                payload_values,
+                Some(ipk_idx),
+                false,
+                &mut cached_default_value_at,
+            );
+        };
+
+        let alias_slot_could_be_present = match value_at_alias_position {
+            SqliteValue::Null => true,
+            SqliteValue::Integer(encoded_rowid) => *encoded_rowid == rowid,
+            _ => false,
+        };
+        if !alias_slot_could_be_present {
+            return Self::inflate_table_row_values_with_alias_alignment(
+                table,
+                rowid,
+                payload_values,
+                Some(ipk_idx),
+                false,
+                &mut cached_default_value_at,
+            );
+        }
+
+        let with_alias = Self::inflate_table_row_values_with_alias_alignment(
+            table,
+            rowid,
+            payload_values,
+            Some(ipk_idx),
+            true,
+            &mut cached_default_value_at,
+        )?;
+        let without_alias = Self::inflate_table_row_values_with_alias_alignment(
+            table,
+            rowid,
+            payload_values,
+            Some(ipk_idx),
+            false,
+            &mut cached_default_value_at,
+        )?;
+        let with_alias_valid = Self::inflated_row_satisfies_notnull(table, &with_alias);
+        let without_alias_valid = Self::inflated_row_satisfies_notnull(table, &without_alias);
+
+        if !with_alias_valid && !without_alias_valid {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table `{}` rowid {rowid} short payload violates NOT NULL constraints under both rowid-alias alignments",
+                    table.name
+                ),
+            });
+        }
+        if with_alias_valid
+            && (!without_alias_valid || matches!(value_at_alias_position, SqliteValue::Null))
+        {
+            // C SQLite short rows use a NULL placeholder for the rowid alias.
+            // If both alignments remain plausible, keep that canonical
+            // interpretation.
+            Ok(with_alias)
+        } else {
+            // A shifted user integer can coincidentally equal the rowid. When
+            // both alignments are otherwise plausible, preserve the
+            // FrankenSQLite legacy omitted-alias interpretation.
+            Ok(without_alias)
+        }
+    }
+
+    fn inflate_table_row_values_with_alias_alignment(
+        table: &TableSchema,
+        rowid: i64,
+        payload_values: &[SqliteValue],
+        rowid_alias_col_idx: Option<usize>,
+        payload_includes_rowid_alias: bool,
+        default_value_at: &mut impl FnMut(usize) -> Result<Option<SqliteValue>>,
+    ) -> Result<Vec<SqliteValue>> {
         let mut values = Vec::with_capacity(table.columns.len());
         let mut payload_idx = 0_usize;
 
@@ -40157,8 +41765,8 @@ impl Connection {
             let value = if let Some(value) = payload_values.get(payload_idx) {
                 payload_idx += 1;
                 value.clone()
-            } else if let Some(Some(default)) = defaults.and_then(|entries| entries.get(col_idx)) {
-                default.clone()
+            } else if let Some(default) = default_value_at(col_idx)? {
+                default
             } else {
                 SqliteValue::Null
             };
@@ -40193,7 +41801,28 @@ impl Connection {
             values.push(value);
         }
 
+        if payload_idx != payload_values.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table `{}` rowid {rowid} left {} payload columns unconsumed after rowid-alias inflation",
+                    table.name,
+                    payload_values.len() - payload_idx
+                ),
+            });
+        }
+
         Ok(values)
+    }
+
+    fn inflated_row_satisfies_notnull(table: &TableSchema, values: &[SqliteValue]) -> bool {
+        values.len() == table.columns.len()
+            && table
+                .columns
+                .iter()
+                .zip(values.iter())
+                .all(|(column, value)| {
+                    !column.notnull || column.is_ipk || !matches!(value, SqliteValue::Null)
+                })
     }
 
     fn parse_partial_index_predicate_for_integrity(index: &IndexSchema) -> Result<Option<Expr>> {
@@ -40619,6 +42248,9 @@ impl Connection {
         }
 
         for table in schema {
+            if table.root_page <= 0 {
+                continue;
+            }
             let table_root = page_number_from_schema_root(table.root_page, &table.name, "table")?;
             if table_root != PageNumber::ONE {
                 Self::walk_integrity_btree_pages(
@@ -40712,6 +42344,9 @@ impl Connection {
                 None,
             )?;
             for table in &schema {
+                if table.root_page <= 0 {
+                    continue;
+                }
                 let table_root =
                     page_number_from_schema_root(table.root_page, &table.name, "table")?;
                 if table_root != PageNumber::ONE {
@@ -40753,6 +42388,9 @@ impl Connection {
             }
         }
         for table in &schema {
+            if table.root_page <= 0 {
+                continue;
+            }
             let uses_index_btree = without_rowid_tables.contains(&table.name.to_ascii_lowercase());
             let root_page = page_number_from_schema_root(table.root_page, &table.name, "table")?;
             let page = txn.get_page(cx, root_page)?;
@@ -40797,9 +42435,10 @@ impl Connection {
                     ),
                 })?;
 
-            // The current row encoder persists the INTEGER PRIMARY KEY alias
-            // in the table record payload, so integrity_check must validate
-            // against the full declared column count.
+            // Table records may carry an INTEGER PRIMARY KEY alias slot as
+            // either SQLite's NULL placeholder or a full-width FrankenSQLite
+            // rowid value; materialize the physical rowid before comparing
+            // expected index keys against persisted indexes.
             let max_payload_columns = table.columns.len();
 
             if uses_index_btree {
@@ -43394,8 +45033,8 @@ impl Connection {
         let TableOrSubquery::Table {
             name,
             alias,
+            index_hint,
             time_travel,
-            ..
         } = &from_clause.source
         else {
             return None;
@@ -43485,11 +45124,20 @@ impl Connection {
             )
         });
 
-        let access_path = best_access_path(
+        // Thread the INDEXED BY / NOT INDEXED hint from the FROM clause
+        // into the planner so a user-specified index (e.g.
+        // `INDEXED BY sqlite_autoindex_messages_1`) actually drives the
+        // access path instead of being silently dropped here. Before
+        // this, the planner saw `None` and re-chose its default —
+        // which for some shapes degraded into a 1.6M-opcode full table
+        // scan (see frankensqlite#88).
+        let access_path = best_access_path_with_hints(
             &planner_table,
             &planner_indexes,
             &where_terms,
             needed_columns.as_deref(),
+            index_hint.as_ref(),
+            None,
         );
 
         let has_ipk_range = ipk_col.is_some_and(|ipk| {
@@ -45552,25 +47200,35 @@ impl Connection {
                 // NULL propagates per comparison, then through AND.
                 // Crucially, `FALSE AND NULL = FALSE` (short-circuit), so
                 // `5 BETWEEN 10 AND NULL` is FALSE, not NULL.
-                let collation = resolve_operand_collation(e, &self.schema.borrow());
+                let schemas = self.schema.borrow();
+                let collation = resolve_operand_collation(e, &schemas);
                 let coll_ref = collation.as_deref();
-                let cmp = |a: &SqliteValue, b: &SqliteValue| -> std::cmp::Ordering {
+                let operand_aff = resolve_operand_affinity(e, &schemas);
+                let low_aff = resolve_operand_affinity(low, &schemas);
+                let high_aff = resolve_operand_affinity(high, &schemas);
+                let cmp_low_aff = TypeAffinity::comparison_affinity(operand_aff, low_aff);
+                let cmp_high_aff = TypeAffinity::comparison_affinity(operand_aff, high_aff);
+                let cmp = |a: &SqliteValue,
+                           b: &SqliteValue,
+                           aff: Option<TypeAffinity>|
+                 -> std::cmp::Ordering {
+                    let (ca, cb) = coerce_values_for_comparison_affinity(a, b, aff);
                     if coll_ref.is_some() {
                         let reg = lock_unpoisoned(&self.collation_registry);
-                        cmp_values_collated_snapshot(a, b, coll_ref, &reg)
+                        cmp_values_collated_snapshot(&ca, &cb, coll_ref, &reg)
                     } else {
-                        cmp_values(a, b)
+                        cmp_values(&ca, &cb)
                     }
                 };
                 let ge_low = if val.is_null() || lo.is_null() {
                     None
                 } else {
-                    Some(cmp(&val, &lo) != std::cmp::Ordering::Less)
+                    Some(cmp(&val, &lo, cmp_low_aff) != std::cmp::Ordering::Less)
                 };
                 let le_high = if val.is_null() || hi.is_null() {
                     None
                 } else {
-                    Some(cmp(&val, &hi) != std::cmp::Ordering::Greater)
+                    Some(cmp(&val, &hi, cmp_high_aff) != std::cmp::Ordering::Greater)
                 };
                 match (ge_low, le_high) {
                     (Some(false), _) | (_, Some(false)) => {
@@ -46948,6 +48606,68 @@ impl Connection {
             FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS.fetch_add(1, AtomicOrdering::Relaxed);
         }
         Some(rows)
+    }
+
+    fn try_scan_join_source_from_pager(
+        &self,
+        src: &JoinTableSource,
+    ) -> Option<Result<Vec<Vec<SqliteValue>>>> {
+        if !self.pager.is_file_backed() {
+            return None;
+        }
+        let binding_name = src.local_table_binding()?;
+        let rowid_alias_column_index = self
+            .rowid_alias_columns
+            .borrow()
+            .get(&binding_name.name.to_ascii_lowercase())
+            .copied();
+        let root_page_num = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&binding_name.name))
+                .map(|table| table.root_page)?
+        };
+        let cx = &self.root_cx;
+        let result = (|| -> Result<Vec<Vec<SqliteValue>>> {
+            let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly)?;
+            let page_no = PageNumber::new(u32::try_from(root_page_num).unwrap_or(1))
+                .unwrap_or(PageNumber::ONE);
+            let mut cursor = Self::new_pager_btree_cursor(cx, &mut txn, page_no, true)?;
+            let mut rows = Vec::new();
+            if cursor.first(cx)? {
+                loop {
+                    let (rowid, payload) = cursor.rowid_and_payload_cow(cx)?;
+                    let mut values = parse_record(payload.as_ref()).ok_or_else(|| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "join pager scan: table `{}` rowid {rowid} has invalid record",
+                                binding_name.name
+                            ),
+                        }
+                    })?;
+                    if let Some(alias_idx) = rowid_alias_column_index
+                        && let Some(alias_value) = values.get_mut(alias_idx)
+                    {
+                        *alias_value = SqliteValue::Integer(rowid);
+                    }
+                    if src.hidden_rowid_projection.is_some() {
+                        values.push(SqliteValue::Integer(rowid));
+                    }
+                    rows.push(values);
+                    if !cursor.next(cx)? {
+                        break;
+                    }
+                }
+            }
+            drop(cursor);
+            txn.commit(cx)?;
+            Ok(rows)
+        })();
+        if result.is_ok() && hot_path_profile_enabled() {
+            FSQLITE_JOIN_PAGER_SCAN_FAST_PATH_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        Some(result)
     }
 
     /// Execute a SELECT containing window functions at the connection level.
@@ -51051,7 +52771,7 @@ impl Connection {
                             &visible_ctes,
                             &mut Vec::new(),
                         );
-                        let label = alias.clone().unwrap_or_else(|| "_subquery".to_owned());
+                        let label = alias.clone().unwrap_or_else(|| "subquery".to_owned());
                         Ok((
                             JoinTableSource {
                                 binding_name: None,
@@ -51283,9 +53003,9 @@ impl Connection {
                 }
                 let row_data = if let Some(row_data) = self.try_scan_join_source_from_memdb(src) {
                     row_data
+                } else if let Some(result) = self.try_scan_join_source_from_pager(src) {
+                    result?
                 } else {
-                    // Scan rows through the normal query path which reads
-                    // from the pager-backed store.
                     let scan_sql = build_join_scan_sql(src);
                     let rows = self.query(&scan_sql)?;
                     rows.iter().map(|r| r.values().to_vec()).collect()
@@ -53004,31 +54724,111 @@ impl Connection {
 
     // ── 5D.2: Pager-backed rollback reload (bd-1ene) ─────────────────────
 
-    /// Reload MemDatabase and schema from the pager's committed state.
-    ///
-    /// After a pager transaction rollback, the pager reflects the pre-transaction
-    /// committed state. This method opens a read transaction, reads sqlite_master
-    /// from page 1, and reloads all table data into a fresh MemDatabase.
-    ///
-    /// Parse a constant column default value string into a `SqliteValue`.
-    /// Used when padding short records from ALTER TABLE ADD COLUMN during
-    /// MemDB reload.
+    // Parse constant column default values when padding short records from
+    // ALTER TABLE ADD COLUMN during MemDB reload.
+    fn strip_wrapping_default_parens(mut default_sql: &str) -> &str {
+        loop {
+            let trimmed = default_sql.trim();
+            let bytes = trimmed.as_bytes();
+            if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
+                return trimmed;
+            }
+
+            let mut depth = 0_i32;
+            let mut idx = 0_usize;
+            let mut wraps_entire_expr = false;
+            while idx < bytes.len() {
+                match bytes[idx] {
+                    quote @ (b'\'' | b'"') => {
+                        idx += 1;
+                        while idx < bytes.len() {
+                            if bytes[idx] == quote {
+                                if idx + 1 < bytes.len() && bytes[idx + 1] == quote {
+                                    idx += 2;
+                                } else {
+                                    idx += 1;
+                                    break;
+                                }
+                            } else {
+                                idx += 1;
+                            }
+                        }
+                        continue;
+                    }
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            wraps_entire_expr = idx == bytes.len() - 1;
+                            break;
+                        }
+                        if depth < 0 {
+                            return trimmed;
+                        }
+                    }
+                    _ => {}
+                }
+                idx += 1;
+            }
+
+            if !wraps_entire_expr || depth != 0 {
+                return trimmed;
+            }
+            default_sql = &trimmed[1..trimmed.len() - 1];
+        }
+    }
+
+    fn parse_wrapped_default_text(default_sql: &str, quote: char) -> Option<SqliteValue> {
+        if !default_sql.starts_with(quote) {
+            return None;
+        }
+        let mut value = String::new();
+        let body = &default_sql[quote.len_utf8()..];
+        let mut chars = body.char_indices().peekable();
+
+        while let Some((offset, ch)) = chars.next() {
+            if ch != quote {
+                value.push(ch);
+                continue;
+            }
+            if let Some((_, next_ch)) = chars.peek()
+                && *next_ch == quote
+            {
+                value.push(quote);
+                let _ = chars.next();
+                continue;
+            }
+            let absolute_end = quote.len_utf8() + offset + ch.len_utf8();
+            return (absolute_end == default_sql.len()).then(|| SqliteValue::Text(value.into()));
+        }
+
+        None
+    }
+
+    #[cfg(test)]
     fn parse_column_default_value(dv: &str) -> SqliteValue {
+        let dv = Self::strip_wrapping_default_parens(dv);
         if dv.eq_ignore_ascii_case("NULL") {
             SqliteValue::Null
         } else if let Ok(i) = dv.parse::<i64>() {
             SqliteValue::Integer(i)
         } else if let Ok(f) = dv.parse::<f64>() {
             SqliteValue::Float(f)
-        } else if dv.starts_with('\'') && dv.ends_with('\'') {
-            SqliteValue::Text(fsqlite_types::SmallText::from_string(
-                dv[1..dv.len() - 1].replace("''", "'"),
-            ))
+        } else if let Some(value) = Self::parse_wrapped_default_text(dv, '\'')
+            .or_else(|| Self::parse_wrapped_default_text(dv, '"'))
+        {
+            value
         } else {
             SqliteValue::Text(fsqlite_types::SmallText::from_string(dv))
         }
     }
 
+    /// Reloads MemDatabase and schema from the pager's committed state. After a
+    /// pager transaction rollback, the pager reflects the pre-transaction
+    /// committed state. This method opens a read transaction, reads
+    /// sqlite_master from page 1, and reloads all table data into a fresh
+    /// MemDatabase.
+    ///
     /// # Errors
     ///
     /// Returns an error if the pager cannot be read or if B-tree traversal fails.
@@ -53132,7 +54932,6 @@ impl Connection {
                 .unwrap_or(PageNumber::ONE);
             let mut cursor =
                 Self::new_header_btree_cursor(txn, root_page, page_size, reserved_per_page, true);
-            let num_columns = table.columns.len();
             let ipk_col_idx = rowid_alias_columns
                 .get(&table.name.to_ascii_lowercase())
                 .copied();
@@ -53162,94 +54961,12 @@ impl Connection {
                     {
                         new_sqlite_sequence_cache.insert(tbl_name.to_ascii_lowercase(), *seq);
                     }
-                    if let Some(ipk_idx) = ipk_col_idx {
-                        match values.len() {
-                            len if len + 1 == num_columns => {
-                                values.insert(ipk_idx, SqliteValue::Integer(rowid));
-                            }
-                            len if len == num_columns => match values.get_mut(ipk_idx) {
-                                Some(slot @ SqliteValue::Null) => {
-                                    *slot = SqliteValue::Integer(rowid);
-                                }
-                                Some(SqliteValue::Integer(encoded_rowid))
-                                    if *encoded_rowid == rowid => {}
-                                Some(SqliteValue::Integer(encoded_rowid)) => {
-                                    return Err(FrankenError::DatabaseCorrupt {
-                                        detail: format!(
-                                            "table `{}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}",
-                                            table.name
-                                        ),
-                                    });
-                                }
-                                Some(other) => {
-                                    return Err(FrankenError::DatabaseCorrupt {
-                                        detail: format!(
-                                            "table `{}` rowid {rowid} stores non-integer INTEGER PRIMARY KEY alias value {other:?}",
-                                            table.name
-                                        ),
-                                    });
-                                }
-                                None => {
-                                    return Err(FrankenError::DatabaseCorrupt {
-                                        detail: format!(
-                                            "table `{}` rowid {rowid} payload is missing INTEGER PRIMARY KEY alias column",
-                                            table.name
-                                        ),
-                                    });
-                                }
-                            },
-                            // Short record: table gained columns via ALTER TABLE ADD COLUMN.
-                            // Determine whether IPK is included by checking the value at the
-                            // IPK position; then insert/pad accordingly.
-                            len if len < num_columns => {
-                                let ipk_in_payload = ipk_idx < len
-                                    && matches!(&values[ipk_idx], SqliteValue::Integer(v) if *v == rowid);
-                                if !ipk_in_payload && ipk_idx <= len {
-                                    values.insert(ipk_idx, SqliteValue::Integer(rowid));
-                                } else if ipk_in_payload {
-                                    // IPK already present; just ensure it's correct.
-                                } else {
-                                    // IPK position is beyond the record — pad with
-                                    // NULLs up to the IPK position, then insert it.
-                                    while values.len() < ipk_idx {
-                                        values.push(SqliteValue::Null);
-                                    }
-                                    values.insert(ipk_idx, SqliteValue::Integer(rowid));
-                                }
-                                // Pad remaining columns with their default values.
-                                while values.len() < num_columns {
-                                    let col_idx = values.len();
-                                    let default_val = table
-                                        .columns
-                                        .get(col_idx)
-                                        .and_then(|c| c.default_value.as_ref())
-                                        .map_or(SqliteValue::Null, |dv| {
-                                            Self::parse_column_default_value(dv)
-                                        });
-                                    values.push(default_val);
-                                }
-                            }
-                            len => {
-                                return Err(FrankenError::DatabaseCorrupt {
-                                    detail: format!(
-                                        "table `{}` rowid {rowid} payload has {len} columns; expected at most {}",
-                                        table.name, num_columns
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                    // Pad non-IPK short records (from ALTER TABLE ADD COLUMN on
-                    // tables without an INTEGER PRIMARY KEY alias).
-                    while values.len() < num_columns {
-                        let col_idx = values.len();
-                        let default_val = table
-                            .columns
-                            .get(col_idx)
-                            .and_then(|c| c.default_value.as_ref())
-                            .map_or(SqliteValue::Null, |dv| Self::parse_column_default_value(dv));
-                        values.push(default_val);
-                    }
+                    values = self.inflate_table_row_values_for_storage_reload(
+                        table,
+                        rowid,
+                        &values,
+                        ipk_col_idx,
+                    )?;
                     if let Some(mem_table) = new_db.get_table_mut(table.root_page) {
                         mem_table.insert_row(rowid, values);
                     }
@@ -53287,7 +55004,6 @@ impl Connection {
         let root_page = page_number_from_schema_root(table.root_page, &table.name, "table")?;
         let mut cursor =
             Self::new_header_btree_cursor(txn, root_page, page_size, reserved_per_page, true);
-        let num_columns = table.columns.len();
         let ipk_col_idx = rowid_alias_columns
             .get(&table.name.to_ascii_lowercase())
             .copied();
@@ -53310,84 +55026,12 @@ impl Connection {
                             table.name
                         ),
                     })?;
-                if let Some(ipk_idx) = ipk_col_idx {
-                    match values.len() {
-                        len if len + 1 == num_columns => {
-                            values.insert(ipk_idx, SqliteValue::Integer(rowid));
-                        }
-                        len if len == num_columns => match values.get_mut(ipk_idx) {
-                            Some(slot @ SqliteValue::Null) => {
-                                *slot = SqliteValue::Integer(rowid);
-                            }
-                            Some(SqliteValue::Integer(encoded_rowid))
-                                if *encoded_rowid == rowid => {}
-                            Some(SqliteValue::Integer(encoded_rowid)) => {
-                                return Err(FrankenError::DatabaseCorrupt {
-                                    detail: format!(
-                                        "table `{}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}",
-                                        table.name
-                                    ),
-                                });
-                            }
-                            Some(other) => {
-                                return Err(FrankenError::DatabaseCorrupt {
-                                    detail: format!(
-                                        "table `{}` rowid {rowid} stores non-integer INTEGER PRIMARY KEY alias value {other:?}",
-                                        table.name
-                                    ),
-                                });
-                            }
-                            None => {
-                                return Err(FrankenError::DatabaseCorrupt {
-                                    detail: format!(
-                                        "table `{}` rowid {rowid} payload is missing INTEGER PRIMARY KEY alias column",
-                                        table.name
-                                    ),
-                                });
-                            }
-                        },
-                        len if len < num_columns => {
-                            let ipk_in_payload = ipk_idx < len
-                                && matches!(&values[ipk_idx], SqliteValue::Integer(v) if *v == rowid);
-                            if !ipk_in_payload && ipk_idx <= len {
-                                values.insert(ipk_idx, SqliteValue::Integer(rowid));
-                            } else if !ipk_in_payload {
-                                while values.len() < ipk_idx {
-                                    values.push(SqliteValue::Null);
-                                }
-                                values.insert(ipk_idx, SqliteValue::Integer(rowid));
-                            }
-                            while values.len() < num_columns {
-                                let col_idx = values.len();
-                                let default_val = table
-                                    .columns
-                                    .get(col_idx)
-                                    .and_then(|column| column.default_value.as_ref())
-                                    .map_or(SqliteValue::Null, |dv| {
-                                        Self::parse_column_default_value(dv)
-                                    });
-                                values.push(default_val);
-                            }
-                        }
-                        len => {
-                            return Err(FrankenError::DatabaseCorrupt {
-                                detail: format!(
-                                    "table `{}` rowid {rowid} payload has {len} columns; expected at most {}",
-                                    table.name, num_columns
-                                ),
-                            });
-                        }
-                    }
-                }
-                while values.len() < num_columns {
-                    let col_idx = values.len();
-                    let default_val = table
-                        .columns
-                        .get(col_idx)
-                        .and_then(|column| column.default_value.as_ref())
-                        .map_or(SqliteValue::Null, |dv| Self::parse_column_default_value(dv));
-                    values.push(default_val);
-                }
+                values = self.inflate_table_row_values_for_storage_reload(
+                    table,
+                    rowid,
+                    &values,
+                    ipk_col_idx,
+                )?;
                 rows.push((rowid, values));
                 if !cursor.next(cx)? {
                     break;
@@ -53396,6 +55040,196 @@ impl Connection {
         }
 
         Ok(rows)
+    }
+
+    fn read_fts5_rootpage_zero_content_rows_for_reload(
+        &self,
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        schema: &[TableSchema],
+        rowid_alias_columns: &HashMap<String, usize>,
+        table_name: &str,
+        args: &[String],
+    ) -> Result<Vec<(i64, Vec<String>)>> {
+        let fts_columns = parse_virtual_table_column_infos(args);
+        let Some(content_option) = virtual_table_option_value(args, "content") else {
+            let content_table_name = format!("{table_name}_content");
+            let content_table = schema
+                .iter()
+                .find(|candidate| candidate.name.eq_ignore_ascii_case(&content_table_name))
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "FTS5 table `{table_name}` is missing required content shadow table `{content_table_name}`"
+                    ),
+                })?;
+            let rows = self.read_storage_table_rows_for_reload(
+                cx,
+                txn,
+                page_size,
+                reserved_per_page,
+                content_table,
+                rowid_alias_columns,
+            )?;
+
+            return Ok(rows
+                .into_iter()
+                .map(|(rowid, values)| {
+                    let content_values = if values.len() == fts_columns.len().saturating_add(1) {
+                        &values[1..]
+                    } else {
+                        values.as_slice()
+                    };
+                    (
+                        rowid,
+                        content_values
+                            .iter()
+                            .take(fts_columns.len())
+                            .map(SqliteValue::to_text)
+                            .collect(),
+                    )
+                })
+                .collect());
+        };
+
+        if content_option.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let content_table = schema
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(&content_option))
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "FTS5 table `{table_name}` references missing external content table `{content_option}`"
+                ),
+            })?;
+        let rows = self.read_storage_table_rows_for_reload(
+            cx,
+            txn,
+            page_size,
+            reserved_per_page,
+            content_table,
+            rowid_alias_columns,
+        )?;
+        let content_rowid =
+            virtual_table_option_value(args, "content_rowid").unwrap_or_else(|| "rowid".to_owned());
+        let content_rowid_index = content_table
+            .columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(&content_rowid));
+        let column_indexes = fts_columns
+            .iter()
+            .map(|fts_column| {
+                content_table
+                    .columns
+                    .iter()
+                    .position(|column| column.name.eq_ignore_ascii_case(&fts_column.name))
+            })
+            .collect::<Vec<_>>();
+
+        rows.into_iter()
+            .map(|(storage_rowid, values)| {
+                let rowid = if matches!(
+                    content_rowid.as_str(),
+                    "rowid" | "oid" | "_rowid_" | "ROWID" | "OID" | "_ROWID_"
+                ) {
+                    storage_rowid
+                } else {
+                    let Some(index) = content_rowid_index else {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "FTS5 table `{table_name}` content_rowid `{content_rowid}` is not present in `{content_option}`"
+                            ),
+                        });
+                    };
+                    values.get(index).map_or(storage_rowid, SqliteValue::to_integer)
+                };
+                let columns = column_indexes
+                    .iter()
+                    .map(|index| {
+                        index
+                            .and_then(|idx| values.get(idx))
+                            .map_or_else(String::new, SqliteValue::to_text)
+                    })
+                    .collect();
+                Ok((rowid, columns))
+            })
+            .collect()
+    }
+
+    fn rebuild_rootpage_zero_live_vtab_instances_from_reload(
+        &self,
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        schema: &[TableSchema],
+        rowid_alias_columns: &HashMap<String, usize>,
+        specs: &[(String, String, Vec<ColumnInfo>)],
+    ) -> Result<HashMap<String, Box<dyn ErasedVtabInstance>>> {
+        let mut reloaded = HashMap::new();
+
+        for (table_name, create_sql, _) in specs {
+            let table_key = table_name.to_ascii_uppercase();
+            let create_stmt = match parse_single_statement(create_sql) {
+                Ok(Statement::CreateVirtualTable(stmt)) => stmt,
+                Ok(_) => continue,
+                Err(error) => {
+                    tracing::debug!(
+                        table = %table_name,
+                        error = %error,
+                        "skipping rootpage=0 virtual table connect during schema reload; CREATE VIRTUAL TABLE SQL did not reparse"
+                    );
+                    continue;
+                }
+            };
+            let module_key = create_stmt.module.to_ascii_uppercase();
+            let mut instance = {
+                let modules = self.vtab_modules.borrow();
+                let Some(factory) = modules.get(&module_key) else {
+                    tracing::debug!(
+                        table = %table_name,
+                        module = %create_stmt.module,
+                        "skipping rootpage=0 virtual table connect during schema reload; module is unavailable"
+                    );
+                    continue;
+                };
+                let mut full_args = vec![
+                    create_stmt.module.clone(),
+                    "main".to_owned(),
+                    table_name.clone(),
+                ];
+                full_args.extend(create_stmt.args.iter().cloned());
+                let full_arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
+                factory.connect(cx, &full_arg_refs)?
+            };
+
+            if let Some(fts5) = instance.as_any_mut().downcast_mut::<Fts5Table>() {
+                let rows = self.read_fts5_rootpage_zero_content_rows_for_reload(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    schema,
+                    rowid_alias_columns,
+                    table_name,
+                    &create_stmt.args,
+                )?;
+                fts5.rebuild_documents(rows);
+                reloaded.insert(table_key, instance);
+                continue;
+            }
+
+            tracing::debug!(
+                table = %table_name,
+                module = %create_stmt.module,
+                "skipping rootpage=0 virtual table connect during schema reload; module does not yet support shadow-backed hydration"
+            );
+        }
+
+        Ok(reloaded)
     }
 
     fn rebuild_materialized_live_vtab_instances_from_reload(
@@ -53737,7 +55571,8 @@ impl Connection {
         let mut new_views: Vec<ViewDef> = Vec::new();
         let mut pending_indexes: Vec<(String, String, i32, ReconstructedIndexDefinition)> =
             Vec::new();
-        let mut pending_legacy_virtual_tables: Vec<(String, Vec<ColumnInfo>)> = Vec::new();
+        let mut pending_rootpage_zero_virtual_tables: Vec<(String, String, Vec<ColumnInfo>)> =
+            Vec::new();
         let mut pending_materialized_live_vtabs: Vec<(String, String)> = Vec::new();
         let mut new_alias_map = HashMap::new();
         let mut new_autoincrement_tables = HashSet::new();
@@ -53758,12 +55593,10 @@ impl Connection {
                     SqliteValue::Text(s) => s.clone(),
                     _ => continue,
                 };
-                let trigger_name = match &entry[1] {
-                    SqliteValue::Text(s) => s.clone(),
+                match &entry[1] {
+                    SqliteValue::Text(_) => {}
                     _ => continue,
-                };
-                new_original_ddl_sql
-                    .insert(trigger_name.to_ascii_lowercase(), create_sql.to_string());
+                }
                 if let Ok(Statement::CreateTrigger(stmt)) = parse_single_statement(&create_sql) {
                     new_triggers.push(TriggerDef::from_create_statement(
                         &stmt,
@@ -53921,7 +55754,11 @@ impl Connection {
                     }
                     _ => crate::compat_persist::parse_columns_from_sqlite_master_sql(&create_sql),
                 };
-                pending_legacy_virtual_tables.push((name.to_string(), columns));
+                pending_rootpage_zero_virtual_tables.push((
+                    name.to_string(),
+                    create_sql.to_string(),
+                    columns,
+                ));
                 continue;
             }
             if is_virtual_sql {
@@ -53951,10 +55788,10 @@ impl Connection {
                 crate::compat_persist::autoincrement_from_create_table_statement,
             );
 
-            // Track rowid alias columns (INTEGER PRIMARY KEY).
-            // When a column is INTEGER PRIMARY KEY, its value is NOT stored in the
-            // record payload - it IS the rowid. We need to insert the rowid at this
-            // position when loading data.
+            // Track rowid alias columns (INTEGER PRIMARY KEY). The alias value
+            // is the physical rowid; persisted records may carry a NULL
+            // placeholder, a full-width rowid slot, or a legacy omitted slot,
+            // so reloads must materialize the rowid into the logical row value.
             let ipk_col_idx = columns.iter().position(|c| c.is_ipk);
             if !without_rowid && let Some(idx) = ipk_col_idx {
                 new_alias_map.insert(name.to_ascii_lowercase(), idx);
@@ -54126,94 +55963,17 @@ impl Connection {
                             new_sqlite_sequence_cache.insert(tbl_name.to_ascii_lowercase(), *seq);
                         }
                         if hydrate_rows {
-                            // If this table has an INTEGER PRIMARY KEY column, insert
-                            // the rowid at that position since it's not stored in the
-                            // record payload.
-                            if let Some(ipk_idx) = ipk_col_idx {
-                                match values.len() {
-                                    len if len + 1 == num_columns => {
-                                        values.insert(ipk_idx, SqliteValue::Integer(rowid));
-                                    }
-                                    len if len == num_columns => match values.get_mut(ipk_idx) {
-                                        Some(slot @ SqliteValue::Null) => {
-                                            *slot = SqliteValue::Integer(rowid);
-                                        }
-                                        Some(SqliteValue::Integer(encoded_rowid))
-                                            if *encoded_rowid == rowid => {}
-                                        Some(SqliteValue::Integer(encoded_rowid)) => {
-                                            return Err(FrankenError::DatabaseCorrupt {
-                                                detail: format!(
-                                                    "table `{name}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}"
-                                                ),
-                                            });
-                                        }
-                                        Some(other) => {
-                                            return Err(FrankenError::DatabaseCorrupt {
-                                                detail: format!(
-                                                    "table `{name}` rowid {rowid} stores non-integer INTEGER PRIMARY KEY alias value {other:?}"
-                                                ),
-                                            });
-                                        }
-                                        None => {
-                                            return Err(FrankenError::DatabaseCorrupt {
-                                                detail: format!(
-                                                    "table `{name}` rowid {rowid} payload is missing INTEGER PRIMARY KEY alias column"
-                                                ),
-                                            });
-                                        }
-                                    },
-                                    // Short record: table gained columns via ALTER TABLE ADD COLUMN.
-                                    len if len < num_columns => {
-                                        let ipk_in_payload = ipk_idx < len
-                                            && matches!(&values[ipk_idx], SqliteValue::Integer(v) if *v == rowid);
-                                        if !ipk_in_payload && ipk_idx <= len {
-                                            values.insert(ipk_idx, SqliteValue::Integer(rowid));
-                                        } else if !ipk_in_payload {
-                                            while values.len() < ipk_idx {
-                                                values.push(SqliteValue::Null);
-                                            }
-                                            values.insert(ipk_idx, SqliteValue::Integer(rowid));
-                                        }
-                                        if let Some(tbl_schema) = new_schema.last() {
-                                            while values.len() < num_columns {
-                                                let ci = values.len();
-                                                let default_val = tbl_schema
-                                                    .columns
-                                                    .get(ci)
-                                                    .and_then(|c| c.default_value.as_ref())
-                                                    .map_or(SqliteValue::Null, |dv| {
-                                                        Self::parse_column_default_value(dv)
-                                                    });
-                                                values.push(default_val);
-                                            }
-                                        }
-                                    }
-                                    len => {
-                                        return Err(FrankenError::DatabaseCorrupt {
-                                            detail: format!(
-                                                "table `{name}` rowid {rowid} payload has {len} columns; expected at most {}",
-                                                num_columns
-                                            ),
-                                        });
-                                    }
-                                }
-                            }
-                            // Pad non-IPK short records.
-                            if let Some(tbl_schema) =
-                                new_schema.iter().find(|t| t.root_page == real_root_page)
-                            {
-                                while values.len() < num_columns {
-                                    let ci = values.len();
-                                    let default_val = tbl_schema
-                                        .columns
-                                        .get(ci)
-                                        .and_then(|c| c.default_value.as_ref())
-                                        .map_or(SqliteValue::Null, |dv| {
-                                            Self::parse_column_default_value(dv)
-                                        });
-                                    values.push(default_val);
-                                }
-                            }
+                            let tbl_schema = new_schema.last().ok_or_else(|| {
+                                FrankenError::Internal(format!(
+                                    "schema reload lost table metadata for `{name}`"
+                                ))
+                            })?;
+                            values = self.inflate_table_row_values_for_storage_reload(
+                                tbl_schema,
+                                rowid,
+                                &values,
+                                ipk_col_idx,
+                            )?;
                             if let Some(mem_table) = new_db.tables.get_mut(&real_root_page) {
                                 mem_table.insert_row(rowid, values);
                             }
@@ -54255,18 +56015,17 @@ impl Connection {
             }
         }
 
-        for (table_name, columns) in pending_legacy_virtual_tables {
+        for (table_name, _, columns) in &pending_rootpage_zero_virtual_tables {
             if new_schema
                 .iter()
-                .any(|table| table.name.eq_ignore_ascii_case(&table_name))
+                .any(|table| table.name.eq_ignore_ascii_case(table_name))
             {
                 continue;
             }
-            let root_page = new_db.create_table(columns.len());
             new_schema.push(TableSchema {
-                name: table_name,
-                root_page,
-                columns,
+                name: table_name.clone(),
+                root_page: 0,
+                columns: columns.clone(),
                 indexes: Vec::new(),
                 strict: false,
                 without_rowid: false,
@@ -54279,7 +56038,7 @@ impl Connection {
         let reloaded_live_vtabs = if self.transactional_live_vtab_registry_active() {
             None
         } else {
-            Some(self.rebuild_materialized_live_vtab_instances_from_reload(
+            let mut reloaded = self.rebuild_materialized_live_vtab_instances_from_reload(
                 cx,
                 txn,
                 page_size,
@@ -54288,7 +56047,19 @@ impl Connection {
                 &new_alias_map,
                 &pending_materialized_live_vtabs,
                 preserve_existing_live_vtabs,
-            )?)
+            )?;
+            let rootpage_zero_live_vtabs = self
+                .rebuild_rootpage_zero_live_vtab_instances_from_reload(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    &new_schema,
+                    &new_alias_map,
+                    &pending_rootpage_zero_virtual_tables,
+                )?;
+            reloaded.extend(rootpage_zero_live_vtabs);
+            Some(reloaded)
         };
 
         // Capture structural fingerprints of old and new schemas BEFORE the
@@ -54326,9 +56097,15 @@ impl Connection {
         let schema_structure_changed = old_schema_fingerprint != new_schema_fingerprint;
 
         // Apply the reloaded state.
+        //
+        // The old MemDatabase is dropped here, before anything else is
+        // published. That drop is the only reentrancy hazard in this function
+        // (a blocking worker's Drop can re-enter the Connection; see the
+        // old-schema-fingerprint scoping comment above), so it must observe the
+        // *old* schema/index pairs while they are still mutually consistent —
+        // hence it runs before the atomic publish below.
         *self.db.borrow_mut() = new_db;
-        *self.schema.borrow_mut() = new_schema;
-        *self.views.borrow_mut() = new_views;
+
         // Preserve TEMP triggers across memdb reloads — they are connection-local
         // and not persisted to sqlite_master, so they would be lost if we simply
         // replaced the trigger list with what was loaded from the pager.
@@ -54340,8 +56117,42 @@ impl Connection {
                 }
             }
         }
+
+        // bd-e6zfc: derive the case-insensitive side indices from the finalized
+        // local Vecs so each data Vec and its HashMap index can be swapped into
+        // the Connection together. Previously the Vecs were published first and
+        // `rebuild_schema_indices()` re-derived the maps afterward, leaving a
+        // window in which `schema_by_name`/`views_by_name`/`triggers_by_name`
+        // disagreed with their backing Vecs — a divergence observable by any
+        // reentrant schema lookup running during that window. This is the same
+        // work the rebuild did (matching its `to_ascii_lowercase` keying and
+        // last-wins insert order), just committed atomically alongside the data.
+        let new_schema_by_name: HashMap<String, usize> = new_schema
+            .iter()
+            .enumerate()
+            .map(|(i, table)| (table.name.to_ascii_lowercase(), i))
+            .collect();
+        let new_views_by_name: HashMap<String, usize> = new_views
+            .iter()
+            .enumerate()
+            .map(|(i, view)| (view.name.to_ascii_lowercase(), i))
+            .collect();
+        let new_triggers_by_name: HashMap<String, usize> = new_triggers
+            .iter()
+            .enumerate()
+            .map(|(i, trigger)| (trigger.name.to_ascii_lowercase(), i))
+            .collect();
+
+        // Atomic publish: each data Vec is swapped in together with its side
+        // index, and no fallible or reentrant call is interleaved between any
+        // pair, so the `schema_by_name == schema` (and views/triggers) invariant
+        // documented on the field declarations holds at every observable point.
+        *self.schema.borrow_mut() = new_schema;
+        *self.schema_by_name.borrow_mut() = new_schema_by_name;
+        *self.views.borrow_mut() = new_views;
+        *self.views_by_name.borrow_mut() = new_views_by_name;
         *self.triggers.borrow_mut() = new_triggers;
-        self.rebuild_schema_indices();
+        *self.triggers_by_name.borrow_mut() = new_triggers_by_name;
         self.validate_schema_index();
         *self.rowid_alias_columns.borrow_mut() = new_alias_map;
         *self.autoincrement_tables.borrow_mut() = new_autoincrement_tables;
@@ -55437,6 +57248,123 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
                 || else_expr.as_deref().is_some_and(expr_has_aggregate)
         }
         _ => false,
+    }
+}
+
+fn collect_aggregate_kind_names(expr: &Expr, out: &mut BTreeSet<String>) {
+    match expr {
+        Expr::FunctionCall {
+            name,
+            args,
+            filter,
+            over: None,
+            ..
+        } => {
+            if is_agg_fn(name) && !is_scalar_max_min(name, args) {
+                out.insert(name.to_ascii_lowercase());
+            }
+            collect_aggregate_kind_names_from_args(args, out);
+            if let Some(filter) = filter.as_deref() {
+                collect_aggregate_kind_names(filter, out);
+            }
+        }
+        Expr::FunctionCall {
+            name,
+            args,
+            filter,
+            over: Some(_),
+            ..
+        } => {
+            if is_agg_fn(name) && !is_scalar_max_min(name, args) {
+                out.insert(name.to_ascii_lowercase());
+            }
+            collect_aggregate_kind_names_from_args(args, out);
+            if let Some(filter) = filter.as_deref() {
+                collect_aggregate_kind_names(filter, out);
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_aggregate_kind_names(left, out);
+            collect_aggregate_kind_names(right, out);
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => collect_aggregate_kind_names(inner, out),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_aggregate_kind_names(inner, out);
+            collect_aggregate_kind_names(low, out);
+            collect_aggregate_kind_names(high, out);
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            collect_aggregate_kind_names(inner, out);
+            if let InSet::List(items) = set {
+                for item in items {
+                    collect_aggregate_kind_names(item, out);
+                }
+            }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_aggregate_kind_names(inner, out);
+            collect_aggregate_kind_names(pattern, out);
+            if let Some(escape) = escape.as_deref() {
+                collect_aggregate_kind_names(escape, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand.as_deref() {
+                collect_aggregate_kind_names(operand, out);
+            }
+            for (when_expr, then_expr) in whens {
+                collect_aggregate_kind_names(when_expr, out);
+                collect_aggregate_kind_names(then_expr, out);
+            }
+            if let Some(else_expr) = else_expr.as_deref() {
+                collect_aggregate_kind_names(else_expr, out);
+            }
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => {
+            collect_aggregate_kind_names(inner, out);
+            collect_aggregate_kind_names(path, out);
+        }
+        Expr::RowValue(items, _) => {
+            for item in items {
+                collect_aggregate_kind_names(item, out);
+            }
+        }
+        Expr::Exists { .. }
+        | Expr::Subquery(_, _)
+        | Expr::Literal(_, _)
+        | Expr::Column(_, _)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _) => {}
+    }
+}
+
+fn collect_aggregate_kind_names_from_args(args: &FunctionArgs, out: &mut BTreeSet<String>) {
+    if let FunctionArgs::List(items) = args {
+        for item in items {
+            collect_aggregate_kind_names(item, out);
+        }
     }
 }
 
@@ -57712,16 +59640,7 @@ fn fk_action_sql(action: FkActionType) -> &'static str {
 
 fn render_create_index_sql(index: &IndexSchema, table_name: &str) -> String {
     let unique = if index.is_unique { "UNIQUE " } else { "" };
-    let cols = if index.key_expressions.is_empty() {
-        index
-            .columns
-            .iter()
-            .map(|column| quote_identifier(column))
-            .collect::<Vec<_>>()
-            .join(", ")
-    } else {
-        index.key_expressions.join(", ")
-    };
+    let cols = render_create_index_terms_sql(index);
     let where_clause = index
         .where_clause
         .as_ref()
@@ -57733,6 +59652,121 @@ fn render_create_index_sql(index: &IndexSchema, table_name: &str) -> String {
         quote_identifier(table_name),
         cols
     )
+}
+
+fn render_create_index_terms_sql(index: &IndexSchema) -> String {
+    let term_count = index.key_term_count();
+    (0..term_count)
+        .filter_map(|i| {
+            let mut term = if index.key_expressions.is_empty() {
+                quote_identifier(index.columns.get(i)?)
+            } else {
+                index.key_expressions.get(i)?.clone()
+            };
+            let expression_declares_collation =
+                !index.key_expressions.is_empty() && term_has_unquoted_collation_keyword(&term);
+            if !expression_declares_collation
+                && let Some(collation) = index.key_collations.get(i).and_then(|c| c.as_deref())
+            {
+                term.push_str(" COLLATE ");
+                term.push_str(&quote_identifier(collation));
+            }
+            match index.key_sort_directions.get(i).copied() {
+                Some(SortDirection::Asc) => term.push_str(" ASC"),
+                Some(SortDirection::Desc) => term.push_str(" DESC"),
+                None => {}
+            }
+            Some(term)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn term_has_unquoted_collation_keyword(term: &str) -> bool {
+    collect_unquoted_sql_tokens(term)
+        .into_iter()
+        .any(|token| token.eq_ignore_ascii_case("COLLATE"))
+}
+
+fn collect_unquoted_sql_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' | '"' | '`' => {
+                push_sql_token(&mut tokens, &mut current);
+                skip_quoted_sql_chars(&mut chars, ch);
+            }
+            '[' => {
+                push_sql_token(&mut tokens, &mut current);
+                skip_bracket_sql_identifier_chars(&mut chars);
+            }
+            '-' if chars.peek().is_some_and(|next| *next == '-') => {
+                let _ = chars.next();
+                push_sql_token(&mut tokens, &mut current);
+                skip_line_sql_comment_chars(&mut chars);
+            }
+            '/' if chars.peek().is_some_and(|next| *next == '*') => {
+                let _ = chars.next();
+                push_sql_token(&mut tokens, &mut current);
+                skip_block_sql_comment_chars(&mut chars);
+            }
+            _ if ch.is_ascii_alphanumeric() || ch == '_' => current.push(ch),
+            _ => push_sql_token(&mut tokens, &mut current),
+        }
+    }
+    push_sql_token(&mut tokens, &mut current);
+    tokens
+}
+
+fn push_sql_token(tokens: &mut Vec<String>, current: &mut String) {
+    if current.is_empty() {
+        return;
+    }
+    tokens.push(std::mem::take(current));
+}
+
+fn skip_quoted_sql_chars(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, quote: char) {
+    while let Some(ch) = chars.next() {
+        if ch == quote {
+            if chars.peek().is_some_and(|next| *next == quote) {
+                let _ = chars.next();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+fn skip_bracket_sql_identifier_chars(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(ch) = chars.next() {
+        if ch == ']' {
+            if chars.peek().is_some_and(|next| *next == ']') {
+                let _ = chars.next();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+fn skip_line_sql_comment_chars(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    for ch in chars.by_ref() {
+        if ch == '\n' || ch == '\r' {
+            break;
+        }
+    }
+}
+
+fn skip_block_sql_comment_chars(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    let mut previous = '\0';
+    for ch in chars.by_ref() {
+        if previous == '*' && ch == '/' {
+            break;
+        }
+        previous = ch;
+    }
 }
 
 /// Check whether a `SelectCore` references a named table/CTE in any FROM source.
@@ -59277,6 +61311,19 @@ fn qualified_relation_name(name: &QualifiedName) -> Option<&str> {
         Some(schema) if is_builtin_schema(schema) => Some(&name.name),
         Some(_) => None,
     }
+}
+
+fn qualified_relation_matches_name(name: &QualifiedName, target: &str) -> bool {
+    qualified_relation_name(name).is_some_and(|local_name| local_name.eq_ignore_ascii_case(target))
+}
+
+fn qualified_relation_matches_unhidden_name(
+    name: &QualifiedName,
+    target: &str,
+    hidden_tables: &HashSet<String>,
+) -> bool {
+    qualified_relation_matches_name(name, target)
+        && !(name.schema.is_none() && hidden_tables.contains(&target.to_ascii_lowercase()))
 }
 
 /// Check whether the subquery's FROM clause references an unmaterialized view.
@@ -61103,13 +63150,13 @@ fn subquery_references_table(subquery: &SelectStatement, table_name: &str) -> bo
     } = &subquery.body.select
     {
         if let TableOrSubquery::Table { name, .. } = &from.source {
-            if name.name.eq_ignore_ascii_case(table_name) {
+            if qualified_relation_matches_name(name, table_name) {
                 return true;
             }
         }
         for join in &from.joins {
             if let TableOrSubquery::Table { name, .. } = &join.table {
-                if name.name.eq_ignore_ascii_case(table_name) {
+                if qualified_relation_matches_name(name, table_name) {
                     return true;
                 }
             }
@@ -63650,7 +65697,7 @@ fn implicit_index_definitions_from_create_table_sql(
         if has_unique_constraint && !is_ipk {
             definitions.push(ReconstructedIndexDefinition {
                 columns: vec![column.name.clone()],
-                key_expressions: vec![column.name.clone()],
+                key_expressions: Vec::new(),
                 key_sort_directions: vec![SortDirection::Asc],
                 key_collations: vec![column_def_declared_collation(column)],
                 where_clause: None,
@@ -63667,24 +65714,24 @@ fn implicit_index_definitions_from_create_table_sql(
             columns: idx_cols, ..
         } = constraint.kind
         {
-            let key_expressions = idx_cols
-                .iter()
-                .map(|indexed| indexed.expr.to_string())
-                .collect::<Vec<_>>();
-            if !key_expressions.is_empty() {
-                let normalized =
-                    collect_effective_index_terms_for_column_defs(&idx_cols, &column_defs);
+            if let Some(normalized) =
+                collect_effective_index_terms_for_column_defs(&idx_cols, &column_defs)
+                && !normalized.is_empty()
+            {
                 definitions.push(ReconstructedIndexDefinition {
-                    columns: extract_simple_index_columns(&idx_cols),
-                    key_expressions,
-                    key_sort_directions: idx_cols
+                    columns: normalized
                         .iter()
-                        .map(|indexed| indexed.direction.unwrap_or(SortDirection::Asc))
+                        .map(|term| term.column_name.clone())
+                        .collect(),
+                    key_expressions: Vec::new(),
+                    key_sort_directions: normalized
+                        .iter()
+                        .map(|term| term.direction.unwrap_or(SortDirection::Asc))
                         .collect(),
                     key_collations: normalized
-                        .as_ref()
-                        .map(|terms| terms.iter().map(|t| t.collation.clone()).collect())
-                        .unwrap_or_default(),
+                        .iter()
+                        .map(|term| term.collation.clone())
+                        .collect(),
                     where_clause: None,
                     is_unique: true,
                 });
@@ -63699,14 +65746,18 @@ fn index_definition_from_create_index_statement(
     stmt: &fsqlite_ast::CreateIndexStatement,
     table_columns: Option<&[ColumnInfo]>,
 ) -> Option<ReconstructedIndexDefinition> {
-    let key_expressions = stmt
-        .columns
-        .iter()
-        .map(|indexed| indexed.expr.to_string())
-        .collect::<Vec<_>>();
-    if key_expressions.is_empty() {
+    if stmt.columns.is_empty() {
         return None;
     }
+    let simple_columns = extract_simple_index_columns(&stmt.columns);
+    let key_expressions = if simple_columns.len() == stmt.columns.len() {
+        Vec::new()
+    } else {
+        stmt.columns
+            .iter()
+            .map(|indexed| indexed.expr.to_string())
+            .collect::<Vec<_>>()
+    };
     let normalized_terms = table_columns
         .map(|columns| collect_effective_index_terms_for_column_infos(&stmt.columns, columns))
         .unwrap_or_else(|| {
@@ -63716,7 +65767,7 @@ fn index_definition_from_create_index_statement(
                 .collect()
         });
     Some(ReconstructedIndexDefinition {
-        columns: extract_simple_index_columns(&stmt.columns),
+        columns: simple_columns,
         key_expressions,
         key_sort_directions: stmt
             .columns
@@ -63727,8 +65778,9 @@ fn index_definition_from_create_index_statement(
             .as_ref()
             .map(|terms| terms.iter().map(|t| t.collation.clone()).collect())
             .unwrap_or_else(|| {
-                // Expression index: extract collations directly from indexed
-                // columns (explicit COLLATE on the indexed term, if any).
+                // Expression or mixed index: keep collations that the parser
+                // stores on `IndexedColumn`; collations parsed into `Expr::Collate`
+                // stay in the expression SQL and are rendered from there.
                 stmt.columns.iter().map(|ic| ic.collation.clone()).collect()
             }),
         where_clause: stmt.where_clause.as_ref().map(ToString::to_string),
@@ -63807,6 +65859,4391 @@ fn collect_effective_index_terms_for_column_infos(
             Some(term)
         })
         .collect()
+}
+
+fn rename_fk_parent_table(fk: &mut FkDef, old: &str, new: &str) -> bool {
+    if !fk.parent_table.eq_ignore_ascii_case(old) {
+        return false;
+    }
+    fk.parent_table.clear();
+    fk.parent_table.push_str(new);
+    true
+}
+
+fn rename_fk_parent_columns(fk: &mut FkDef, parent_table: &str, old: &str, new: &str) -> bool {
+    if !fk.parent_table.eq_ignore_ascii_case(parent_table) {
+        return false;
+    }
+    fk.parent_columns.iter_mut().fold(false, |changed, column| {
+        if column.eq_ignore_ascii_case(old) {
+            column.clear();
+            column.push_str(new);
+            true
+        } else {
+            changed
+        }
+    })
+}
+
+fn schema_table_index_or_view_name_exists(
+    schema: &[TableSchema],
+    views: &[ViewDef],
+    name: &str,
+) -> bool {
+    schema.iter().any(|table| {
+        table.name.eq_ignore_ascii_case(name)
+            || table
+                .indexes
+                .iter()
+                .any(|index| index.name.eq_ignore_ascii_case(name))
+    }) || views
+        .iter()
+        .any(|view| view.name.eq_ignore_ascii_case(name))
+}
+
+fn render_create_view_sql(view: &ViewDef) -> String {
+    fsqlite_ast::CreateViewStatement {
+        if_not_exists: false,
+        temporary: false,
+        name: QualifiedName::bare(view.name.clone()),
+        columns: view.columns.clone(),
+        query: view.query.clone(),
+    }
+    .to_string()
+}
+
+fn render_create_trigger_sql(trigger: &TriggerDef) -> String {
+    fsqlite_ast::CreateTriggerStatement {
+        if_not_exists: false,
+        temporary: trigger.temporary,
+        name: QualifiedName::bare(trigger.name.clone()),
+        timing: trigger.timing,
+        event: trigger.event.clone(),
+        table: trigger.table_name.clone(),
+        for_each_row: trigger.for_each_row,
+        when: trigger.when_clause.clone(),
+        body: trigger.body.clone(),
+    }
+    .to_string()
+}
+
+#[derive(Default)]
+struct TableRenameScope {
+    changed: bool,
+    renamed_unaliased_source: bool,
+    old_alias_present: bool,
+}
+
+impl TableRenameScope {
+    fn merge(&mut self, other: Self) {
+        self.changed |= other.changed;
+        self.renamed_unaliased_source |= other.renamed_unaliased_source;
+        self.old_alias_present |= other.old_alias_present;
+    }
+
+    const fn should_rename_qualifiers(&self) -> bool {
+        self.renamed_unaliased_source && !self.old_alias_present
+    }
+}
+
+fn rename_table_refs_in_statement(statement: &mut Statement, old: &str, new: &str) -> bool {
+    let mut changed = false;
+    match statement {
+        Statement::Select(select) => rename_table_refs_in_select(select, old, new),
+        Statement::Insert(insert) => rename_table_refs_in_insert_statement(insert, old, new),
+        Statement::Update(update) => rename_table_refs_in_update_statement(update, old, new),
+        Statement::Delete(delete) => rename_table_refs_in_delete_statement(delete, old, new),
+        Statement::Explain { stmt, .. } => rename_table_refs_in_statement(stmt, old, new),
+        Statement::Reindex(Some(name)) | Statement::Analyze(Some(name)) => {
+            rename_qualified_table_name(name, old, new, &HashSet::new())
+        }
+        Statement::CreateView(view) => rename_table_refs_in_select(&mut view.query, old, new),
+        Statement::CreateIndex(index) => {
+            if index.table.eq_ignore_ascii_case(old) {
+                index.table.clear();
+                index.table.push_str(new);
+                changed = true;
+            }
+            for column in &mut index.columns {
+                changed |=
+                    rename_table_refs_in_expr(&mut column.expr, old, new, &HashSet::new(), false);
+            }
+            if let Some(where_clause) = &mut index.where_clause {
+                changed |=
+                    rename_table_refs_in_expr(where_clause, old, new, &HashSet::new(), false);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn rename_table_refs_in_select(select: &mut SelectStatement, old: &str, new: &str) -> bool {
+    rename_table_refs_in_select_with_hidden(select, old, new, &HashSet::new())
+}
+
+fn rename_table_refs_in_select_with_hidden(
+    select: &mut SelectStatement,
+    old: &str,
+    new: &str,
+    hidden_tables: &HashSet<String>,
+) -> bool {
+    let mut changed = false;
+    let scoped_hidden = if let Some(with) = &mut select.with {
+        let (with_changed, hidden) =
+            rename_table_refs_in_with_clause(with, old, new, hidden_tables);
+        changed |= with_changed;
+        hidden
+    } else {
+        hidden_tables.clone()
+    };
+
+    let mut body_scope =
+        rename_table_refs_in_select_core(&mut select.body.select, old, new, &scoped_hidden);
+    for (_, core) in &mut select.body.compounds {
+        body_scope.merge(rename_table_refs_in_select_core(
+            core,
+            old,
+            new,
+            &scoped_hidden,
+        ));
+    }
+    changed |= body_scope.changed;
+    let rename_qualifiers = body_scope.should_rename_qualifiers();
+    for term in &mut select.order_by {
+        changed |=
+            rename_table_refs_in_expr(&mut term.expr, old, new, &scoped_hidden, rename_qualifiers);
+    }
+    if let Some(limit) = &mut select.limit {
+        changed |= rename_table_refs_in_expr(
+            &mut limit.limit,
+            old,
+            new,
+            &scoped_hidden,
+            rename_qualifiers,
+        );
+        if let Some(offset) = &mut limit.offset {
+            changed |=
+                rename_table_refs_in_expr(offset, old, new, &scoped_hidden, rename_qualifiers);
+        }
+    }
+    changed
+}
+
+fn rename_table_refs_in_with_clause(
+    with: &mut fsqlite_ast::WithClause,
+    old: &str,
+    new: &str,
+    hidden_tables: &HashSet<String>,
+) -> (bool, HashSet<String>) {
+    let mut changed = false;
+    let mut scoped_hidden = hidden_tables.clone();
+    scoped_hidden.extend(with.ctes.iter().map(|cte| cte.name.to_ascii_lowercase()));
+    for cte in &mut with.ctes {
+        changed |=
+            rename_table_refs_in_select_with_hidden(&mut cte.query, old, new, &scoped_hidden);
+    }
+    (changed, scoped_hidden)
+}
+
+fn rename_table_refs_in_insert_statement(
+    insert: &mut InsertStatement,
+    old: &str,
+    new: &str,
+) -> bool {
+    let old_alias_present = insert
+        .alias
+        .as_deref()
+        .is_some_and(|alias| alias.eq_ignore_ascii_case(old));
+    let renamed_target = rename_qualified_table_name(&mut insert.table, old, new, &HashSet::new());
+    let mut changed = renamed_target;
+    let hidden_tables = if let Some(with) = &mut insert.with {
+        let (with_changed, hidden) =
+            rename_table_refs_in_with_clause(with, old, new, &HashSet::new());
+        changed |= with_changed;
+        hidden
+    } else {
+        HashSet::new()
+    };
+    match &mut insert.source {
+        InsertSource::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    changed |= rename_table_refs_in_expr(expr, old, new, &hidden_tables, false);
+                }
+            }
+        }
+        InsertSource::Select(select) => {
+            changed |= rename_table_refs_in_select_with_hidden(select, old, new, &hidden_tables);
+        }
+        InsertSource::DefaultValues => {}
+    }
+    for upsert in &mut insert.upsert {
+        if let Some(target) = &mut upsert.target {
+            for column in &mut target.columns {
+                changed |=
+                    rename_table_refs_in_expr(&mut column.expr, old, new, &hidden_tables, false);
+            }
+            if let Some(where_clause) = &mut target.where_clause {
+                changed |= rename_table_refs_in_expr(where_clause, old, new, &hidden_tables, false);
+            }
+        }
+        if let UpsertAction::Update {
+            assignments,
+            where_clause,
+        } = &mut upsert.action
+        {
+            let rename_target_qualifiers = renamed_target && !old_alias_present;
+            for assignment in assignments {
+                changed |= rename_table_refs_in_expr(
+                    &mut assignment.value,
+                    old,
+                    new,
+                    &hidden_tables,
+                    rename_target_qualifiers,
+                );
+            }
+            if let Some(where_clause) = where_clause {
+                changed |= rename_table_refs_in_expr(
+                    where_clause,
+                    old,
+                    new,
+                    &hidden_tables,
+                    rename_target_qualifiers,
+                );
+            }
+        }
+    }
+    let rename_target_qualifiers = renamed_target && !old_alias_present;
+    for column in &mut insert.returning {
+        changed |= rename_table_refs_in_result_column(
+            column,
+            old,
+            new,
+            &hidden_tables,
+            rename_target_qualifiers,
+        );
+    }
+    changed
+}
+
+fn rename_table_refs_in_update_statement(
+    update: &mut fsqlite_ast::UpdateStatement,
+    old: &str,
+    new: &str,
+) -> bool {
+    let mut changed = false;
+    let hidden_tables = if let Some(with) = &mut update.with {
+        let (with_changed, hidden) =
+            rename_table_refs_in_with_clause(with, old, new, &HashSet::new());
+        changed |= with_changed;
+        hidden
+    } else {
+        HashSet::new()
+    };
+    let mut scope = rename_table_refs_in_qualified_table_ref(&mut update.table, old, new);
+    if let Some(from_clause) = &mut update.from {
+        scope.merge(rename_table_refs_in_table_or_subquery(
+            &mut from_clause.source,
+            old,
+            new,
+            &hidden_tables,
+        ));
+        for join in &mut from_clause.joins {
+            scope.merge(rename_table_refs_in_table_or_subquery(
+                &mut join.table,
+                old,
+                new,
+                &hidden_tables,
+            ));
+        }
+        let rename_qualifiers = scope.should_rename_qualifiers();
+        for join in &mut from_clause.joins {
+            if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+                scope.changed |=
+                    rename_table_refs_in_expr(expr, old, new, &hidden_tables, rename_qualifiers);
+            }
+        }
+    }
+    changed |= scope.changed;
+    let rename_qualifiers = scope.should_rename_qualifiers();
+    for assignment in &mut update.assignments {
+        changed |= rename_table_refs_in_expr(
+            &mut assignment.value,
+            old,
+            new,
+            &hidden_tables,
+            rename_qualifiers,
+        );
+    }
+    if let Some(where_expr) = &mut update.where_clause {
+        changed |=
+            rename_table_refs_in_expr(where_expr, old, new, &hidden_tables, rename_qualifiers);
+    }
+    for column in &mut update.returning {
+        changed |=
+            rename_table_refs_in_result_column(column, old, new, &hidden_tables, rename_qualifiers);
+    }
+    for term in &mut update.order_by {
+        changed |=
+            rename_table_refs_in_expr(&mut term.expr, old, new, &hidden_tables, rename_qualifiers);
+    }
+    if let Some(limit) = &mut update.limit {
+        changed |= rename_table_refs_in_expr(
+            &mut limit.limit,
+            old,
+            new,
+            &hidden_tables,
+            rename_qualifiers,
+        );
+        if let Some(offset) = &mut limit.offset {
+            changed |=
+                rename_table_refs_in_expr(offset, old, new, &hidden_tables, rename_qualifiers);
+        }
+    }
+    changed
+}
+
+fn rename_table_refs_in_delete_statement(
+    delete: &mut fsqlite_ast::DeleteStatement,
+    old: &str,
+    new: &str,
+) -> bool {
+    let mut changed = false;
+    let hidden_tables = if let Some(with) = &mut delete.with {
+        let (with_changed, hidden) =
+            rename_table_refs_in_with_clause(with, old, new, &HashSet::new());
+        changed |= with_changed;
+        hidden
+    } else {
+        HashSet::new()
+    };
+    let scope = rename_table_refs_in_qualified_table_ref(&mut delete.table, old, new);
+    changed |= scope.changed;
+    let rename_qualifiers = scope.should_rename_qualifiers();
+    if let Some(where_expr) = &mut delete.where_clause {
+        changed |=
+            rename_table_refs_in_expr(where_expr, old, new, &hidden_tables, rename_qualifiers);
+    }
+    for column in &mut delete.returning {
+        changed |=
+            rename_table_refs_in_result_column(column, old, new, &hidden_tables, rename_qualifiers);
+    }
+    for term in &mut delete.order_by {
+        changed |=
+            rename_table_refs_in_expr(&mut term.expr, old, new, &hidden_tables, rename_qualifiers);
+    }
+    if let Some(limit) = &mut delete.limit {
+        changed |= rename_table_refs_in_expr(
+            &mut limit.limit,
+            old,
+            new,
+            &hidden_tables,
+            rename_qualifiers,
+        );
+        if let Some(offset) = &mut limit.offset {
+            changed |=
+                rename_table_refs_in_expr(offset, old, new, &hidden_tables, rename_qualifiers);
+        }
+    }
+    changed
+}
+
+fn rename_table_refs_in_select_core(
+    core: &mut SelectCore,
+    old: &str,
+    new: &str,
+    hidden_tables: &HashSet<String>,
+) -> TableRenameScope {
+    match core {
+        SelectCore::Values(rows) => {
+            let mut scope = TableRenameScope::default();
+            for row in rows {
+                for expr in row {
+                    scope.changed |=
+                        rename_table_refs_in_expr(expr, old, new, hidden_tables, false);
+                }
+            }
+            scope
+        }
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            let mut scope = TableRenameScope::default();
+            if let Some(from_clause) = from {
+                scope.merge(rename_table_refs_in_table_or_subquery(
+                    &mut from_clause.source,
+                    old,
+                    new,
+                    hidden_tables,
+                ));
+                for join in &mut from_clause.joins {
+                    scope.merge(rename_table_refs_in_table_or_subquery(
+                        &mut join.table,
+                        old,
+                        new,
+                        hidden_tables,
+                    ));
+                }
+                let rename_qualifiers = scope.should_rename_qualifiers();
+                for join in &mut from_clause.joins {
+                    if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+                        scope.changed |= rename_table_refs_in_expr(
+                            expr,
+                            old,
+                            new,
+                            hidden_tables,
+                            rename_qualifiers,
+                        );
+                    }
+                }
+            }
+            let rename_qualifiers = scope.should_rename_qualifiers();
+            for column in columns {
+                scope.changed |= rename_table_refs_in_result_column(
+                    column,
+                    old,
+                    new,
+                    hidden_tables,
+                    rename_qualifiers,
+                );
+            }
+            if let Some(expr) = where_clause {
+                scope.changed |=
+                    rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers);
+            }
+            for expr in group_by {
+                scope.changed |=
+                    rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers);
+            }
+            if let Some(expr) = having {
+                scope.changed |=
+                    rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers);
+            }
+            for window in windows {
+                scope.changed |= rename_table_refs_in_window_spec(
+                    &mut window.spec,
+                    old,
+                    new,
+                    hidden_tables,
+                    rename_qualifiers,
+                );
+            }
+            scope
+        }
+    }
+}
+
+fn rename_table_refs_in_table_or_subquery(
+    source: &mut TableOrSubquery,
+    old: &str,
+    new: &str,
+    hidden_tables: &HashSet<String>,
+) -> TableRenameScope {
+    let mut scope = TableRenameScope::default();
+    match source {
+        TableOrSubquery::Table { name, alias, .. } => {
+            scope.old_alias_present = alias
+                .as_deref()
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(old));
+            if rename_qualified_table_name(name, old, new, hidden_tables) {
+                scope.changed = true;
+                scope.renamed_unaliased_source = alias.is_none();
+            }
+        }
+        TableOrSubquery::Subquery { query, alias } => {
+            scope.changed |=
+                rename_table_refs_in_select_with_hidden(query, old, new, hidden_tables);
+            scope.old_alias_present = alias
+                .as_deref()
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(old));
+        }
+        TableOrSubquery::TableFunction { args, alias, .. } => {
+            for expr in args {
+                scope.changed |= rename_table_refs_in_expr(expr, old, new, hidden_tables, false);
+            }
+            scope.old_alias_present = alias
+                .as_deref()
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(old));
+        }
+        TableOrSubquery::ParenJoin(from_clause) => {
+            scope.merge(rename_table_refs_in_table_or_subquery(
+                &mut from_clause.source,
+                old,
+                new,
+                hidden_tables,
+            ));
+            for join in &mut from_clause.joins {
+                scope.merge(rename_table_refs_in_table_or_subquery(
+                    &mut join.table,
+                    old,
+                    new,
+                    hidden_tables,
+                ));
+            }
+            let rename_qualifiers = scope.should_rename_qualifiers();
+            for join in &mut from_clause.joins {
+                if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+                    scope.changed |=
+                        rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers);
+                }
+            }
+        }
+    }
+    scope
+}
+
+fn rename_table_refs_in_qualified_table_ref(
+    table: &mut fsqlite_ast::QualifiedTableRef,
+    old: &str,
+    new: &str,
+) -> TableRenameScope {
+    let mut scope = TableRenameScope {
+        old_alias_present: table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case(old)),
+        ..TableRenameScope::default()
+    };
+    if rename_qualified_table_name(&mut table.name, old, new, &HashSet::new()) {
+        scope.changed = true;
+        scope.renamed_unaliased_source = table.alias.is_none();
+    }
+    scope
+}
+
+fn rename_qualified_table_name(
+    name: &mut QualifiedName,
+    old: &str,
+    new: &str,
+    hidden_tables: &HashSet<String>,
+) -> bool {
+    if !qualified_relation_matches_unhidden_name(name, old, hidden_tables) {
+        return false;
+    }
+    name.name.clear();
+    name.name.push_str(new);
+    true
+}
+
+fn rename_table_refs_in_result_column(
+    column: &mut ResultColumn,
+    old: &str,
+    new: &str,
+    hidden_tables: &HashSet<String>,
+    rename_qualifiers: bool,
+) -> bool {
+    match column {
+        ResultColumn::Expr { expr, .. } => {
+            rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers)
+        }
+        ResultColumn::TableStar(name) if rename_qualifiers => {
+            rename_qualified_table_name(name, old, new, hidden_tables)
+        }
+        ResultColumn::Star | ResultColumn::TableStar(_) => false,
+    }
+}
+
+fn rename_table_refs_in_expr(
+    expr: &mut Expr,
+    old: &str,
+    new: &str,
+    hidden_tables: &HashSet<String>,
+    rename_qualifiers: bool,
+) -> bool {
+    match expr {
+        Expr::Literal(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => false,
+        Expr::Column(col_ref, _) => {
+            if rename_qualifiers
+                && col_ref
+                    .table
+                    .as_deref()
+                    .is_some_and(|table| table.eq_ignore_ascii_case(old))
+            {
+                col_ref.table = Some(Arc::from(new));
+                true
+            } else {
+                false
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rename_table_refs_in_expr(left, old, new, hidden_tables, rename_qualifiers)
+                | rename_table_refs_in_expr(right, old, new, hidden_tables, rename_qualifiers)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => {
+            rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers)
+                | rename_table_refs_in_expr(low, old, new, hidden_tables, rename_qualifiers)
+                | rename_table_refs_in_expr(high, old, new, hidden_tables, rename_qualifiers)
+        }
+        Expr::In { expr, set, .. } => {
+            let expr_changed =
+                rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers);
+            let set_changed = match set {
+                InSet::List(values) => values.iter_mut().fold(false, |changed, value| {
+                    rename_table_refs_in_expr(value, old, new, hidden_tables, rename_qualifiers)
+                        | changed
+                }),
+                InSet::Subquery(query) => {
+                    rename_table_refs_in_select_with_hidden(query, old, new, hidden_tables)
+                }
+                InSet::Table(name) => rename_qualified_table_name(name, old, new, hidden_tables),
+            };
+            expr_changed | set_changed
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers)
+                | rename_table_refs_in_expr(pattern, old, new, hidden_tables, rename_qualifiers)
+                | escape.as_deref_mut().is_some_and(|expr| {
+                    rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers)
+                })
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            let operand_changed = operand.as_deref_mut().is_some_and(|expr| {
+                rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers)
+            });
+            let whens_changed = whens.iter_mut().fold(false, |changed, (when, then)| {
+                changed
+                    | rename_table_refs_in_expr(when, old, new, hidden_tables, rename_qualifiers)
+                    | rename_table_refs_in_expr(then, old, new, hidden_tables, rename_qualifiers)
+            });
+            let else_changed = else_expr.as_deref_mut().is_some_and(|expr| {
+                rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers)
+            });
+            operand_changed | whens_changed | else_changed
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+            rename_table_refs_in_select_with_hidden(subquery, old, new, hidden_tables)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            let args_changed = match args {
+                FunctionArgs::List(args) => args.iter_mut().fold(false, |changed, arg| {
+                    rename_table_refs_in_expr(arg, old, new, hidden_tables, rename_qualifiers)
+                        | changed
+                }),
+                FunctionArgs::Star => false,
+            };
+            let order_changed = order_by.iter_mut().fold(false, |changed, term| {
+                rename_table_refs_in_expr(
+                    &mut term.expr,
+                    old,
+                    new,
+                    hidden_tables,
+                    rename_qualifiers,
+                ) | changed
+            });
+            let filter_changed = filter.as_deref_mut().is_some_and(|expr| {
+                rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers)
+            });
+            let over_changed = over.as_mut().is_some_and(|window| {
+                rename_table_refs_in_window_spec(window, old, new, hidden_tables, rename_qualifiers)
+            });
+            args_changed | order_changed | filter_changed | over_changed
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers)
+                | rename_table_refs_in_expr(path, old, new, hidden_tables, rename_qualifiers)
+        }
+        Expr::RowValue(values, _) => values.iter_mut().fold(false, |changed, value| {
+            rename_table_refs_in_expr(value, old, new, hidden_tables, rename_qualifiers) | changed
+        }),
+    }
+}
+
+fn rename_table_refs_in_window_spec(
+    window: &mut WindowSpec,
+    old: &str,
+    new: &str,
+    hidden_tables: &HashSet<String>,
+    rename_qualifiers: bool,
+) -> bool {
+    let partition_changed = window.partition_by.iter_mut().fold(false, |changed, expr| {
+        rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers) | changed
+    });
+    let order_changed = window.order_by.iter_mut().fold(false, |changed, term| {
+        rename_table_refs_in_expr(&mut term.expr, old, new, hidden_tables, rename_qualifiers)
+            | changed
+    });
+    let frame_changed = window.frame.as_mut().is_some_and(|frame| {
+        rename_table_refs_in_frame_spec(frame, old, new, hidden_tables, rename_qualifiers)
+    });
+    partition_changed | order_changed | frame_changed
+}
+
+fn rename_table_refs_in_frame_spec(
+    frame: &mut FrameSpec,
+    old: &str,
+    new: &str,
+    hidden_tables: &HashSet<String>,
+    rename_qualifiers: bool,
+) -> bool {
+    rename_table_refs_in_frame_bound(&mut frame.start, old, new, hidden_tables, rename_qualifiers)
+        | frame.end.as_mut().is_some_and(|bound| {
+            rename_table_refs_in_frame_bound(bound, old, new, hidden_tables, rename_qualifiers)
+        })
+}
+
+fn rename_table_refs_in_frame_bound(
+    bound: &mut FrameBound,
+    old: &str,
+    new: &str,
+    hidden_tables: &HashSet<String>,
+    rename_qualifiers: bool,
+) -> bool {
+    match bound {
+        FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
+            rename_table_refs_in_expr(expr, old, new, hidden_tables, rename_qualifiers)
+        }
+        FrameBound::UnboundedPreceding
+        | FrameBound::CurrentRow
+        | FrameBound::UnboundedFollowing => false,
+    }
+}
+
+fn rename_column_refs_in_expr_sql(expr_sql: &str, old: &str, new: &str) -> Result<Option<String>> {
+    let mut expr = fsqlite_parser::expr::parse_expr(expr_sql).map_err(|err| {
+        FrankenError::Internal(format!(
+            "failed to parse schema expression `{expr_sql}` during column rename: {err}"
+        ))
+    })?;
+    if rename_column_refs_in_expr(&mut expr, old, new) {
+        Ok(Some(expr.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn rename_column_refs_in_stored_expr_sql(
+    expr_sql: &mut String,
+    old: &str,
+    new: &str,
+) -> Result<()> {
+    if let Some(renamed) = rename_column_refs_in_expr_sql(expr_sql, old, new)? {
+        *expr_sql = renamed;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct ColumnRenameOutputStatus {
+    exposes_old: bool,
+    exposes_renamed: bool,
+}
+
+impl ColumnRenameOutputStatus {
+    fn old() -> Self {
+        Self {
+            exposes_old: true,
+            exposes_renamed: false,
+        }
+    }
+
+    fn renamed() -> Self {
+        Self {
+            exposes_old: false,
+            exposes_renamed: true,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.exposes_old |= other.exposes_old;
+        self.exposes_renamed |= other.exposes_renamed;
+    }
+}
+
+#[derive(Default)]
+struct ColumnRenameOutputSources {
+    all: ColumnRenameOutputStatus,
+    by_binding: HashMap<String, ColumnRenameOutputStatus>,
+}
+
+impl ColumnRenameOutputSources {
+    fn add_source(&mut self, binding: Option<&str>, status: ColumnRenameOutputStatus) {
+        self.all.merge(status);
+        if let Some(binding) = binding {
+            self.by_binding
+                .entry(binding.to_ascii_lowercase())
+                .or_default()
+                .merge(status);
+        }
+    }
+
+    fn status_for_binding(&self, binding: &str) -> ColumnRenameOutputStatus {
+        self.by_binding
+            .get(&binding.to_ascii_lowercase())
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+struct ColumnRenameSourceCatalog {
+    renamed_table: String,
+    known_tables: HashSet<String>,
+    tables_with_old_column: HashSet<String>,
+    view_outputs: HashMap<String, ColumnRenameOutputStatus>,
+}
+
+impl ColumnRenameSourceCatalog {
+    fn set_view_output_status(
+        &mut self,
+        view_name: &str,
+        status: ColumnRenameOutputStatus,
+    ) -> bool {
+        self.view_outputs
+            .insert(view_name.to_ascii_lowercase(), status)
+            != Some(status)
+    }
+
+    fn table_may_expose_old_column(
+        &self,
+        name: &QualifiedName,
+        hidden_tables: &HashSet<String>,
+    ) -> bool {
+        let Some(local_name) = qualified_relation_name(name) else {
+            return true;
+        };
+        let key = local_name.to_ascii_lowercase();
+        if name.schema.is_none() && hidden_tables.contains(&key) {
+            return hidden_tables.contains(&hidden_old_column_marker(&key));
+        }
+        if let Some(status) = self.view_outputs.get(&key) {
+            return status.exposes_old;
+        }
+        self.tables_with_old_column.contains(&key) || !self.known_tables.contains(&key)
+    }
+
+    fn table_outputs_renamed_column(
+        &self,
+        name: &QualifiedName,
+        hidden_tables: &HashSet<String>,
+    ) -> bool {
+        let Some(local_name) = qualified_relation_name(name) else {
+            return false;
+        };
+        let key = local_name.to_ascii_lowercase();
+        if name.schema.is_none() && hidden_tables.contains(&key) {
+            return hidden_tables.contains(&hidden_renamed_column_marker(&key));
+        }
+        self.view_outputs
+            .get(&key)
+            .is_some_and(|status| status.exposes_renamed)
+    }
+
+    fn table_output_status_after_column_rename(
+        &self,
+        name: &QualifiedName,
+        hidden_tables: &HashSet<String>,
+    ) -> ColumnRenameOutputStatus {
+        let Some(local_name) = qualified_relation_name(name) else {
+            return ColumnRenameOutputStatus::old();
+        };
+        let key = local_name.to_ascii_lowercase();
+        if name.schema.is_none() && hidden_tables.contains(&key) {
+            let mut status = ColumnRenameOutputStatus::default();
+            if hidden_tables.contains(&hidden_old_column_marker(&key)) {
+                status.merge(ColumnRenameOutputStatus::old());
+            }
+            if hidden_tables.contains(&hidden_renamed_column_marker(&key)) {
+                status.merge(ColumnRenameOutputStatus::renamed());
+            }
+            return status;
+        }
+        if let Some(status) = self.view_outputs.get(&key) {
+            return *status;
+        }
+        if key == self.renamed_table {
+            ColumnRenameOutputStatus::renamed()
+        } else if self.tables_with_old_column.contains(&key) || !self.known_tables.contains(&key) {
+            ColumnRenameOutputStatus::old()
+        } else {
+            ColumnRenameOutputStatus::default()
+        }
+    }
+}
+
+fn hidden_old_column_marker(name: &str) -> String {
+    format!("\0old-column:{name}")
+}
+
+fn hidden_renamed_column_marker(name: &str) -> String {
+    format!("\0renamed-column:{name}")
+}
+
+fn add_hidden_cte_for_column_rename(
+    hidden_tables: &mut HashSet<String>,
+    cte: &fsqlite_ast::Cte,
+    old_column: &str,
+) {
+    let key = cte.name.to_ascii_lowercase();
+    if cte_may_expose_old_column(cte, old_column) {
+        hidden_tables.insert(hidden_old_column_marker(&key));
+    }
+    hidden_tables.insert(key);
+}
+
+fn refresh_hidden_cte_for_column_rename(
+    hidden_tables: &mut HashSet<String>,
+    cte: &fsqlite_ast::Cte,
+    old_column: &str,
+    new_column: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+) {
+    let key = cte.name.to_ascii_lowercase();
+    let old_marker = hidden_old_column_marker(&key);
+    let renamed_marker = hidden_renamed_column_marker(&key);
+    let had_old_marker = hidden_tables.remove(&old_marker);
+    let had_renamed_marker = hidden_tables.remove(&renamed_marker);
+    let output_status =
+        cte_column_rename_output_status(cte, old_column, new_column, hidden_tables, source_catalog);
+    if output_status.exposes_old {
+        hidden_tables.insert(old_marker);
+    }
+    if (had_old_marker || had_renamed_marker) && output_status.exposes_renamed {
+        hidden_tables.insert(renamed_marker);
+    }
+    hidden_tables.insert(key);
+}
+
+fn cte_may_expose_old_column(cte: &fsqlite_ast::Cte, old_column: &str) -> bool {
+    cte_may_expose_column(cte, old_column)
+}
+
+fn cte_may_expose_column(cte: &fsqlite_ast::Cte, column_name: &str) -> bool {
+    if !cte.columns.is_empty() {
+        return cte
+            .columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(column_name));
+    }
+    select_statement_may_output_column(&cte.query, column_name)
+}
+
+fn select_statement_may_output_column(select: &SelectStatement, old_column: &str) -> bool {
+    select_core_may_output_column(&select.body.select, old_column)
+}
+
+fn select_core_may_output_column(core: &SelectCore, old_column: &str) -> bool {
+    let SelectCore::Select { columns, .. } = core else {
+        return false;
+    };
+    columns
+        .iter()
+        .any(|column| result_column_may_output_column(column, old_column))
+}
+
+fn result_column_may_output_column(column: &ResultColumn, old_column: &str) -> bool {
+    match column {
+        ResultColumn::Expr {
+            alias: Some(alias), ..
+        } => alias.eq_ignore_ascii_case(old_column),
+        ResultColumn::Expr { expr, alias: None } => match expr {
+            Expr::Column(col_ref, _) => col_ref.column.eq_ignore_ascii_case(old_column),
+            _ => false,
+        },
+        ResultColumn::Star | ResultColumn::TableStar(_) => true,
+    }
+}
+
+fn cte_column_rename_output_status(
+    cte: &fsqlite_ast::Cte,
+    old_column: &str,
+    new_column: &str,
+    hidden_tables: &HashSet<String>,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> ColumnRenameOutputStatus {
+    if !cte.columns.is_empty() {
+        return if cte
+            .columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(old_column))
+        {
+            ColumnRenameOutputStatus::old()
+        } else {
+            ColumnRenameOutputStatus::default()
+        };
+    }
+    select_column_rename_output_status(
+        &cte.query,
+        old_column,
+        new_column,
+        hidden_tables,
+        source_catalog,
+    )
+}
+
+fn view_column_rename_initial_output_status(
+    view: &ViewDef,
+    old_column: &str,
+) -> ColumnRenameOutputStatus {
+    if !view.columns.is_empty() {
+        return if view
+            .columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(old_column))
+        {
+            ColumnRenameOutputStatus::old()
+        } else {
+            ColumnRenameOutputStatus::default()
+        };
+    }
+    if select_statement_may_output_column(&view.query, old_column) {
+        ColumnRenameOutputStatus::old()
+    } else {
+        ColumnRenameOutputStatus::default()
+    }
+}
+
+fn view_column_rename_output_status(
+    view: &ViewDef,
+    old_column: &str,
+    new_column: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> ColumnRenameOutputStatus {
+    if !view.columns.is_empty() {
+        return if view
+            .columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(old_column))
+        {
+            ColumnRenameOutputStatus::old()
+        } else {
+            ColumnRenameOutputStatus::default()
+        };
+    }
+    select_column_rename_output_status(
+        &view.query,
+        old_column,
+        new_column,
+        &HashSet::new(),
+        source_catalog,
+    )
+}
+
+fn select_column_rename_output_status(
+    select: &SelectStatement,
+    old_column: &str,
+    new_column: &str,
+    hidden_tables: &HashSet<String>,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> ColumnRenameOutputStatus {
+    let mut scoped_hidden = hidden_tables.clone();
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            add_hidden_cte_for_column_rename(&mut scoped_hidden, cte, old_column);
+        }
+        for _ in 0..=with.ctes.len() {
+            let before = scoped_hidden.clone();
+            for cte in &with.ctes {
+                refresh_hidden_cte_for_column_rename(
+                    &mut scoped_hidden,
+                    cte,
+                    old_column,
+                    new_column,
+                    source_catalog,
+                );
+            }
+            if scoped_hidden == before {
+                break;
+            }
+        }
+    }
+    select_core_column_rename_output_status(
+        &select.body.select,
+        old_column,
+        new_column,
+        &scoped_hidden,
+        source_catalog,
+    )
+}
+
+fn select_core_column_rename_output_status(
+    core: &SelectCore,
+    old_column: &str,
+    new_column: &str,
+    hidden_tables: &HashSet<String>,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> ColumnRenameOutputStatus {
+    let SelectCore::Select { columns, from, .. } = core else {
+        return ColumnRenameOutputStatus::default();
+    };
+    let sources = from
+        .as_ref()
+        .map_or_else(ColumnRenameOutputSources::default, |from| {
+            column_rename_output_sources(
+                from,
+                old_column,
+                new_column,
+                hidden_tables,
+                source_catalog,
+            )
+        });
+    columns
+        .iter()
+        .fold(ColumnRenameOutputStatus::default(), |mut status, column| {
+            status.merge(result_column_rename_output_status(
+                column, old_column, new_column, &sources,
+            ));
+            status
+        })
+}
+
+fn result_column_rename_output_status(
+    column: &ResultColumn,
+    old_column: &str,
+    new_column: &str,
+    sources: &ColumnRenameOutputSources,
+) -> ColumnRenameOutputStatus {
+    match column {
+        ResultColumn::Expr {
+            alias: Some(alias), ..
+        } => {
+            if alias.eq_ignore_ascii_case(old_column) {
+                ColumnRenameOutputStatus::old()
+            } else {
+                ColumnRenameOutputStatus::default()
+            }
+        }
+        ResultColumn::Expr { expr, alias: None } => match expr {
+            Expr::Column(col_ref, _) if col_ref.column.eq_ignore_ascii_case(old_column) => {
+                ColumnRenameOutputStatus::old()
+            }
+            Expr::Column(col_ref, _) if col_ref.column.eq_ignore_ascii_case(new_column) => {
+                col_ref.table.as_deref().map_or_else(
+                    || {
+                        if sources.all.exposes_renamed {
+                            ColumnRenameOutputStatus::renamed()
+                        } else {
+                            ColumnRenameOutputStatus::default()
+                        }
+                    },
+                    |table| {
+                        let source_status = sources.status_for_binding(table);
+                        if source_status.exposes_renamed {
+                            ColumnRenameOutputStatus::renamed()
+                        } else {
+                            ColumnRenameOutputStatus::default()
+                        }
+                    },
+                )
+            }
+            _ => ColumnRenameOutputStatus::default(),
+        },
+        ResultColumn::Star => sources.all,
+        ResultColumn::TableStar(name) => sources.status_for_binding(&name.name),
+    }
+}
+
+fn column_rename_output_sources(
+    from: &FromClause,
+    old_column: &str,
+    new_column: &str,
+    hidden_tables: &HashSet<String>,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> ColumnRenameOutputSources {
+    let mut sources = ColumnRenameOutputSources::default();
+    collect_column_rename_output_sources_from_table_or_subquery(
+        &from.source,
+        old_column,
+        new_column,
+        hidden_tables,
+        source_catalog,
+        &mut sources,
+    );
+    for join in &from.joins {
+        collect_column_rename_output_sources_from_table_or_subquery(
+            &join.table,
+            old_column,
+            new_column,
+            hidden_tables,
+            source_catalog,
+            &mut sources,
+        );
+    }
+    sources
+}
+
+fn collect_column_rename_output_sources_from_table_or_subquery(
+    source: &TableOrSubquery,
+    old_column: &str,
+    new_column: &str,
+    hidden_tables: &HashSet<String>,
+    source_catalog: &ColumnRenameSourceCatalog,
+    sources: &mut ColumnRenameOutputSources,
+) {
+    match source {
+        TableOrSubquery::Table { name, alias, .. } => {
+            let status =
+                source_catalog.table_output_status_after_column_rename(name, hidden_tables);
+            sources.add_source(Some(alias.as_deref().unwrap_or(&name.name)), status);
+            if alias.is_none() {
+                sources.add_source(Some(&name.name), status);
+            }
+        }
+        TableOrSubquery::Subquery { query, alias } => {
+            let status = select_column_rename_output_status(
+                query,
+                old_column,
+                new_column,
+                hidden_tables,
+                source_catalog,
+            );
+            sources.add_source(alias.as_deref(), status);
+        }
+        TableOrSubquery::TableFunction { name, alias, .. } => {
+            sources.add_source(
+                Some(alias.as_deref().unwrap_or(name)),
+                ColumnRenameOutputStatus::old(),
+            );
+        }
+        TableOrSubquery::ParenJoin(from_clause) => {
+            collect_column_rename_output_sources_from_table_or_subquery(
+                &from_clause.source,
+                old_column,
+                new_column,
+                hidden_tables,
+                source_catalog,
+                sources,
+            );
+            for join in &from_clause.joins {
+                collect_column_rename_output_sources_from_table_or_subquery(
+                    &join.table,
+                    old_column,
+                    new_column,
+                    hidden_tables,
+                    source_catalog,
+                    sources,
+                );
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ColumnRenameBindings {
+    /// Source aliases/names that refer to the table whose column is being renamed.
+    bindings: HashSet<String>,
+    /// All source aliases/names in this SELECT scope.  Used to prevent an
+    /// inner query source from accidentally capturing an outer correlated
+    /// reference with the same qualifier.
+    source_bindings: HashSet<String>,
+    /// Number of local sources that may expose the old column name.  Known
+    /// tables without the old column do not block correlated outer refs.
+    source_count: usize,
+}
+
+impl ColumnRenameBindings {
+    fn add_source(&mut self) {
+        self.source_count = self.source_count.saturating_add(1);
+    }
+
+    fn add_source_binding(&mut self, binding: &str) {
+        self.source_bindings.insert(binding.to_ascii_lowercase());
+    }
+
+    fn add_source_alias_or_name(&mut self, alias: Option<&str>, name: &str) {
+        self.add_source_binding(alias.unwrap_or(name));
+    }
+
+    fn add_matching_binding(&mut self, binding: &str) {
+        let binding = binding.to_ascii_lowercase();
+        self.source_bindings.insert(binding.clone());
+        self.bindings.insert(binding);
+    }
+
+    fn has_matching_source(&self) -> bool {
+        !self.bindings.is_empty()
+    }
+
+    fn can_rename_unqualified(&self) -> bool {
+        self.has_matching_source() && self.source_count == 1
+    }
+
+    fn table_matches(&self, table: &str) -> bool {
+        self.bindings.contains(&table.to_ascii_lowercase())
+    }
+
+    fn source_binding_shadows(&self, table: &str) -> bool {
+        self.source_bindings.contains(&table.to_ascii_lowercase())
+    }
+
+    fn nested_outer_bindings(&self, outer: &Self) -> Self {
+        let mut merged = self.clone();
+        for binding in &outer.source_bindings {
+            if !self.source_bindings.contains(binding) {
+                merged.source_bindings.insert(binding.clone());
+            }
+        }
+        for binding in &outer.bindings {
+            if !self.source_bindings.contains(binding) {
+                merged.bindings.insert(binding.clone());
+            }
+        }
+        merged.source_count = self.source_count.saturating_add(outer.source_count);
+        merged
+    }
+
+    fn absorb(&mut self, other: Self) {
+        self.bindings.extend(other.bindings);
+        self.source_bindings.extend(other.source_bindings);
+        self.source_count = self.source_count.saturating_add(other.source_count);
+    }
+}
+
+fn rename_column_refs_in_select_for_table(
+    select: &mut SelectStatement,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    rename_column_refs_in_select_for_table_with_hidden(
+        select,
+        table_name,
+        old_column,
+        new_column,
+        &HashSet::new(),
+        source_catalog,
+    )
+}
+
+fn rename_column_refs_in_select_for_table_with_hidden(
+    select: &mut SelectStatement,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    hidden_tables: &HashSet<String>,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    rename_column_refs_in_select_for_table_with_outer(
+        select,
+        table_name,
+        old_column,
+        new_column,
+        hidden_tables,
+        &ColumnRenameBindings::default(),
+        false,
+        source_catalog,
+    )
+}
+
+fn rename_column_refs_in_select_for_table_with_outer(
+    select: &mut SelectStatement,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    hidden_tables: &HashSet<String>,
+    outer_bindings: &ColumnRenameBindings,
+    outer_allow_unqualified: bool,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    let mut changed = false;
+    let scoped_hidden = if let Some(with) = &mut select.with {
+        let (with_changed, hidden) = rename_column_refs_in_with_clause_for_table_with_outer(
+            with,
+            table_name,
+            old_column,
+            new_column,
+            hidden_tables,
+            outer_bindings,
+            outer_allow_unqualified,
+            source_catalog,
+        );
+        changed |= with_changed;
+        hidden
+    } else {
+        hidden_tables.clone()
+    };
+
+    let (first_core_changed, first_core_bindings) =
+        rename_column_refs_in_select_core_for_table_with_outer(
+            &mut select.body.select,
+            table_name,
+            old_column,
+            new_column,
+            &scoped_hidden,
+            outer_bindings,
+            outer_allow_unqualified,
+            source_catalog,
+        );
+    changed |= first_core_changed;
+    let mut top_level_bindings = first_core_bindings.clone();
+    for (_, core) in &mut select.body.compounds {
+        let (core_changed, core_bindings) = rename_column_refs_in_select_core_for_table_with_outer(
+            core,
+            table_name,
+            old_column,
+            new_column,
+            &scoped_hidden,
+            outer_bindings,
+            outer_allow_unqualified,
+            source_catalog,
+        );
+        changed |= core_changed;
+        top_level_bindings.absorb(core_bindings);
+    }
+    let has_compound_cores = !select.body.compounds.is_empty();
+    let top_level_allow_unqualified = if has_compound_cores {
+        first_core_bindings.can_rename_unqualified()
+    } else {
+        top_level_bindings.can_rename_unqualified()
+    };
+    let top_level_order_bindings = if has_compound_cores {
+        &first_core_bindings
+    } else {
+        &top_level_bindings
+    };
+    let top_level_output_aliases = collect_select_core_result_aliases(&select.body.select);
+    changed |= rename_column_refs_in_top_level_ordering_terms_for_table(
+        &mut select.order_by,
+        table_name,
+        old_column,
+        new_column,
+        top_level_order_bindings,
+        top_level_allow_unqualified,
+        &top_level_output_aliases,
+        &scoped_hidden,
+        outer_bindings,
+        outer_allow_unqualified,
+        source_catalog,
+    );
+    if let Some(limit) = &mut select.limit {
+        changed |= rename_column_refs_in_expr_for_table_with_outer(
+            &mut limit.limit,
+            table_name,
+            old_column,
+            new_column,
+            &ColumnRenameBindings::default(),
+            false,
+            &scoped_hidden,
+            outer_bindings,
+            outer_allow_unqualified,
+            source_catalog,
+        );
+        if let Some(offset) = &mut limit.offset {
+            changed |= rename_column_refs_in_expr_for_table_with_outer(
+                offset,
+                table_name,
+                old_column,
+                new_column,
+                &ColumnRenameBindings::default(),
+                false,
+                &scoped_hidden,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            );
+        }
+    }
+    changed
+}
+
+fn rename_column_refs_in_with_clause_for_table(
+    with: &mut fsqlite_ast::WithClause,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    hidden_tables: &HashSet<String>,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> (bool, HashSet<String>) {
+    rename_column_refs_in_with_clause_for_table_with_outer(
+        with,
+        table_name,
+        old_column,
+        new_column,
+        hidden_tables,
+        &ColumnRenameBindings::default(),
+        false,
+        source_catalog,
+    )
+}
+
+fn rename_column_refs_in_with_clause_for_table_with_outer(
+    with: &mut fsqlite_ast::WithClause,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    hidden_tables: &HashSet<String>,
+    outer_bindings: &ColumnRenameBindings,
+    outer_allow_unqualified: bool,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> (bool, HashSet<String>) {
+    let mut changed = false;
+    let mut scoped_hidden = hidden_tables.clone();
+    for cte in &with.ctes {
+        add_hidden_cte_for_column_rename(&mut scoped_hidden, cte, old_column);
+    }
+    for _ in 0..=with.ctes.len() {
+        let mut pass_changed = false;
+        for cte in &mut with.ctes {
+            pass_changed |= rename_column_refs_in_select_for_table_with_outer(
+                &mut cte.query,
+                table_name,
+                old_column,
+                new_column,
+                &scoped_hidden,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            );
+            refresh_hidden_cte_for_column_rename(
+                &mut scoped_hidden,
+                cte,
+                old_column,
+                new_column,
+                source_catalog,
+            );
+        }
+        changed |= pass_changed;
+        if !pass_changed {
+            break;
+        }
+    }
+    (changed, scoped_hidden)
+}
+
+fn rename_column_refs_in_select_core_for_table_with_outer(
+    core: &mut SelectCore,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    hidden_tables: &HashSet<String>,
+    outer_bindings: &ColumnRenameBindings,
+    outer_allow_unqualified: bool,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> (bool, ColumnRenameBindings) {
+    match core {
+        SelectCore::Values(rows) => {
+            let changed = rows.iter_mut().fold(false, |changed, row| {
+                row.iter_mut().fold(changed, |changed, expr| {
+                    rename_column_refs_in_expr_for_table_with_outer(
+                        expr,
+                        table_name,
+                        old_column,
+                        new_column,
+                        &ColumnRenameBindings::default(),
+                        false,
+                        hidden_tables,
+                        outer_bindings,
+                        outer_allow_unqualified,
+                        source_catalog,
+                    ) | changed
+                })
+            });
+            (changed, ColumnRenameBindings::default())
+        }
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            let mut changed = false;
+            let mut bindings = ColumnRenameBindings::default();
+            if let Some(from_clause) = from {
+                changed |= collect_column_rename_bindings_from_table_or_subquery_with_outer(
+                    &mut from_clause.source,
+                    table_name,
+                    old_column,
+                    new_column,
+                    hidden_tables,
+                    &mut bindings,
+                    outer_bindings,
+                    outer_allow_unqualified,
+                    source_catalog,
+                );
+                for join in &mut from_clause.joins {
+                    changed |= collect_column_rename_bindings_from_table_or_subquery_with_outer(
+                        &mut join.table,
+                        table_name,
+                        old_column,
+                        new_column,
+                        hidden_tables,
+                        &mut bindings,
+                        outer_bindings,
+                        outer_allow_unqualified,
+                        source_catalog,
+                    );
+                }
+                for join in &mut from_clause.joins {
+                    if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+                        changed |= rename_column_refs_in_expr_for_table_with_outer(
+                            expr,
+                            table_name,
+                            old_column,
+                            new_column,
+                            &bindings,
+                            bindings.can_rename_unqualified(),
+                            hidden_tables,
+                            outer_bindings,
+                            outer_allow_unqualified,
+                            source_catalog,
+                        );
+                    }
+                }
+            }
+            for column in columns {
+                changed |= rename_column_refs_in_result_column_for_table_with_outer(
+                    column,
+                    table_name,
+                    old_column,
+                    new_column,
+                    &bindings,
+                    bindings.can_rename_unqualified(),
+                    hidden_tables,
+                    outer_bindings,
+                    outer_allow_unqualified,
+                    source_catalog,
+                );
+            }
+            if let Some(expr) = where_clause {
+                changed |= rename_column_refs_in_expr_for_table_with_outer(
+                    expr,
+                    table_name,
+                    old_column,
+                    new_column,
+                    &bindings,
+                    bindings.can_rename_unqualified(),
+                    hidden_tables,
+                    outer_bindings,
+                    outer_allow_unqualified,
+                    source_catalog,
+                );
+            }
+            for expr in group_by {
+                changed |= rename_column_refs_in_expr_for_table_with_outer(
+                    expr,
+                    table_name,
+                    old_column,
+                    new_column,
+                    &bindings,
+                    bindings.can_rename_unqualified(),
+                    hidden_tables,
+                    outer_bindings,
+                    outer_allow_unqualified,
+                    source_catalog,
+                );
+            }
+            if let Some(expr) = having {
+                changed |= rename_column_refs_in_expr_for_table_with_outer(
+                    expr,
+                    table_name,
+                    old_column,
+                    new_column,
+                    &bindings,
+                    bindings.can_rename_unqualified(),
+                    hidden_tables,
+                    outer_bindings,
+                    outer_allow_unqualified,
+                    source_catalog,
+                );
+            }
+            for window in windows {
+                changed |= rename_column_refs_in_window_spec_for_table_with_outer(
+                    &mut window.spec,
+                    table_name,
+                    old_column,
+                    new_column,
+                    &bindings,
+                    bindings.can_rename_unqualified(),
+                    hidden_tables,
+                    outer_bindings,
+                    outer_allow_unqualified,
+                    source_catalog,
+                );
+            }
+            (changed, bindings)
+        }
+    }
+}
+
+fn collect_select_core_result_aliases(core: &SelectCore) -> HashSet<String> {
+    let SelectCore::Select { columns, .. } = core else {
+        return HashSet::new();
+    };
+    columns
+        .iter()
+        .filter_map(|column| match column {
+            ResultColumn::Expr {
+                alias: Some(alias), ..
+            } => Some(alias.to_ascii_lowercase()),
+            ResultColumn::Star
+            | ResultColumn::TableStar(_)
+            | ResultColumn::Expr { alias: None, .. } => None,
+        })
+        .collect()
+}
+
+fn collect_column_rename_bindings_from_table_or_subquery(
+    source: &mut TableOrSubquery,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    hidden_tables: &HashSet<String>,
+    bindings: &mut ColumnRenameBindings,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    collect_column_rename_bindings_from_table_or_subquery_with_outer(
+        source,
+        table_name,
+        old_column,
+        new_column,
+        hidden_tables,
+        bindings,
+        &ColumnRenameBindings::default(),
+        false,
+        source_catalog,
+    )
+}
+
+fn collect_column_rename_bindings_from_table_or_subquery_with_outer(
+    source: &mut TableOrSubquery,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    hidden_tables: &HashSet<String>,
+    bindings: &mut ColumnRenameBindings,
+    outer_bindings: &ColumnRenameBindings,
+    outer_allow_unqualified: bool,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    let mut changed = false;
+    match source {
+        TableOrSubquery::Table { name, alias, .. } => {
+            let hidden_outputs_renamed =
+                source_catalog.table_outputs_renamed_column(name, hidden_tables);
+            if hidden_outputs_renamed
+                || source_catalog.table_may_expose_old_column(name, hidden_tables)
+            {
+                bindings.add_source();
+            }
+            bindings.add_source_alias_or_name(alias.as_deref(), &name.name);
+            if hidden_outputs_renamed {
+                bindings.add_matching_binding(alias.as_deref().unwrap_or(&name.name));
+                if alias.is_none() {
+                    bindings.add_matching_binding(&name.name);
+                }
+            }
+            if qualified_relation_matches_unhidden_name(name, table_name, hidden_tables) {
+                bindings.add_matching_binding(alias.as_deref().unwrap_or(&name.name));
+                if alias.is_none() {
+                    bindings.add_matching_binding(table_name);
+                }
+            }
+        }
+        TableOrSubquery::Subquery { query, alias } => {
+            let exposed_old_before = select_statement_may_output_column(query, old_column);
+            if let Some(alias) = alias {
+                bindings.add_source_binding(alias);
+            }
+            changed |= rename_column_refs_in_select_for_table_with_outer(
+                query,
+                table_name,
+                old_column,
+                new_column,
+                hidden_tables,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            );
+            let output_status = select_column_rename_output_status(
+                query,
+                old_column,
+                new_column,
+                hidden_tables,
+                source_catalog,
+            );
+            let output_was_renamed =
+                exposed_old_before && output_status.exposes_renamed && !output_status.exposes_old;
+            if output_status.exposes_old || output_was_renamed {
+                bindings.add_source();
+            }
+            if output_was_renamed {
+                bindings.add_matching_binding(alias.as_deref().unwrap_or("subquery"));
+            }
+        }
+        TableOrSubquery::TableFunction { name, args, alias } => {
+            bindings.add_source();
+            bindings.add_source_alias_or_name(alias.as_deref(), name);
+            for expr in args {
+                changed |= rename_column_refs_in_expr_for_table_with_outer(
+                    expr,
+                    table_name,
+                    old_column,
+                    new_column,
+                    &ColumnRenameBindings::default(),
+                    false,
+                    hidden_tables,
+                    outer_bindings,
+                    outer_allow_unqualified,
+                    source_catalog,
+                );
+            }
+        }
+        TableOrSubquery::ParenJoin(from_clause) => {
+            changed |= collect_column_rename_bindings_from_table_or_subquery_with_outer(
+                &mut from_clause.source,
+                table_name,
+                old_column,
+                new_column,
+                hidden_tables,
+                bindings,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            );
+            for join in &mut from_clause.joins {
+                changed |= collect_column_rename_bindings_from_table_or_subquery_with_outer(
+                    &mut join.table,
+                    table_name,
+                    old_column,
+                    new_column,
+                    hidden_tables,
+                    bindings,
+                    outer_bindings,
+                    outer_allow_unqualified,
+                    source_catalog,
+                );
+            }
+        }
+    }
+    changed
+}
+
+fn rename_column_refs_in_statement_for_table(
+    statement: &mut Statement,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    match statement {
+        Statement::Select(select) => rename_column_refs_in_select_for_table(
+            select,
+            table_name,
+            old_column,
+            new_column,
+            source_catalog,
+        ),
+        Statement::Insert(insert) => rename_column_refs_in_insert_for_table(
+            insert,
+            table_name,
+            old_column,
+            new_column,
+            source_catalog,
+        ),
+        Statement::Update(update) => rename_column_refs_in_update_for_table(
+            update,
+            table_name,
+            old_column,
+            new_column,
+            source_catalog,
+        ),
+        Statement::Delete(delete) => rename_column_refs_in_delete_for_table(
+            delete,
+            table_name,
+            old_column,
+            new_column,
+            source_catalog,
+        ),
+        Statement::Explain { stmt, .. } => rename_column_refs_in_statement_for_table(
+            stmt,
+            table_name,
+            old_column,
+            new_column,
+            source_catalog,
+        ),
+        _ => false,
+    }
+}
+
+fn rename_column_refs_in_insert_for_table(
+    insert: &mut InsertStatement,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    let mut changed = false;
+    let target_matches = qualified_relation_matches_name(&insert.table, table_name);
+    let hidden_tables = if let Some(with) = &mut insert.with {
+        let (with_changed, hidden) = rename_column_refs_in_with_clause_for_table(
+            with,
+            table_name,
+            old_column,
+            new_column,
+            &HashSet::new(),
+            source_catalog,
+        );
+        changed |= with_changed;
+        hidden
+    } else {
+        HashSet::new()
+    };
+    if target_matches {
+        for column in &mut insert.columns {
+            if column.eq_ignore_ascii_case(old_column) {
+                column.clear();
+                column.push_str(new_column);
+                changed = true;
+            }
+        }
+    }
+    let bindings = ColumnRenameBindings::default();
+    let mut target_bindings = ColumnRenameBindings::default();
+    let target_may_expose_old_column =
+        source_catalog.table_may_expose_old_column(&insert.table, &hidden_tables);
+    if target_may_expose_old_column {
+        target_bindings.add_source();
+    }
+    target_bindings.add_source_alias_or_name(insert.alias.as_deref(), &insert.table.name);
+    if target_matches {
+        target_bindings.add_matching_binding(insert.alias.as_deref().unwrap_or(&insert.table.name));
+        target_bindings.add_matching_binding(table_name);
+        target_bindings.add_matching_binding("excluded");
+    }
+    let target_allow_unqualified = target_bindings.can_rename_unqualified();
+    match &mut insert.source {
+        InsertSource::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    changed |= rename_column_refs_in_expr_for_table_with_hidden(
+                        expr,
+                        table_name,
+                        old_column,
+                        new_column,
+                        &bindings,
+                        false,
+                        &hidden_tables,
+                        source_catalog,
+                    );
+                }
+            }
+        }
+        InsertSource::Select(select) => {
+            changed |= rename_column_refs_in_select_for_table_with_hidden(
+                select,
+                table_name,
+                old_column,
+                new_column,
+                &hidden_tables,
+                source_catalog,
+            );
+        }
+        InsertSource::DefaultValues => {}
+    }
+    for upsert in &mut insert.upsert {
+        if let Some(target) = &mut upsert.target {
+            for column in &mut target.columns {
+                changed |= rename_column_refs_in_expr_for_table_with_hidden(
+                    &mut column.expr,
+                    table_name,
+                    old_column,
+                    new_column,
+                    &target_bindings,
+                    target_allow_unqualified,
+                    &hidden_tables,
+                    source_catalog,
+                );
+            }
+            if let Some(where_clause) = &mut target.where_clause {
+                changed |= rename_column_refs_in_expr_for_table_with_hidden(
+                    where_clause,
+                    table_name,
+                    old_column,
+                    new_column,
+                    &target_bindings,
+                    target_allow_unqualified,
+                    &hidden_tables,
+                    source_catalog,
+                );
+            }
+        }
+        if let UpsertAction::Update {
+            assignments,
+            where_clause,
+        } = &mut upsert.action
+        {
+            for assignment in assignments {
+                if target_matches {
+                    changed |= rename_assignment_target_columns(
+                        &mut assignment.target,
+                        old_column,
+                        new_column,
+                    );
+                }
+                changed |= rename_column_refs_in_expr_for_table_with_hidden(
+                    &mut assignment.value,
+                    table_name,
+                    old_column,
+                    new_column,
+                    &target_bindings,
+                    target_allow_unqualified,
+                    &hidden_tables,
+                    source_catalog,
+                );
+            }
+            if let Some(where_clause) = where_clause {
+                changed |= rename_column_refs_in_expr_for_table_with_hidden(
+                    where_clause,
+                    table_name,
+                    old_column,
+                    new_column,
+                    &target_bindings,
+                    target_allow_unqualified,
+                    &hidden_tables,
+                    source_catalog,
+                );
+            }
+        }
+    }
+    for column in &mut insert.returning {
+        changed |= rename_column_refs_in_result_column_for_table_with_hidden(
+            column,
+            table_name,
+            old_column,
+            new_column,
+            &target_bindings,
+            target_allow_unqualified,
+            &hidden_tables,
+            source_catalog,
+        );
+    }
+    changed
+}
+
+fn rename_assignment_target_columns(
+    target: &mut fsqlite_ast::AssignmentTarget,
+    old_column: &str,
+    new_column: &str,
+) -> bool {
+    match target {
+        fsqlite_ast::AssignmentTarget::Column(column) => {
+            if column.eq_ignore_ascii_case(old_column) {
+                column.clear();
+                column.push_str(new_column);
+                true
+            } else {
+                false
+            }
+        }
+        fsqlite_ast::AssignmentTarget::ColumnList(columns) => {
+            columns.iter_mut().fold(false, |changed, column| {
+                if column.eq_ignore_ascii_case(old_column) {
+                    column.clear();
+                    column.push_str(new_column);
+                    true
+                } else {
+                    changed
+                }
+            })
+        }
+    }
+}
+
+fn rename_column_refs_in_update_for_table(
+    update: &mut fsqlite_ast::UpdateStatement,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    let mut changed = false;
+    let hidden_tables = if let Some(with) = &mut update.with {
+        let (with_changed, hidden) = rename_column_refs_in_with_clause_for_table(
+            with,
+            table_name,
+            old_column,
+            new_column,
+            &HashSet::new(),
+            source_catalog,
+        );
+        changed |= with_changed;
+        hidden
+    } else {
+        HashSet::new()
+    };
+    let mut bindings = ColumnRenameBindings::default();
+    if source_catalog.table_may_expose_old_column(&update.table.name, &hidden_tables) {
+        bindings.add_source();
+    }
+    bindings.add_source_alias_or_name(update.table.alias.as_deref(), &update.table.name.name);
+    if qualified_relation_matches_name(&update.table.name, table_name) {
+        bindings.add_matching_binding(
+            update
+                .table
+                .alias
+                .as_deref()
+                .unwrap_or(&update.table.name.name),
+        );
+        bindings.add_matching_binding(table_name);
+        for assignment in &mut update.assignments {
+            changed |=
+                rename_assignment_target_columns(&mut assignment.target, old_column, new_column);
+        }
+    }
+    if let Some(from_clause) = &mut update.from {
+        changed |= collect_column_rename_bindings_from_table_or_subquery(
+            &mut from_clause.source,
+            table_name,
+            old_column,
+            new_column,
+            &hidden_tables,
+            &mut bindings,
+            source_catalog,
+        );
+        for join in &mut from_clause.joins {
+            changed |= collect_column_rename_bindings_from_table_or_subquery(
+                &mut join.table,
+                table_name,
+                old_column,
+                new_column,
+                &hidden_tables,
+                &mut bindings,
+                source_catalog,
+            );
+        }
+        for join in &mut from_clause.joins {
+            if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+                changed |= rename_column_refs_in_expr_for_table_with_hidden(
+                    expr,
+                    table_name,
+                    old_column,
+                    new_column,
+                    &bindings,
+                    bindings.can_rename_unqualified(),
+                    &hidden_tables,
+                    source_catalog,
+                );
+            }
+        }
+    }
+    let allow_unqualified = bindings.can_rename_unqualified();
+    for assignment in &mut update.assignments {
+        changed |= rename_column_refs_in_expr_for_table_with_hidden(
+            &mut assignment.value,
+            table_name,
+            old_column,
+            new_column,
+            &bindings,
+            allow_unqualified,
+            &hidden_tables,
+            source_catalog,
+        );
+    }
+    if let Some(where_expr) = &mut update.where_clause {
+        changed |= rename_column_refs_in_expr_for_table_with_hidden(
+            where_expr,
+            table_name,
+            old_column,
+            new_column,
+            &bindings,
+            allow_unqualified,
+            &hidden_tables,
+            source_catalog,
+        );
+    }
+    for column in &mut update.returning {
+        changed |= rename_column_refs_in_result_column_for_table_with_hidden(
+            column,
+            table_name,
+            old_column,
+            new_column,
+            &bindings,
+            allow_unqualified,
+            &hidden_tables,
+            source_catalog,
+        );
+    }
+    changed |= rename_column_refs_in_ordering_terms_for_table_with_hidden(
+        &mut update.order_by,
+        table_name,
+        old_column,
+        new_column,
+        &bindings,
+        allow_unqualified,
+        &hidden_tables,
+        source_catalog,
+    );
+    if let Some(limit) = &mut update.limit {
+        changed |= rename_column_refs_in_expr_for_table_with_hidden(
+            &mut limit.limit,
+            table_name,
+            old_column,
+            new_column,
+            &bindings,
+            allow_unqualified,
+            &hidden_tables,
+            source_catalog,
+        );
+        if let Some(offset) = &mut limit.offset {
+            changed |= rename_column_refs_in_expr_for_table_with_hidden(
+                offset,
+                table_name,
+                old_column,
+                new_column,
+                &bindings,
+                allow_unqualified,
+                &hidden_tables,
+                source_catalog,
+            );
+        }
+    }
+    changed
+}
+
+fn rename_column_refs_in_delete_for_table(
+    delete: &mut fsqlite_ast::DeleteStatement,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    let mut changed = false;
+    let hidden_tables = if let Some(with) = &mut delete.with {
+        let (with_changed, hidden) = rename_column_refs_in_with_clause_for_table(
+            with,
+            table_name,
+            old_column,
+            new_column,
+            &HashSet::new(),
+            source_catalog,
+        );
+        changed |= with_changed;
+        hidden
+    } else {
+        HashSet::new()
+    };
+    let mut bindings = ColumnRenameBindings::default();
+    if source_catalog.table_may_expose_old_column(&delete.table.name, &hidden_tables) {
+        bindings.add_source();
+    }
+    bindings.add_source_alias_or_name(delete.table.alias.as_deref(), &delete.table.name.name);
+    if qualified_relation_matches_name(&delete.table.name, table_name) {
+        bindings.add_matching_binding(
+            delete
+                .table
+                .alias
+                .as_deref()
+                .unwrap_or(&delete.table.name.name),
+        );
+        bindings.add_matching_binding(table_name);
+    }
+    let allow_unqualified = bindings.can_rename_unqualified();
+    if let Some(where_expr) = &mut delete.where_clause {
+        changed |= rename_column_refs_in_expr_for_table_with_hidden(
+            where_expr,
+            table_name,
+            old_column,
+            new_column,
+            &bindings,
+            allow_unqualified,
+            &hidden_tables,
+            source_catalog,
+        );
+    }
+    for column in &mut delete.returning {
+        changed |= rename_column_refs_in_result_column_for_table_with_hidden(
+            column,
+            table_name,
+            old_column,
+            new_column,
+            &bindings,
+            allow_unqualified,
+            &hidden_tables,
+            source_catalog,
+        );
+    }
+    changed |= rename_column_refs_in_ordering_terms_for_table_with_hidden(
+        &mut delete.order_by,
+        table_name,
+        old_column,
+        new_column,
+        &bindings,
+        allow_unqualified,
+        &hidden_tables,
+        source_catalog,
+    );
+    if let Some(limit) = &mut delete.limit {
+        changed |= rename_column_refs_in_expr_for_table_with_hidden(
+            &mut limit.limit,
+            table_name,
+            old_column,
+            new_column,
+            &bindings,
+            allow_unqualified,
+            &hidden_tables,
+            source_catalog,
+        );
+        if let Some(offset) = &mut limit.offset {
+            changed |= rename_column_refs_in_expr_for_table_with_hidden(
+                offset,
+                table_name,
+                old_column,
+                new_column,
+                &bindings,
+                allow_unqualified,
+                &hidden_tables,
+                source_catalog,
+            );
+        }
+    }
+    changed
+}
+
+fn rename_column_refs_in_result_column_for_table_with_hidden(
+    column: &mut ResultColumn,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    bindings: &ColumnRenameBindings,
+    allow_unqualified: bool,
+    hidden_tables: &HashSet<String>,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    rename_column_refs_in_result_column_for_table_with_outer(
+        column,
+        table_name,
+        old_column,
+        new_column,
+        bindings,
+        allow_unqualified,
+        hidden_tables,
+        &ColumnRenameBindings::default(),
+        false,
+        source_catalog,
+    )
+}
+
+fn rename_column_refs_in_result_column_for_table_with_outer(
+    column: &mut ResultColumn,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    bindings: &ColumnRenameBindings,
+    allow_unqualified: bool,
+    hidden_tables: &HashSet<String>,
+    outer_bindings: &ColumnRenameBindings,
+    outer_allow_unqualified: bool,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    match column {
+        ResultColumn::Expr { expr, .. } => rename_column_refs_in_expr_for_table_with_outer(
+            expr,
+            table_name,
+            old_column,
+            new_column,
+            bindings,
+            allow_unqualified,
+            hidden_tables,
+            outer_bindings,
+            outer_allow_unqualified,
+            source_catalog,
+        ),
+        ResultColumn::Star | ResultColumn::TableStar(_) => false,
+    }
+}
+
+fn rename_column_refs_in_expr_for_table(
+    expr: &mut Expr,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    bindings: &ColumnRenameBindings,
+    allow_unqualified: bool,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    rename_column_refs_in_expr_for_table_with_hidden(
+        expr,
+        table_name,
+        old_column,
+        new_column,
+        bindings,
+        allow_unqualified,
+        &HashSet::new(),
+        source_catalog,
+    )
+}
+
+fn rename_column_refs_in_expr_for_table_with_hidden(
+    expr: &mut Expr,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    bindings: &ColumnRenameBindings,
+    allow_unqualified: bool,
+    hidden_tables: &HashSet<String>,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    rename_column_refs_in_expr_for_table_with_outer(
+        expr,
+        table_name,
+        old_column,
+        new_column,
+        bindings,
+        allow_unqualified,
+        hidden_tables,
+        &ColumnRenameBindings::default(),
+        false,
+        source_catalog,
+    )
+}
+
+fn rename_column_refs_in_expr_for_table_with_outer(
+    expr: &mut Expr,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    bindings: &ColumnRenameBindings,
+    allow_unqualified: bool,
+    hidden_tables: &HashSet<String>,
+    outer_bindings: &ColumnRenameBindings,
+    outer_allow_unqualified: bool,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    match expr {
+        Expr::Literal(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => false,
+        Expr::Column(col_ref, _) => {
+            if !col_ref.column.eq_ignore_ascii_case(old_column) {
+                return false;
+            }
+            let qualified_match = col_ref
+                .table
+                .as_deref()
+                .is_some_and(|table| bindings.table_matches(table));
+            let outer_qualified_match = col_ref.table.as_deref().is_some_and(|table| {
+                !bindings.source_binding_shadows(table) && outer_bindings.table_matches(table)
+            });
+            let unqualified_match = col_ref.table.is_none()
+                && (allow_unqualified || (bindings.source_count == 0 && outer_allow_unqualified));
+            if qualified_match || outer_qualified_match || unqualified_match {
+                col_ref.column = Arc::from(new_column);
+                true
+            } else {
+                false
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rename_column_refs_in_expr_for_table_with_outer(
+                left,
+                table_name,
+                old_column,
+                new_column,
+                bindings,
+                allow_unqualified,
+                hidden_tables,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            ) | rename_column_refs_in_expr_for_table_with_outer(
+                right,
+                table_name,
+                old_column,
+                new_column,
+                bindings,
+                allow_unqualified,
+                hidden_tables,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            )
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => rename_column_refs_in_expr_for_table_with_outer(
+            expr,
+            table_name,
+            old_column,
+            new_column,
+            bindings,
+            allow_unqualified,
+            hidden_tables,
+            outer_bindings,
+            outer_allow_unqualified,
+            source_catalog,
+        ),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rename_column_refs_in_expr_for_table_with_outer(
+                expr,
+                table_name,
+                old_column,
+                new_column,
+                bindings,
+                allow_unqualified,
+                hidden_tables,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            ) | rename_column_refs_in_expr_for_table_with_outer(
+                low,
+                table_name,
+                old_column,
+                new_column,
+                bindings,
+                allow_unqualified,
+                hidden_tables,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            ) | rename_column_refs_in_expr_for_table_with_outer(
+                high,
+                table_name,
+                old_column,
+                new_column,
+                bindings,
+                allow_unqualified,
+                hidden_tables,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            )
+        }
+        Expr::In { expr, set, .. } => {
+            let expr_changed = rename_column_refs_in_expr_for_table_with_outer(
+                expr,
+                table_name,
+                old_column,
+                new_column,
+                bindings,
+                allow_unqualified,
+                hidden_tables,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            );
+            let set_changed = match set {
+                InSet::List(values) => values.iter_mut().fold(false, |changed, value| {
+                    rename_column_refs_in_expr_for_table_with_outer(
+                        value,
+                        table_name,
+                        old_column,
+                        new_column,
+                        bindings,
+                        allow_unqualified,
+                        hidden_tables,
+                        outer_bindings,
+                        outer_allow_unqualified,
+                        source_catalog,
+                    ) | changed
+                }),
+                InSet::Subquery(query) => {
+                    let nested_outer = bindings.nested_outer_bindings(outer_bindings);
+                    let nested_outer_allow = allow_unqualified
+                        || (bindings.source_count == 0 && outer_allow_unqualified);
+                    rename_column_refs_in_select_for_table_with_outer(
+                        query,
+                        table_name,
+                        old_column,
+                        new_column,
+                        hidden_tables,
+                        &nested_outer,
+                        nested_outer_allow,
+                        source_catalog,
+                    )
+                }
+                InSet::Table(_) => false,
+            };
+            expr_changed | set_changed
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            rename_column_refs_in_expr_for_table_with_outer(
+                expr,
+                table_name,
+                old_column,
+                new_column,
+                bindings,
+                allow_unqualified,
+                hidden_tables,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            ) | rename_column_refs_in_expr_for_table_with_outer(
+                pattern,
+                table_name,
+                old_column,
+                new_column,
+                bindings,
+                allow_unqualified,
+                hidden_tables,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            ) | escape.as_deref_mut().is_some_and(|expr| {
+                rename_column_refs_in_expr_for_table_with_outer(
+                    expr,
+                    table_name,
+                    old_column,
+                    new_column,
+                    bindings,
+                    allow_unqualified,
+                    hidden_tables,
+                    outer_bindings,
+                    outer_allow_unqualified,
+                    source_catalog,
+                )
+            })
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            let operand_changed = operand.as_deref_mut().is_some_and(|expr| {
+                rename_column_refs_in_expr_for_table_with_outer(
+                    expr,
+                    table_name,
+                    old_column,
+                    new_column,
+                    bindings,
+                    allow_unqualified,
+                    hidden_tables,
+                    outer_bindings,
+                    outer_allow_unqualified,
+                    source_catalog,
+                )
+            });
+            let whens_changed = whens.iter_mut().fold(false, |changed, (when, then)| {
+                changed
+                    | rename_column_refs_in_expr_for_table_with_outer(
+                        when,
+                        table_name,
+                        old_column,
+                        new_column,
+                        bindings,
+                        allow_unqualified,
+                        hidden_tables,
+                        outer_bindings,
+                        outer_allow_unqualified,
+                        source_catalog,
+                    )
+                    | rename_column_refs_in_expr_for_table_with_outer(
+                        then,
+                        table_name,
+                        old_column,
+                        new_column,
+                        bindings,
+                        allow_unqualified,
+                        hidden_tables,
+                        outer_bindings,
+                        outer_allow_unqualified,
+                        source_catalog,
+                    )
+            });
+            let else_changed = else_expr.as_deref_mut().is_some_and(|expr| {
+                rename_column_refs_in_expr_for_table_with_outer(
+                    expr,
+                    table_name,
+                    old_column,
+                    new_column,
+                    bindings,
+                    allow_unqualified,
+                    hidden_tables,
+                    outer_bindings,
+                    outer_allow_unqualified,
+                    source_catalog,
+                )
+            });
+            operand_changed | whens_changed | else_changed
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+            let nested_outer = bindings.nested_outer_bindings(outer_bindings);
+            let nested_outer_allow =
+                allow_unqualified || (bindings.source_count == 0 && outer_allow_unqualified);
+            rename_column_refs_in_select_for_table_with_outer(
+                subquery,
+                table_name,
+                old_column,
+                new_column,
+                hidden_tables,
+                &nested_outer,
+                nested_outer_allow,
+                source_catalog,
+            )
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            let args_changed = match args {
+                FunctionArgs::List(args) => args.iter_mut().fold(false, |changed, arg| {
+                    rename_column_refs_in_expr_for_table_with_outer(
+                        arg,
+                        table_name,
+                        old_column,
+                        new_column,
+                        bindings,
+                        allow_unqualified,
+                        hidden_tables,
+                        outer_bindings,
+                        outer_allow_unqualified,
+                        source_catalog,
+                    ) | changed
+                }),
+                FunctionArgs::Star => false,
+            };
+            let order_changed = rename_column_refs_in_ordering_terms_for_table_with_outer(
+                order_by,
+                table_name,
+                old_column,
+                new_column,
+                bindings,
+                allow_unqualified,
+                hidden_tables,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            );
+            let filter_changed = filter.as_deref_mut().is_some_and(|expr| {
+                rename_column_refs_in_expr_for_table_with_outer(
+                    expr,
+                    table_name,
+                    old_column,
+                    new_column,
+                    bindings,
+                    allow_unqualified,
+                    hidden_tables,
+                    outer_bindings,
+                    outer_allow_unqualified,
+                    source_catalog,
+                )
+            });
+            let over_changed = over.as_mut().is_some_and(|window| {
+                rename_column_refs_in_window_spec_for_table_with_outer(
+                    window,
+                    table_name,
+                    old_column,
+                    new_column,
+                    bindings,
+                    allow_unqualified,
+                    hidden_tables,
+                    outer_bindings,
+                    outer_allow_unqualified,
+                    source_catalog,
+                )
+            });
+            args_changed | order_changed | filter_changed | over_changed
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            rename_column_refs_in_expr_for_table_with_outer(
+                expr,
+                table_name,
+                old_column,
+                new_column,
+                bindings,
+                allow_unqualified,
+                hidden_tables,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            ) | rename_column_refs_in_expr_for_table_with_outer(
+                path,
+                table_name,
+                old_column,
+                new_column,
+                bindings,
+                allow_unqualified,
+                hidden_tables,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            )
+        }
+        Expr::RowValue(values, _) => values.iter_mut().fold(false, |changed, value| {
+            rename_column_refs_in_expr_for_table_with_outer(
+                value,
+                table_name,
+                old_column,
+                new_column,
+                bindings,
+                allow_unqualified,
+                hidden_tables,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            ) | changed
+        }),
+    }
+}
+
+fn rename_column_refs_in_ordering_terms_for_table_with_hidden(
+    order_by: &mut [OrderingTerm],
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    bindings: &ColumnRenameBindings,
+    allow_unqualified: bool,
+    hidden_tables: &HashSet<String>,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    rename_column_refs_in_ordering_terms_for_table_with_outer(
+        order_by,
+        table_name,
+        old_column,
+        new_column,
+        bindings,
+        allow_unqualified,
+        hidden_tables,
+        &ColumnRenameBindings::default(),
+        false,
+        source_catalog,
+    )
+}
+
+fn rename_column_refs_in_ordering_terms_for_table_with_outer(
+    order_by: &mut [OrderingTerm],
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    bindings: &ColumnRenameBindings,
+    allow_unqualified: bool,
+    hidden_tables: &HashSet<String>,
+    outer_bindings: &ColumnRenameBindings,
+    outer_allow_unqualified: bool,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    order_by.iter_mut().fold(false, |changed, term| {
+        rename_column_refs_in_expr_for_table_with_outer(
+            &mut term.expr,
+            table_name,
+            old_column,
+            new_column,
+            bindings,
+            allow_unqualified,
+            hidden_tables,
+            outer_bindings,
+            outer_allow_unqualified,
+            source_catalog,
+        ) | changed
+    })
+}
+
+fn rename_column_refs_in_top_level_ordering_terms_for_table(
+    order_by: &mut [OrderingTerm],
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    bindings: &ColumnRenameBindings,
+    allow_unqualified: bool,
+    output_aliases: &HashSet<String>,
+    hidden_tables: &HashSet<String>,
+    outer_bindings: &ColumnRenameBindings,
+    outer_allow_unqualified: bool,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    order_by.iter_mut().fold(false, |changed, term| {
+        let allow_unqualified =
+            allow_unqualified && !ordering_term_resolves_to_output_alias(term, output_aliases);
+        rename_column_refs_in_expr_for_table_with_outer(
+            &mut term.expr,
+            table_name,
+            old_column,
+            new_column,
+            bindings,
+            allow_unqualified,
+            hidden_tables,
+            outer_bindings,
+            outer_allow_unqualified,
+            source_catalog,
+        ) | changed
+    })
+}
+
+fn ordering_term_resolves_to_output_alias(
+    term: &OrderingTerm,
+    output_aliases: &HashSet<String>,
+) -> bool {
+    expr_resolves_to_output_alias(&term.expr, output_aliases)
+}
+
+fn expr_resolves_to_output_alias(expr: &Expr, output_aliases: &HashSet<String>) -> bool {
+    match expr {
+        Expr::Column(col_ref, _) if col_ref.table.is_none() => {
+            output_aliases.contains(&col_ref.column.to_ascii_lowercase())
+        }
+        Expr::Collate { expr, .. } => expr_resolves_to_output_alias(expr, output_aliases),
+        _ => false,
+    }
+}
+
+fn rename_column_refs_in_window_spec_for_table_with_outer(
+    window: &mut WindowSpec,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    bindings: &ColumnRenameBindings,
+    allow_unqualified: bool,
+    hidden_tables: &HashSet<String>,
+    outer_bindings: &ColumnRenameBindings,
+    outer_allow_unqualified: bool,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    window.partition_by.iter_mut().fold(false, |changed, expr| {
+        rename_column_refs_in_expr_for_table_with_outer(
+            expr,
+            table_name,
+            old_column,
+            new_column,
+            bindings,
+            allow_unqualified,
+            hidden_tables,
+            outer_bindings,
+            outer_allow_unqualified,
+            source_catalog,
+        ) | changed
+    }) | rename_column_refs_in_ordering_terms_for_table_with_outer(
+        &mut window.order_by,
+        table_name,
+        old_column,
+        new_column,
+        bindings,
+        allow_unqualified,
+        hidden_tables,
+        outer_bindings,
+        outer_allow_unqualified,
+        source_catalog,
+    ) | window.frame.as_mut().is_some_and(|frame| {
+        rename_column_refs_in_frame_spec_for_table_with_outer(
+            frame,
+            table_name,
+            old_column,
+            new_column,
+            bindings,
+            allow_unqualified,
+            hidden_tables,
+            outer_bindings,
+            outer_allow_unqualified,
+            source_catalog,
+        )
+    })
+}
+
+fn rename_column_refs_in_frame_spec_for_table_with_outer(
+    frame: &mut FrameSpec,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    bindings: &ColumnRenameBindings,
+    allow_unqualified: bool,
+    hidden_tables: &HashSet<String>,
+    outer_bindings: &ColumnRenameBindings,
+    outer_allow_unqualified: bool,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    rename_column_refs_in_frame_bound_for_table_with_outer(
+        &mut frame.start,
+        table_name,
+        old_column,
+        new_column,
+        bindings,
+        allow_unqualified,
+        hidden_tables,
+        outer_bindings,
+        outer_allow_unqualified,
+        source_catalog,
+    ) | frame.end.as_mut().is_some_and(|bound| {
+        rename_column_refs_in_frame_bound_for_table_with_outer(
+            bound,
+            table_name,
+            old_column,
+            new_column,
+            bindings,
+            allow_unqualified,
+            hidden_tables,
+            outer_bindings,
+            outer_allow_unqualified,
+            source_catalog,
+        )
+    })
+}
+
+fn rename_column_refs_in_frame_bound_for_table_with_outer(
+    bound: &mut FrameBound,
+    table_name: &str,
+    old_column: &str,
+    new_column: &str,
+    bindings: &ColumnRenameBindings,
+    allow_unqualified: bool,
+    hidden_tables: &HashSet<String>,
+    outer_bindings: &ColumnRenameBindings,
+    outer_allow_unqualified: bool,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    match bound {
+        FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
+            rename_column_refs_in_expr_for_table_with_outer(
+                expr,
+                table_name,
+                old_column,
+                new_column,
+                bindings,
+                allow_unqualified,
+                hidden_tables,
+                outer_bindings,
+                outer_allow_unqualified,
+                source_catalog,
+            )
+        }
+        FrameBound::UnboundedPreceding
+        | FrameBound::CurrentRow
+        | FrameBound::UnboundedFollowing => false,
+    }
+}
+
+fn rename_trigger_event_columns(
+    event: &mut fsqlite_ast::TriggerEvent,
+    old: &str,
+    new: &str,
+) -> bool {
+    let fsqlite_ast::TriggerEvent::Update(columns) = event else {
+        return false;
+    };
+    columns.iter_mut().fold(false, |changed, column| {
+        if column.eq_ignore_ascii_case(old) {
+            column.clear();
+            column.push_str(new);
+            true
+        } else {
+            changed
+        }
+    })
+}
+
+#[derive(Clone, Default)]
+struct TriggerRowRenameScope {
+    shadowed_row_names: HashSet<String>,
+    bare_old_column_shadowed: bool,
+}
+
+impl TriggerRowRenameScope {
+    fn shadows_trigger_row(&self, name: &str) -> bool {
+        self.shadowed_row_names.contains(&name.to_ascii_lowercase())
+    }
+
+    fn shadows_bare_old_column(&self) -> bool {
+        self.bare_old_column_shadowed
+    }
+
+    fn add_source_binding(&mut self, name: &str) {
+        if is_trigger_row_name(name) {
+            self.shadowed_row_names.insert(name.to_ascii_lowercase());
+        }
+    }
+
+    fn add_old_column_source(&mut self) {
+        self.bare_old_column_shadowed = true;
+    }
+
+    fn add_source_alias_or_name(&mut self, alias: Option<&str>, name: &str) {
+        self.add_source_binding(alias.unwrap_or(name));
+    }
+
+    fn add_table_source_if_may_expose_old_column(
+        &mut self,
+        alias: Option<&str>,
+        name: &QualifiedName,
+        hidden_tables: &HashSet<String>,
+        source_catalog: &ColumnRenameSourceCatalog,
+    ) {
+        if source_catalog.table_may_expose_old_column(name, hidden_tables) {
+            self.add_old_column_source();
+            self.add_source_alias_or_name(alias, &name.name);
+        }
+    }
+
+    fn add_subquery_alias_if_may_expose_old_column(
+        &mut self,
+        alias: Option<&str>,
+        query: &SelectStatement,
+        old_column: &str,
+    ) {
+        if select_statement_may_output_column(query, old_column) {
+            self.add_old_column_source();
+            if let Some(alias) = alias {
+                self.add_source_binding(alias);
+            }
+        }
+    }
+}
+
+fn is_trigger_row_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("old") || name.eq_ignore_ascii_case("new")
+}
+
+fn rename_trigger_row_column_refs_in_statement(
+    statement: &mut Statement,
+    old: &str,
+    new: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    let hidden_tables = HashSet::new();
+    rename_trigger_row_column_refs_in_statement_with_scope(
+        statement,
+        old,
+        new,
+        source_catalog,
+        &TriggerRowRenameScope::default(),
+        &hidden_tables,
+    )
+}
+
+fn rename_trigger_row_column_refs_in_statement_with_scope(
+    statement: &mut Statement,
+    old: &str,
+    new: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+    scope: &TriggerRowRenameScope,
+    hidden_tables: &HashSet<String>,
+) -> bool {
+    match statement {
+        Statement::Select(select) => rename_trigger_row_column_refs_in_select_with_scope(
+            select,
+            old,
+            new,
+            source_catalog,
+            scope,
+            hidden_tables,
+        ),
+        Statement::Insert(insert) => {
+            let mut changed = false;
+            let scoped_hidden = if let Some(with) = &mut insert.with {
+                let (with_changed, hidden) =
+                    rename_trigger_row_column_refs_in_with_clause_with_scope(
+                        with,
+                        old,
+                        new,
+                        source_catalog,
+                        scope,
+                        hidden_tables,
+                    );
+                changed |= with_changed;
+                hidden
+            } else {
+                hidden_tables.clone()
+            };
+            match &mut insert.source {
+                InsertSource::Values(rows) => {
+                    for row in rows {
+                        for expr in row {
+                            changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                                expr,
+                                old,
+                                new,
+                                source_catalog,
+                                &scoped_hidden,
+                                scope,
+                            );
+                        }
+                    }
+                }
+                InsertSource::Select(select) => {
+                    changed |= rename_trigger_row_column_refs_in_select_with_scope(
+                        select,
+                        old,
+                        new,
+                        source_catalog,
+                        scope,
+                        &scoped_hidden,
+                    );
+                }
+                InsertSource::DefaultValues => {}
+            }
+            let mut target_scope = scope.clone();
+            target_scope.add_table_source_if_may_expose_old_column(
+                insert.alias.as_deref(),
+                &insert.table,
+                &scoped_hidden,
+                source_catalog,
+            );
+            for upsert in &mut insert.upsert {
+                if let Some(target) = &mut upsert.target {
+                    for column in &mut target.columns {
+                        changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                            &mut column.expr,
+                            old,
+                            new,
+                            source_catalog,
+                            &scoped_hidden,
+                            &target_scope,
+                        );
+                    }
+                    if let Some(where_clause) = &mut target.where_clause {
+                        changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                            where_clause,
+                            old,
+                            new,
+                            source_catalog,
+                            &scoped_hidden,
+                            &target_scope,
+                        );
+                    }
+                }
+                if let UpsertAction::Update {
+                    assignments,
+                    where_clause,
+                } = &mut upsert.action
+                {
+                    for assignment in assignments {
+                        changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                            &mut assignment.value,
+                            old,
+                            new,
+                            source_catalog,
+                            &scoped_hidden,
+                            &target_scope,
+                        );
+                    }
+                    if let Some(where_clause) = where_clause {
+                        changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                            where_clause,
+                            old,
+                            new,
+                            source_catalog,
+                            &scoped_hidden,
+                            &target_scope,
+                        );
+                    }
+                }
+            }
+            for column in &mut insert.returning {
+                changed |= rename_trigger_row_column_refs_in_result_column_with_scope(
+                    column,
+                    old,
+                    new,
+                    source_catalog,
+                    &scoped_hidden,
+                    &target_scope,
+                );
+            }
+            changed
+        }
+        Statement::Update(update) => {
+            let mut changed = false;
+            let scoped_hidden = if let Some(with) = &mut update.with {
+                let (with_changed, hidden) =
+                    rename_trigger_row_column_refs_in_with_clause_with_scope(
+                        with,
+                        old,
+                        new,
+                        source_catalog,
+                        scope,
+                        hidden_tables,
+                    );
+                changed |= with_changed;
+                hidden
+            } else {
+                hidden_tables.clone()
+            };
+            let mut statement_scope = scope.clone();
+            statement_scope.add_table_source_if_may_expose_old_column(
+                update.table.alias.as_deref(),
+                &update.table.name,
+                &scoped_hidden,
+                source_catalog,
+            );
+            if let Some(from_clause) = &mut update.from {
+                changed |= rename_trigger_row_column_refs_in_table_or_subquery_with_scope(
+                    &mut from_clause.source,
+                    old,
+                    new,
+                    source_catalog,
+                    &scoped_hidden,
+                    scope,
+                    &mut statement_scope,
+                );
+                for join in &mut from_clause.joins {
+                    changed |= rename_trigger_row_column_refs_in_table_or_subquery_with_scope(
+                        &mut join.table,
+                        old,
+                        new,
+                        source_catalog,
+                        &scoped_hidden,
+                        scope,
+                        &mut statement_scope,
+                    );
+                }
+                for join in &mut from_clause.joins {
+                    if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+                        changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                            expr,
+                            old,
+                            new,
+                            source_catalog,
+                            &scoped_hidden,
+                            &statement_scope,
+                        );
+                    }
+                }
+            }
+            for assignment in &mut update.assignments {
+                changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                    &mut assignment.value,
+                    old,
+                    new,
+                    source_catalog,
+                    &scoped_hidden,
+                    &statement_scope,
+                );
+            }
+            if let Some(where_clause) = &mut update.where_clause {
+                changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                    where_clause,
+                    old,
+                    new,
+                    source_catalog,
+                    &scoped_hidden,
+                    &statement_scope,
+                );
+            }
+            for column in &mut update.returning {
+                changed |= rename_trigger_row_column_refs_in_result_column_with_scope(
+                    column,
+                    old,
+                    new,
+                    source_catalog,
+                    &scoped_hidden,
+                    &statement_scope,
+                );
+            }
+            changed |= rename_trigger_row_column_refs_in_ordering_terms_with_scope(
+                &mut update.order_by,
+                old,
+                new,
+                source_catalog,
+                &scoped_hidden,
+                &statement_scope,
+            );
+            if let Some(limit) = &mut update.limit {
+                changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                    &mut limit.limit,
+                    old,
+                    new,
+                    source_catalog,
+                    &scoped_hidden,
+                    &statement_scope,
+                );
+                if let Some(offset) = &mut limit.offset {
+                    changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                        offset,
+                        old,
+                        new,
+                        source_catalog,
+                        &scoped_hidden,
+                        &statement_scope,
+                    );
+                }
+            }
+            changed
+        }
+        Statement::Delete(delete) => {
+            let mut changed = false;
+            let scoped_hidden = if let Some(with) = &mut delete.with {
+                let (with_changed, hidden) =
+                    rename_trigger_row_column_refs_in_with_clause_with_scope(
+                        with,
+                        old,
+                        new,
+                        source_catalog,
+                        scope,
+                        hidden_tables,
+                    );
+                changed |= with_changed;
+                hidden
+            } else {
+                hidden_tables.clone()
+            };
+            let mut statement_scope = scope.clone();
+            statement_scope.add_table_source_if_may_expose_old_column(
+                delete.table.alias.as_deref(),
+                &delete.table.name,
+                &scoped_hidden,
+                source_catalog,
+            );
+            if let Some(where_clause) = &mut delete.where_clause {
+                changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                    where_clause,
+                    old,
+                    new,
+                    source_catalog,
+                    &scoped_hidden,
+                    &statement_scope,
+                );
+            }
+            for column in &mut delete.returning {
+                changed |= rename_trigger_row_column_refs_in_result_column_with_scope(
+                    column,
+                    old,
+                    new,
+                    source_catalog,
+                    &scoped_hidden,
+                    &statement_scope,
+                );
+            }
+            changed |= rename_trigger_row_column_refs_in_ordering_terms_with_scope(
+                &mut delete.order_by,
+                old,
+                new,
+                source_catalog,
+                &scoped_hidden,
+                &statement_scope,
+            );
+            if let Some(limit) = &mut delete.limit {
+                changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                    &mut limit.limit,
+                    old,
+                    new,
+                    source_catalog,
+                    &scoped_hidden,
+                    &statement_scope,
+                );
+                if let Some(offset) = &mut limit.offset {
+                    changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                        offset,
+                        old,
+                        new,
+                        source_catalog,
+                        &scoped_hidden,
+                        &statement_scope,
+                    );
+                }
+            }
+            changed
+        }
+        Statement::Explain { stmt, .. } => rename_trigger_row_column_refs_in_statement_with_scope(
+            stmt,
+            old,
+            new,
+            source_catalog,
+            scope,
+            hidden_tables,
+        ),
+        _ => false,
+    }
+}
+
+fn rename_trigger_row_column_refs_in_with_clause_with_scope(
+    with: &mut fsqlite_ast::WithClause,
+    old: &str,
+    new: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+    scope: &TriggerRowRenameScope,
+    hidden_tables: &HashSet<String>,
+) -> (bool, HashSet<String>) {
+    let mut scoped_hidden = hidden_tables.clone();
+    for cte in &with.ctes {
+        add_hidden_cte_for_column_rename(&mut scoped_hidden, cte, old);
+    }
+    let mut changed = false;
+    for _ in 0..=with.ctes.len() {
+        let mut pass_changed = false;
+        for cte in &mut with.ctes {
+            pass_changed |= rename_trigger_row_column_refs_in_select_with_scope(
+                &mut cte.query,
+                old,
+                new,
+                source_catalog,
+                scope,
+                &scoped_hidden,
+            );
+            refresh_hidden_cte_for_column_rename(&mut scoped_hidden, cte, old, new, source_catalog);
+        }
+        changed |= pass_changed;
+        if !pass_changed {
+            break;
+        }
+    }
+    (changed, scoped_hidden)
+}
+
+fn rename_trigger_row_column_refs_in_select_with_scope(
+    select: &mut SelectStatement,
+    old: &str,
+    new: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+    scope: &TriggerRowRenameScope,
+    hidden_tables: &HashSet<String>,
+) -> bool {
+    let mut changed = false;
+    let scoped_hidden = if let Some(with) = &mut select.with {
+        let (with_changed, hidden) = rename_trigger_row_column_refs_in_with_clause_with_scope(
+            with,
+            old,
+            new,
+            source_catalog,
+            scope,
+            hidden_tables,
+        );
+        changed |= with_changed;
+        hidden
+    } else {
+        hidden_tables.clone()
+    };
+    let mut first_core_scope = scope.clone();
+    changed |= rename_trigger_row_column_refs_in_select_core_with_scope(
+        &mut select.body.select,
+        old,
+        new,
+        source_catalog,
+        &scoped_hidden,
+        scope,
+        &mut first_core_scope,
+    );
+    for (_, core) in &mut select.body.compounds {
+        let mut compound_core_scope = scope.clone();
+        changed |= rename_trigger_row_column_refs_in_select_core_with_scope(
+            core,
+            old,
+            new,
+            source_catalog,
+            &scoped_hidden,
+            scope,
+            &mut compound_core_scope,
+        );
+    }
+    let order_scope = &first_core_scope;
+    changed |= rename_trigger_row_column_refs_in_ordering_terms_with_scope(
+        &mut select.order_by,
+        old,
+        new,
+        source_catalog,
+        &scoped_hidden,
+        order_scope,
+    );
+    if let Some(limit) = &mut select.limit {
+        changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+            &mut limit.limit,
+            old,
+            new,
+            source_catalog,
+            &scoped_hidden,
+            order_scope,
+        );
+        if let Some(offset) = &mut limit.offset {
+            changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                offset,
+                old,
+                new,
+                source_catalog,
+                &scoped_hidden,
+                order_scope,
+            );
+        }
+    }
+    changed
+}
+
+fn rename_trigger_row_column_refs_in_select_core_with_scope(
+    core: &mut SelectCore,
+    old: &str,
+    new: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+    hidden_tables: &HashSet<String>,
+    outer_scope: &TriggerRowRenameScope,
+    expression_scope: &mut TriggerRowRenameScope,
+) -> bool {
+    match core {
+        SelectCore::Values(rows) => rows.iter_mut().fold(false, |changed, row| {
+            row.iter_mut().fold(changed, |changed, expr| {
+                rename_trigger_row_column_refs_in_expr_with_scope(
+                    expr,
+                    old,
+                    new,
+                    source_catalog,
+                    hidden_tables,
+                    expression_scope,
+                ) | changed
+            })
+        }),
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            let mut changed = false;
+            if let Some(from_clause) = from {
+                changed |= rename_trigger_row_column_refs_in_table_or_subquery_with_scope(
+                    &mut from_clause.source,
+                    old,
+                    new,
+                    source_catalog,
+                    hidden_tables,
+                    outer_scope,
+                    expression_scope,
+                );
+                for join in &mut from_clause.joins {
+                    changed |= rename_trigger_row_column_refs_in_table_or_subquery_with_scope(
+                        &mut join.table,
+                        old,
+                        new,
+                        source_catalog,
+                        hidden_tables,
+                        outer_scope,
+                        expression_scope,
+                    );
+                }
+                for join in &mut from_clause.joins {
+                    if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+                        changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                            expr,
+                            old,
+                            new,
+                            source_catalog,
+                            hidden_tables,
+                            expression_scope,
+                        );
+                    }
+                }
+            }
+            for column in columns {
+                changed |= rename_trigger_row_column_refs_in_result_column_with_scope(
+                    column,
+                    old,
+                    new,
+                    source_catalog,
+                    hidden_tables,
+                    expression_scope,
+                );
+            }
+            if let Some(expr) = where_clause {
+                changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                    expr,
+                    old,
+                    new,
+                    source_catalog,
+                    hidden_tables,
+                    expression_scope,
+                );
+            }
+            for expr in group_by {
+                changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                    expr,
+                    old,
+                    new,
+                    source_catalog,
+                    hidden_tables,
+                    expression_scope,
+                );
+            }
+            if let Some(expr) = having {
+                changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                    expr,
+                    old,
+                    new,
+                    source_catalog,
+                    hidden_tables,
+                    expression_scope,
+                );
+            }
+            for window in windows {
+                changed |= rename_trigger_row_column_refs_in_window_spec_with_scope(
+                    &mut window.spec,
+                    old,
+                    new,
+                    source_catalog,
+                    hidden_tables,
+                    expression_scope,
+                );
+            }
+            changed
+        }
+    }
+}
+
+fn rename_trigger_row_column_refs_in_table_or_subquery_with_scope(
+    source: &mut TableOrSubquery,
+    old: &str,
+    new: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+    hidden_tables: &HashSet<String>,
+    outer_scope: &TriggerRowRenameScope,
+    expression_scope: &mut TriggerRowRenameScope,
+) -> bool {
+    match source {
+        TableOrSubquery::Subquery { query, alias } => {
+            let changed = rename_trigger_row_column_refs_in_select_with_scope(
+                query,
+                old,
+                new,
+                source_catalog,
+                outer_scope,
+                hidden_tables,
+            );
+            expression_scope.add_subquery_alias_if_may_expose_old_column(
+                alias.as_deref(),
+                query,
+                old,
+            );
+            changed
+        }
+        TableOrSubquery::TableFunction { name, args, alias } => {
+            let changed = args.iter_mut().fold(false, |changed, expr| {
+                rename_trigger_row_column_refs_in_expr_with_scope(
+                    expr,
+                    old,
+                    new,
+                    source_catalog,
+                    hidden_tables,
+                    outer_scope,
+                ) | changed
+            });
+            expression_scope.add_old_column_source();
+            expression_scope.add_source_alias_or_name(alias.as_deref(), name);
+            changed
+        }
+        TableOrSubquery::ParenJoin(from_clause) => {
+            let mut changed = rename_trigger_row_column_refs_in_table_or_subquery_with_scope(
+                &mut from_clause.source,
+                old,
+                new,
+                source_catalog,
+                hidden_tables,
+                outer_scope,
+                expression_scope,
+            );
+            for join in &mut from_clause.joins {
+                changed |= rename_trigger_row_column_refs_in_table_or_subquery_with_scope(
+                    &mut join.table,
+                    old,
+                    new,
+                    source_catalog,
+                    hidden_tables,
+                    outer_scope,
+                    expression_scope,
+                );
+            }
+            for join in &mut from_clause.joins {
+                if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+                    changed |= rename_trigger_row_column_refs_in_expr_with_scope(
+                        expr,
+                        old,
+                        new,
+                        source_catalog,
+                        hidden_tables,
+                        expression_scope,
+                    );
+                }
+            }
+            changed
+        }
+        TableOrSubquery::Table { name, alias, .. } => {
+            expression_scope.add_table_source_if_may_expose_old_column(
+                alias.as_deref(),
+                name,
+                hidden_tables,
+                source_catalog,
+            );
+            false
+        }
+    }
+}
+
+fn rename_trigger_row_column_refs_in_result_column_with_scope(
+    column: &mut ResultColumn,
+    old: &str,
+    new: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+    hidden_tables: &HashSet<String>,
+    scope: &TriggerRowRenameScope,
+) -> bool {
+    match column {
+        ResultColumn::Expr { expr, .. } => rename_trigger_row_column_refs_in_expr_with_scope(
+            expr,
+            old,
+            new,
+            source_catalog,
+            hidden_tables,
+            scope,
+        ),
+        ResultColumn::Star | ResultColumn::TableStar(_) => false,
+    }
+}
+
+fn rename_trigger_row_column_refs_in_expr(
+    expr: &mut Expr,
+    old: &str,
+    new: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+) -> bool {
+    let hidden_tables = HashSet::new();
+    rename_trigger_row_column_refs_in_expr_with_scope(
+        expr,
+        old,
+        new,
+        source_catalog,
+        &hidden_tables,
+        &TriggerRowRenameScope::default(),
+    )
+}
+
+fn rename_trigger_row_column_refs_in_expr_with_scope(
+    expr: &mut Expr,
+    old: &str,
+    new: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+    hidden_tables: &HashSet<String>,
+    scope: &TriggerRowRenameScope,
+) -> bool {
+    match expr {
+        Expr::Literal(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => false,
+        Expr::Column(col_ref, _) => match col_ref.table.as_deref() {
+            Some(table)
+                if is_trigger_row_name(table)
+                    && !scope.shadows_trigger_row(table)
+                    && col_ref.column.eq_ignore_ascii_case(old) =>
+            {
+                col_ref.column = Arc::from(new);
+                true
+            }
+            None if !scope.shadows_bare_old_column()
+                && col_ref.column.eq_ignore_ascii_case(old) =>
+            {
+                col_ref.column = Arc::from(new);
+                true
+            }
+            Some(_) | None => false,
+        },
+        Expr::BinaryOp { left, right, .. } => {
+            rename_trigger_row_column_refs_in_expr_with_scope(
+                left,
+                old,
+                new,
+                source_catalog,
+                hidden_tables,
+                scope,
+            ) | rename_trigger_row_column_refs_in_expr_with_scope(
+                right,
+                old,
+                new,
+                source_catalog,
+                hidden_tables,
+                scope,
+            )
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => rename_trigger_row_column_refs_in_expr_with_scope(
+            expr,
+            old,
+            new,
+            source_catalog,
+            hidden_tables,
+            scope,
+        ),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rename_trigger_row_column_refs_in_expr_with_scope(
+                expr,
+                old,
+                new,
+                source_catalog,
+                hidden_tables,
+                scope,
+            ) | rename_trigger_row_column_refs_in_expr_with_scope(
+                low,
+                old,
+                new,
+                source_catalog,
+                hidden_tables,
+                scope,
+            ) | rename_trigger_row_column_refs_in_expr_with_scope(
+                high,
+                old,
+                new,
+                source_catalog,
+                hidden_tables,
+                scope,
+            )
+        }
+        Expr::In { expr, set, .. } => {
+            let expr_changed = rename_trigger_row_column_refs_in_expr_with_scope(
+                expr,
+                old,
+                new,
+                source_catalog,
+                hidden_tables,
+                scope,
+            );
+            let set_changed = match set {
+                InSet::List(values) => values.iter_mut().fold(false, |changed, value| {
+                    rename_trigger_row_column_refs_in_expr_with_scope(
+                        value,
+                        old,
+                        new,
+                        source_catalog,
+                        hidden_tables,
+                        scope,
+                    ) | changed
+                }),
+                InSet::Subquery(query) => rename_trigger_row_column_refs_in_select_with_scope(
+                    query,
+                    old,
+                    new,
+                    source_catalog,
+                    scope,
+                    hidden_tables,
+                ),
+                InSet::Table(_) => false,
+            };
+            expr_changed | set_changed
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            rename_trigger_row_column_refs_in_expr_with_scope(
+                expr,
+                old,
+                new,
+                source_catalog,
+                hidden_tables,
+                scope,
+            ) | rename_trigger_row_column_refs_in_expr_with_scope(
+                pattern,
+                old,
+                new,
+                source_catalog,
+                hidden_tables,
+                scope,
+            ) | escape.as_deref_mut().is_some_and(|expr| {
+                rename_trigger_row_column_refs_in_expr_with_scope(
+                    expr,
+                    old,
+                    new,
+                    source_catalog,
+                    hidden_tables,
+                    scope,
+                )
+            })
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            let operand_changed = operand.as_deref_mut().is_some_and(|expr| {
+                rename_trigger_row_column_refs_in_expr_with_scope(
+                    expr,
+                    old,
+                    new,
+                    source_catalog,
+                    hidden_tables,
+                    scope,
+                )
+            });
+            let whens_changed = whens.iter_mut().fold(false, |changed, (when, then)| {
+                changed
+                    | rename_trigger_row_column_refs_in_expr_with_scope(
+                        when,
+                        old,
+                        new,
+                        source_catalog,
+                        hidden_tables,
+                        scope,
+                    )
+                    | rename_trigger_row_column_refs_in_expr_with_scope(
+                        then,
+                        old,
+                        new,
+                        source_catalog,
+                        hidden_tables,
+                        scope,
+                    )
+            });
+            let else_changed = else_expr.as_deref_mut().is_some_and(|expr| {
+                rename_trigger_row_column_refs_in_expr_with_scope(
+                    expr,
+                    old,
+                    new,
+                    source_catalog,
+                    hidden_tables,
+                    scope,
+                )
+            });
+            operand_changed | whens_changed | else_changed
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            let args_changed = match args {
+                FunctionArgs::List(args) => args.iter_mut().fold(false, |changed, arg| {
+                    rename_trigger_row_column_refs_in_expr_with_scope(
+                        arg,
+                        old,
+                        new,
+                        source_catalog,
+                        hidden_tables,
+                        scope,
+                    ) | changed
+                }),
+                FunctionArgs::Star => false,
+            };
+            let order_changed = rename_trigger_row_column_refs_in_ordering_terms_with_scope(
+                order_by,
+                old,
+                new,
+                source_catalog,
+                hidden_tables,
+                scope,
+            );
+            let filter_changed = filter.as_deref_mut().is_some_and(|expr| {
+                rename_trigger_row_column_refs_in_expr_with_scope(
+                    expr,
+                    old,
+                    new,
+                    source_catalog,
+                    hidden_tables,
+                    scope,
+                )
+            });
+            let over_changed = over.as_mut().is_some_and(|window| {
+                rename_trigger_row_column_refs_in_window_spec_with_scope(
+                    window,
+                    old,
+                    new,
+                    source_catalog,
+                    hidden_tables,
+                    scope,
+                )
+            });
+            args_changed | order_changed | filter_changed | over_changed
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            rename_trigger_row_column_refs_in_expr_with_scope(
+                expr,
+                old,
+                new,
+                source_catalog,
+                hidden_tables,
+                scope,
+            ) | rename_trigger_row_column_refs_in_expr_with_scope(
+                path,
+                old,
+                new,
+                source_catalog,
+                hidden_tables,
+                scope,
+            )
+        }
+        Expr::RowValue(values, _) => values.iter_mut().fold(false, |changed, value| {
+            rename_trigger_row_column_refs_in_expr_with_scope(
+                value,
+                old,
+                new,
+                source_catalog,
+                hidden_tables,
+                scope,
+            ) | changed
+        }),
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+            rename_trigger_row_column_refs_in_select_with_scope(
+                subquery,
+                old,
+                new,
+                source_catalog,
+                scope,
+                hidden_tables,
+            )
+        }
+    }
+}
+
+fn rename_trigger_row_column_refs_in_ordering_terms_with_scope(
+    order_by: &mut [OrderingTerm],
+    old: &str,
+    new: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+    hidden_tables: &HashSet<String>,
+    scope: &TriggerRowRenameScope,
+) -> bool {
+    order_by.iter_mut().fold(false, |changed, term| {
+        rename_trigger_row_column_refs_in_expr_with_scope(
+            &mut term.expr,
+            old,
+            new,
+            source_catalog,
+            hidden_tables,
+            scope,
+        ) | changed
+    })
+}
+
+fn rename_trigger_row_column_refs_in_window_spec_with_scope(
+    window: &mut WindowSpec,
+    old: &str,
+    new: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+    hidden_tables: &HashSet<String>,
+    scope: &TriggerRowRenameScope,
+) -> bool {
+    window.partition_by.iter_mut().fold(false, |changed, expr| {
+        rename_trigger_row_column_refs_in_expr_with_scope(
+            expr,
+            old,
+            new,
+            source_catalog,
+            hidden_tables,
+            scope,
+        ) | changed
+    }) | rename_trigger_row_column_refs_in_ordering_terms_with_scope(
+        &mut window.order_by,
+        old,
+        new,
+        source_catalog,
+        hidden_tables,
+        scope,
+    ) | window.frame.as_mut().is_some_and(|frame| {
+        rename_trigger_row_column_refs_in_frame_spec_with_scope(
+            frame,
+            old,
+            new,
+            source_catalog,
+            hidden_tables,
+            scope,
+        )
+    })
+}
+
+fn rename_trigger_row_column_refs_in_frame_spec_with_scope(
+    frame: &mut FrameSpec,
+    old: &str,
+    new: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+    hidden_tables: &HashSet<String>,
+    scope: &TriggerRowRenameScope,
+) -> bool {
+    rename_trigger_row_column_refs_in_frame_bound_with_scope(
+        &mut frame.start,
+        old,
+        new,
+        source_catalog,
+        hidden_tables,
+        scope,
+    ) | frame.end.as_mut().is_some_and(|bound| {
+        rename_trigger_row_column_refs_in_frame_bound_with_scope(
+            bound,
+            old,
+            new,
+            source_catalog,
+            hidden_tables,
+            scope,
+        )
+    })
+}
+
+fn rename_trigger_row_column_refs_in_frame_bound_with_scope(
+    bound: &mut FrameBound,
+    old: &str,
+    new: &str,
+    source_catalog: &ColumnRenameSourceCatalog,
+    hidden_tables: &HashSet<String>,
+    scope: &TriggerRowRenameScope,
+) -> bool {
+    match bound {
+        FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
+            rename_trigger_row_column_refs_in_expr_with_scope(
+                expr,
+                old,
+                new,
+                source_catalog,
+                hidden_tables,
+                scope,
+            )
+        }
+        FrameBound::UnboundedPreceding
+        | FrameBound::CurrentRow
+        | FrameBound::UnboundedFollowing => false,
+    }
+}
+
+fn rename_column_refs_in_expr(expr: &mut Expr, old: &str, new: &str) -> bool {
+    match expr {
+        Expr::Literal(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => false,
+        Expr::Column(col_ref, _) => {
+            if col_ref.column.eq_ignore_ascii_case(old) {
+                col_ref.column = Arc::from(new);
+                true
+            } else {
+                false
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rename_column_refs_in_expr(left, old, new) | rename_column_refs_in_expr(right, old, new)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => rename_column_refs_in_expr(expr, old, new),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rename_column_refs_in_expr(expr, old, new)
+                | rename_column_refs_in_expr(low, old, new)
+                | rename_column_refs_in_expr(high, old, new)
+        }
+        Expr::In { expr, set, .. } => {
+            let expr_changed = rename_column_refs_in_expr(expr, old, new);
+            let set_changed = match set {
+                InSet::List(values) => rename_column_refs_in_exprs(values, old, new),
+                InSet::Subquery(_) | InSet::Table(_) => false,
+            };
+            expr_changed | set_changed
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            rename_column_refs_in_expr(expr, old, new)
+                | rename_column_refs_in_expr(pattern, old, new)
+                | escape
+                    .as_deref_mut()
+                    .is_some_and(|expr| rename_column_refs_in_expr(expr, old, new))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            let operand_changed = operand
+                .as_deref_mut()
+                .is_some_and(|expr| rename_column_refs_in_expr(expr, old, new));
+            let whens_changed = whens.iter_mut().fold(false, |changed, (when, then)| {
+                changed
+                    | rename_column_refs_in_expr(when, old, new)
+                    | rename_column_refs_in_expr(then, old, new)
+            });
+            let else_changed = else_expr
+                .as_deref_mut()
+                .is_some_and(|expr| rename_column_refs_in_expr(expr, old, new));
+            operand_changed | whens_changed | else_changed
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            let args_changed = match args {
+                FunctionArgs::List(args) => rename_column_refs_in_exprs(args, old, new),
+                FunctionArgs::Star => false,
+            };
+            let order_changed = rename_column_refs_in_ordering_terms(order_by, old, new);
+            let filter_changed = filter
+                .as_deref_mut()
+                .is_some_and(|expr| rename_column_refs_in_expr(expr, old, new));
+            let over_changed = over
+                .as_mut()
+                .is_some_and(|window| rename_column_refs_in_window_spec(window, old, new));
+            args_changed | order_changed | filter_changed | over_changed
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            rename_column_refs_in_expr(expr, old, new) | rename_column_refs_in_expr(path, old, new)
+        }
+        Expr::RowValue(values, _) => rename_column_refs_in_exprs(values, old, new),
+        Expr::Exists { .. } | Expr::Subquery(..) => false,
+    }
+}
+
+fn rename_column_refs_in_exprs(exprs: &mut [Expr], old: &str, new: &str) -> bool {
+    exprs.iter_mut().fold(false, |changed, expr| {
+        rename_column_refs_in_expr(expr, old, new) | changed
+    })
+}
+
+fn rename_column_refs_in_ordering_terms(
+    order_by: &mut [OrderingTerm],
+    old: &str,
+    new: &str,
+) -> bool {
+    order_by.iter_mut().fold(false, |changed, term| {
+        rename_column_refs_in_expr(&mut term.expr, old, new) | changed
+    })
+}
+
+fn rename_column_refs_in_window_spec(window: &mut WindowSpec, old: &str, new: &str) -> bool {
+    rename_column_refs_in_exprs(&mut window.partition_by, old, new)
+        | rename_column_refs_in_ordering_terms(&mut window.order_by, old, new)
+        | window
+            .frame
+            .as_mut()
+            .is_some_and(|frame| rename_column_refs_in_frame_spec(frame, old, new))
+}
+
+fn rename_column_refs_in_frame_spec(frame: &mut FrameSpec, old: &str, new: &str) -> bool {
+    rename_column_refs_in_frame_bound(&mut frame.start, old, new)
+        | frame
+            .end
+            .as_mut()
+            .is_some_and(|bound| rename_column_refs_in_frame_bound(bound, old, new))
+}
+
+fn rename_column_refs_in_frame_bound(bound: &mut FrameBound, old: &str, new: &str) -> bool {
+    match bound {
+        FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
+            rename_column_refs_in_expr(expr, old, new)
+        }
+        FrameBound::UnboundedPreceding
+        | FrameBound::CurrentRow
+        | FrameBound::UnboundedFollowing => false,
+    }
 }
 
 fn collect_primary_key_constraints(
@@ -66660,6 +73097,39 @@ fn resolve_operand_collation(expr: &Expr, schemas: &[TableSchema]) -> Option<Str
     None
 }
 
+fn resolve_operand_affinity(expr: &Expr, schemas: &[TableSchema]) -> TypeAffinity {
+    if let Expr::Cast { type_name, .. } = expr {
+        return TypeAffinity::from_type_name(&type_name.name);
+    }
+    if let Expr::Collate { expr: inner, .. } = expr {
+        return resolve_operand_affinity(inner, schemas);
+    }
+    if let Expr::Column(cr, _) = expr {
+        for schema in schemas {
+            let name_matches = cr
+                .table
+                .as_ref()
+                .is_none_or(|t| t.eq_ignore_ascii_case(&schema.name));
+            if name_matches {
+                if let Some(col) = schema
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(&cr.column))
+                {
+                    return match col.affinity {
+                        'B' | 'b' => TypeAffinity::Text,
+                        'C' | 'c' => TypeAffinity::Numeric,
+                        'D' | 'd' => TypeAffinity::Integer,
+                        'E' | 'e' => TypeAffinity::Real,
+                        _ => TypeAffinity::Blob,
+                    };
+                }
+            }
+        }
+    }
+    TypeAffinity::Blob
+}
+
 fn resolve_named_order_term_idx(
     col_name: &str,
     order_table: Option<&str>,
@@ -69376,6 +75846,96 @@ fn is_virtual_table_sql(sql: &str) -> bool {
         .starts_with("CREATE VIRTUAL TABLE")
 }
 
+fn virtual_table_shadow_drop_names(table_name: &str, sql: &str) -> Vec<String> {
+    let Ok(Statement::CreateVirtualTable(stmt)) = parse_single_statement(sql) else {
+        return Vec::new();
+    };
+    let module = stmt.module.to_ascii_lowercase();
+    match module.as_str() {
+        "fts5" => fts5_shadow_drop_names(table_name, &stmt.args),
+        "fts4" => fts4_shadow_drop_names(table_name, &stmt.args),
+        "fts3" => vec![
+            format!("{table_name}_content"),
+            format!("{table_name}_segments"),
+            format!("{table_name}_segdir"),
+        ],
+        "rtree" | "rtree_i32" => vec![
+            format!("{table_name}_node"),
+            format!("{table_name}_rowid"),
+            format!("{table_name}_parent"),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn fts5_shadow_drop_names(table_name: &str, args: &[String]) -> Vec<String> {
+    let mut names = vec![
+        format!("{table_name}_data"),
+        format!("{table_name}_idx"),
+        format!("{table_name}_config"),
+    ];
+    if virtual_table_option_value(args, "content").is_none() {
+        names.push(format!("{table_name}_content"));
+    }
+    if !matches!(
+        virtual_table_option_value(args, "columnsize").as_deref(),
+        Some("0")
+    ) {
+        names.push(format!("{table_name}_docsize"));
+    }
+    names
+}
+
+fn fts4_shadow_drop_names(table_name: &str, args: &[String]) -> Vec<String> {
+    let mut names = Vec::new();
+    if virtual_table_option_value(args, "content").is_none() {
+        names.push(format!("{table_name}_content"));
+    }
+    names.extend([
+        format!("{table_name}_segments"),
+        format!("{table_name}_segdir"),
+    ]);
+    if !matches!(
+        virtual_table_option_value(args, "matchinfo").as_deref(),
+        Some("fts3")
+    ) {
+        names.push(format!("{table_name}_docsize"));
+    }
+    names.push(format!("{table_name}_stat"));
+    names
+}
+
+fn virtual_table_option_value(args: &[String], option: &str) -> Option<String> {
+    args.iter().find_map(|arg| {
+        let (key, value) = arg.split_once('=')?;
+        if normalize_virtual_table_option_token(key) == option {
+            Some(normalize_virtual_table_option_token(value))
+        } else {
+            None
+        }
+    })
+}
+
+fn normalize_virtual_table_option_token(token: &str) -> String {
+    let trimmed = token.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if matches!((first, last), (b'\'', b'\'') | (b'"', b'"') | (b'`', b'`')) {
+            let body = &trimmed[1..trimmed.len() - 1];
+            let quote = char::from(first);
+            return body
+                .replace(&format!("{quote}{quote}"), &quote.to_string())
+                .to_ascii_lowercase();
+        }
+        if first == b'[' && last == b']' {
+            return trimmed[1..trimmed.len() - 1].to_ascii_lowercase();
+        }
+    }
+    trimmed.to_ascii_lowercase()
+}
+
 fn is_without_rowid_table_sql(sql: &str) -> bool {
     crate::compat_persist::is_without_rowid_table_sql(sql)
 }
@@ -69386,18 +75946,8 @@ fn should_ignore_expected_master_row_for_integrity(row: &[SqliteValue]) -> Resul
 }
 
 fn should_ignore_actual_master_row_for_integrity(row: &[SqliteValue]) -> Result<bool> {
-    let (entry_type, name, _, root_page) = sqlite_master_signature(row)?;
+    let (entry_type, name, _, _) = sqlite_master_signature(row)?;
     if entry_type == "index" && is_implicit_autoindex_name(&name) {
-        return Ok(true);
-    }
-    // Stock SQLite records virtual tables with rootpage=0. Those legacy
-    // declarations are skipped during schema reload and should not count as
-    // integrity mismatches. Materialized positive-rootpage virtual tables are
-    // now kept in the schema, so they must remain visible to integrity checks.
-    if entry_type == "table"
-        && root_page == 0
-        && sqlite_master_sql_text(row)?.is_some_and(is_virtual_table_sql)
-    {
         return Ok(true);
     }
     Ok(false)
@@ -71948,6 +78498,12 @@ enum InsertTarget {
     HiddenRowid,
 }
 
+#[derive(Default)]
+struct InsertSelectReplayOutcome {
+    changes: usize,
+    returning_rows: Vec<Row>,
+}
+
 #[derive(Debug, Clone)]
 struct InsertTargetLayout {
     table_columns: Vec<String>,
@@ -74221,9 +80777,16 @@ fn simple_match_fts5_expr(expr: &Fts5Expr, document: &str, columns: &[(String, S
             simple_match_fts5_expr(left, document, columns)
                 && !simple_match_fts5_expr(right, document, columns)
         }
-        Fts5Expr::Near(terms, _) => terms
-            .iter()
-            .all(|term| simple_match_term(term, &document.to_lowercase())),
+        Fts5Expr::Near(operands, _) => {
+            let doc_lower = document.to_lowercase();
+            operands.iter().all(|op| match op {
+                fsqlite_ext_fts5::Fts5NearOperand::Term(t) => simple_match_term(t, &doc_lower),
+                fsqlite_ext_fts5::Fts5NearOperand::Prefix(p) => simple_match_prefix(p, &doc_lower),
+                fsqlite_ext_fts5::Fts5NearOperand::Phrase(words) => {
+                    doc_lower.contains(&words.join(" ").to_lowercase())
+                }
+            })
+        }
         Fts5Expr::ColumnFilter(column_name, inner) => {
             let filtered_columns: Vec<(String, String)> = columns
                 .iter()
@@ -74254,6 +80817,14 @@ fn simple_match_fts5_expr(expr: &Fts5Expr, document: &str, columns: &[(String, S
                 .starts_with(&words.join(" ").to_lowercase()),
             _ => simple_match_fts5_expr(inner, document, columns),
         },
+        Fts5Expr::PhrasePrefix(words, prefix) => {
+            let doc_lower = document.to_lowercase();
+            let phrase = words.join(" ").to_lowercase();
+            if !phrase.is_empty() && !doc_lower.contains(&phrase) {
+                return false;
+            }
+            simple_match_prefix(prefix, &doc_lower)
+        }
     }
 }
 
@@ -75755,7 +82326,7 @@ mod tests {
         statement_contains_rewritable_subquery, wal_file_present_with_vfs, wal_path_for_db_path,
     };
     use crate::region::RegionKind;
-    use fsqlite_ast::{JoinKind, Statement};
+    use fsqlite_ast::{JoinKind, SortDirection, Statement};
     use fsqlite_btree::BtreeCursorOps;
     use fsqlite_error::{FrankenError, Result};
     use fsqlite_func::vtab::{
@@ -81609,6 +88180,69 @@ mod tests {
     }
 
     #[test]
+    fn test_prepared_expression_query_row_order_by_limit_matches_rusqlite_without_row_cap() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let sql = "SELECT 'gamma' || '' AS val ORDER BY val LIMIT 1";
+        let stmt = fconn.prepare(sql).unwrap();
+        assert!(
+            stmt.prepared_query_fast_path.is_none(),
+            "expression-only ORDER BY/LIMIT should use the expression postprocess path",
+        );
+        assert!(
+            !stmt.can_use_query_row_result_row_cap(),
+            "expression ORDER BY/LIMIT postprocessing must run before query_row cardinality checks",
+        );
+
+        let frow = stmt.query_row().unwrap();
+        let expected: String = rconn.query_row(sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(frow.values(), &[SqliteValue::Text(expected.into())]);
+    }
+
+    #[test]
+    fn test_prepared_table_program_scalar_functions_keep_registry_and_match_rusqlite() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        for sql in [
+            "CREATE TABLE prep_func_registry (id INTEGER PRIMARY KEY, name TEXT, nickname TEXT);",
+            "INSERT INTO prep_func_registry VALUES (1, 'alpha', NULL), (2, 'beta', 'bee');",
+        ] {
+            fconn.execute(sql).unwrap();
+            rconn.execute_batch(sql).unwrap();
+        }
+
+        let sql = "SELECT upper(name), length(name), coalesce(nickname, 'missing') \
+             FROM prep_func_registry WHERE id = ?1";
+        let stmt = fconn.prepare(sql).unwrap();
+        assert!(
+            stmt.db.is_some(),
+            "table-backed prepared SELECT should compile to a reusable table program"
+        );
+        assert!(
+            stmt.func_registry.is_some(),
+            "prepared table programs must carry a function registry for scalar execution"
+        );
+
+        let row = stmt.query_with_params(&[SqliteValue::Integer(2)]).unwrap();
+        let expected: (String, i64, String) = rconn
+            .query_row(sql, rusqlite::params![2_i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(row.len(), 1);
+        assert_eq!(
+            row[0].values(),
+            &[
+                SqliteValue::Text(expected.0.into()),
+                SqliteValue::Integer(expected.1),
+                SqliteValue::Text(expected.2.into()),
+            ]
+        );
+    }
+
+    #[test]
     fn test_prepared_count_star_query_row_uses_fast_path_and_tracks_write_through_rows() {
         let _profile_guard = super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
         let conn = Connection::open(":memory:").unwrap();
@@ -85831,6 +92465,361 @@ mod tests {
     }
 
     #[test]
+    fn test_alter_table_rename_to_rejects_duplicate_target() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE old_name (x INTEGER);").unwrap();
+        conn.execute("CREATE TABLE existing_name (x INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO old_name VALUES (42);").unwrap();
+
+        let err = conn
+            .execute("ALTER TABLE old_name RENAME TO existing_name;")
+            .expect_err("renaming to an existing table should fail");
+        assert!(
+            err.to_string().contains("already exists"),
+            "unexpected error: {err}"
+        );
+
+        let rows = conn.query("SELECT x FROM old_name;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(42));
+    }
+
+    #[test]
+    fn test_alter_table_rename_to_rejects_index_target() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE old_name (x INTEGER);").unwrap();
+        conn.execute("CREATE INDEX existing_name ON old_name(x);")
+            .unwrap();
+        conn.execute("INSERT INTO old_name VALUES (42);").unwrap();
+
+        let err = conn
+            .execute("ALTER TABLE old_name RENAME TO existing_name;")
+            .expect_err("renaming to an existing index should fail");
+        assert!(
+            err.to_string().contains("already exists"),
+            "unexpected error: {err}"
+        );
+
+        let rows = conn.query("SELECT x FROM old_name;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(42));
+        let rows = conn
+            .query("SELECT name FROM sqlite_master WHERE type='index' AND name='existing_name';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_alter_table_rename_to_rejects_view_target() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE old_name (x INTEGER);").unwrap();
+        conn.execute("CREATE VIEW existing_name AS SELECT x FROM old_name;")
+            .unwrap();
+        conn.execute("INSERT INTO old_name VALUES (42);").unwrap();
+
+        let err = conn
+            .execute("ALTER TABLE old_name RENAME TO existing_name;")
+            .expect_err("renaming to an existing view should fail");
+        assert!(
+            err.to_string().contains("already exists"),
+            "unexpected error: {err}"
+        );
+
+        let rows = conn.query("SELECT x FROM old_name;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(42));
+        let rows = conn
+            .query("SELECT name FROM sqlite_master WHERE type='view' AND name='existing_name';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_alter_table_rename_to_updates_child_foreign_key_sql() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("CREATE TABLE child (parent_id INTEGER REFERENCES parent(id));")
+            .unwrap();
+
+        conn.execute("ALTER TABLE parent RENAME TO renamed_parent;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='table' AND name='child';")
+            .unwrap();
+        let child_sql = row_values(&rows[0])[0].to_text();
+        assert!(child_sql.contains("renamed_parent"), "{child_sql}");
+        assert!(!child_sql.contains("REFERENCES parent"), "{child_sql}");
+
+        let schema = conn.schema.borrow();
+        let child = schema.iter().find(|table| table.name == "child").unwrap();
+        assert_eq!(child.foreign_keys[0].parent_table, "renamed_parent");
+        drop(schema);
+
+        conn.execute("INSERT INTO renamed_parent(id) VALUES (7);")
+            .unwrap();
+        conn.execute("INSERT INTO child(parent_id) VALUES (7);")
+            .unwrap();
+        let err = conn.execute("INSERT INTO child(parent_id) VALUES (8);");
+        assert!(
+            err.is_err(),
+            "renamed parent-table FK should still be enforced"
+        );
+    }
+
+    #[test]
+    fn test_alter_table_rename_to_updates_dependent_view_sql_and_query() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE source_table (a INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO source_table VALUES (7);")
+            .unwrap();
+        conn.execute(
+            "CREATE VIEW source_view AS \
+             SELECT source_table.a FROM source_table WHERE source_table.a > 0;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE source_table RENAME TO renamed_table;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='source_view';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        assert!(view_sql.contains("renamed_table"), "{view_sql}");
+        assert!(!view_sql.contains("source_table"), "{view_sql}");
+
+        let rows = conn.query("SELECT a FROM source_view;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(7));
+    }
+
+    #[test]
+    fn test_alter_table_rename_to_keeps_attached_schema_view_refs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE source_table (a INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE VIEW source_view AS \
+             SELECT source_table.a FROM aux.source_table;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE source_table RENAME TO renamed_table;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='source_view';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(
+            lower_view_sql.contains("from aux.source_table"),
+            "{view_sql}"
+        );
+        assert!(!lower_view_sql.contains("aux.renamed_table"), "{view_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_to_updates_view_sql_with_trigger_name_collision() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE source_table (a INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE fire_table (a INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TRIGGER source_view AFTER INSERT ON fire_table BEGIN SELECT 1; END;")
+            .unwrap();
+        conn.execute("CREATE VIEW source_view AS SELECT source_table.a FROM source_table;")
+            .unwrap();
+
+        conn.execute("ALTER TABLE source_table RENAME TO renamed_table;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='source_view';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        assert!(view_sql.contains("renamed_table"), "{view_sql}");
+        assert!(!view_sql.contains("source_table"), "{view_sql}");
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='source_view';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        assert!(trigger_sql.contains("CREATE TRIGGER"), "{trigger_sql}");
+        assert!(!trigger_sql.contains("CREATE VIEW"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_to_preserves_cte_shadow_in_view() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE source_table (a INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE VIEW cte_view AS \
+             WITH source_table(a) AS (SELECT 9) SELECT a FROM source_table;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE source_table RENAME TO renamed_table;")
+            .unwrap();
+
+        let rows = conn.query("SELECT a FROM cte_view;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(9));
+    }
+
+    #[test]
+    fn test_alter_table_rename_to_updates_trigger_target_and_body_sql() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE source_table (a INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE audit_log (a INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER source_ai AFTER INSERT ON source_table BEGIN
+                INSERT INTO audit_log
+                SELECT source_table.a FROM source_table WHERE source_table.a = NEW.a;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE source_table RENAME TO renamed_table;")
+            .unwrap();
+        conn.execute("INSERT INTO renamed_table VALUES (11);")
+            .unwrap();
+
+        let rows = conn.query("SELECT a FROM audit_log;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(11));
+
+        let rows = conn
+            .query("SELECT tbl_name, sql FROM sqlite_master WHERE type='trigger' AND name='source_ai';")
+            .unwrap();
+        let values = row_values(&rows[0]);
+        assert_eq!(values[0], SqliteValue::Text("renamed_table".into()));
+        let trigger_sql = values[1].to_text();
+        assert!(trigger_sql.contains("renamed_table"), "{trigger_sql}");
+        assert!(!trigger_sql.contains("source_table"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_to_updates_trigger_sql_with_table_name_collision() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE collision_name (x INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE source_table (a INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE fire_table (a INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE audit_log (a INTEGER);").unwrap();
+        conn.execute("INSERT INTO source_table VALUES (1);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER collision_name AFTER INSERT ON fire_table
+             WHEN (SELECT count(*) FROM source_table) > 0
+             BEGIN
+                INSERT INTO audit_log VALUES (NEW.a);
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE source_table RENAME TO renamed_table;")
+            .unwrap();
+        conn.execute("INSERT INTO fire_table VALUES (33);").unwrap();
+
+        let rows = conn.query("SELECT a FROM audit_log;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(33));
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='table' AND name='collision_name';")
+            .unwrap();
+        let table_sql = row_values(&rows[0])[0].to_text();
+        assert!(table_sql.contains("CREATE TABLE"), "{table_sql}");
+        assert!(!table_sql.contains("CREATE TRIGGER"), "{table_sql}");
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='collision_name';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        assert!(trigger_sql.contains("renamed_table"), "{trigger_sql}");
+        assert!(!trigger_sql.contains("source_table"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_to_preserves_same_named_trigger_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rename_table_trigger_name_collision.db");
+        let path_str = path.to_string_lossy().into_owned();
+
+        {
+            let conn = Connection::open(&path_str).unwrap();
+            conn.execute("CREATE TABLE source_table (a INTEGER);")
+                .unwrap();
+            conn.execute("CREATE TABLE fire_table (a INTEGER);")
+                .unwrap();
+            conn.execute(
+                "CREATE TRIGGER source_table AFTER INSERT ON fire_table BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+
+            conn.execute("ALTER TABLE source_table RENAME TO renamed_table;")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        {
+            let conn = Connection::open(&path_str).unwrap();
+            let rows = conn
+                .query(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='renamed_table';",
+                )
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            let rows = conn
+                .query(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' AND name='source_table';",
+                )
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_alter_table_rename_to_updates_trigger_when_sql() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE source_table (a INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE fire_table (a INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE audit_log (a INTEGER);").unwrap();
+        conn.execute("INSERT INTO source_table VALUES (1);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER fire_ai AFTER INSERT ON fire_table
+             WHEN (SELECT count(*) FROM source_table) > 0
+             BEGIN
+                INSERT INTO audit_log VALUES (NEW.a);
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE source_table RENAME TO renamed_table;")
+            .unwrap();
+        conn.execute("INSERT INTO fire_table VALUES (22);").unwrap();
+
+        let rows = conn.query("SELECT a FROM audit_log;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(22));
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='fire_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        assert!(trigger_sql.contains("renamed_table"), "{trigger_sql}");
+        assert!(!trigger_sql.contains("source_table"), "{trigger_sql}");
+    }
+
+    #[test]
     fn test_alter_table_rename_column() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
@@ -85845,11 +92834,75 @@ mod tests {
     }
 
     #[test]
+    fn test_alter_table_rename_column_rejects_duplicate_target() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER, existing_col TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (10, 'kept');").unwrap();
+
+        let err = conn
+            .execute("ALTER TABLE t RENAME COLUMN old_col TO existing_col;")
+            .expect_err("renaming to an existing column should fail");
+        assert!(
+            err.to_string().contains("duplicate column name"),
+            "unexpected error: {err}"
+        );
+
+        let rows = conn.query("SELECT old_col, existing_col FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(10));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("kept".into()));
+
+        let schema = conn.schema.borrow();
+        let table = schema.iter().find(|table| table.name == "t").unwrap();
+        assert_eq!(table.columns[0].name, "old_col");
+        assert_eq!(table.columns[1].name, "existing_col");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_child_foreign_key_sql() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute("CREATE TABLE parent (old_col INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("CREATE TABLE child (parent_id INTEGER REFERENCES parent(old_col));")
+            .unwrap();
+
+        conn.execute("ALTER TABLE parent RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='table' AND name='child';")
+            .unwrap();
+        let child_sql = row_values(&rows[0])[0].to_text();
+        assert!(child_sql.contains("new_col"), "{child_sql}");
+        assert!(!child_sql.contains("old_col"), "{child_sql}");
+
+        let schema = conn.schema.borrow();
+        let child = schema.iter().find(|table| table.name == "child").unwrap();
+        assert_eq!(
+            child.foreign_keys[0].parent_columns,
+            vec!["new_col".to_owned()]
+        );
+        drop(schema);
+
+        conn.execute("INSERT INTO parent(new_col) VALUES (7);")
+            .unwrap();
+        conn.execute("INSERT INTO child(parent_id) VALUES (7);")
+            .unwrap();
+        let err = conn.execute("INSERT INTO child(parent_id) VALUES (8);");
+        assert!(
+            err.is_err(),
+            "renamed parent-column FK should still be enforced"
+        );
+    }
+
+    #[test]
     fn test_alter_table_rename_column_updates_explicit_index_sql() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (old_col INTEGER, payload TEXT);")
             .unwrap();
-        conn.execute("CREATE INDEX idx_t_old_col ON t(old_col);")
+        conn.execute("CREATE INDEX idx_t_old_col ON t(old_col COLLATE NOCASE DESC);")
             .unwrap();
 
         conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
@@ -85859,13 +92912,1852 @@ mod tests {
             .query("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_t_old_col';")
             .unwrap();
         let sql = row_values(&rows[0])[0].to_text();
-        assert!(sql.contains("(new_col)"), "{sql}");
-        assert!(!sql.contains("(old_col)"), "{sql}");
+        assert!(sql.contains("new_col"), "{sql}");
+        assert!(sql.contains("COLLATE"), "{sql}");
+        assert!(sql.contains("NOCASE"), "{sql}");
+        assert!(sql.contains("DESC"), "{sql}");
+        assert!(!sql.contains("\"old_col\""), "{sql}");
 
         let schema = conn.schema.borrow();
         let table = schema.iter().find(|table| table.name == "t").unwrap();
         assert_eq!(table.indexes[0].columns, vec!["new_col".to_owned()]);
-        assert_eq!(table.indexes[0].key_expressions, vec!["new_col".to_owned()]);
+        assert!(table.indexes[0].key_expressions.is_empty());
+        assert_eq!(
+            table.indexes[0].key_collations,
+            vec![Some("NOCASE".to_owned())]
+        );
+        assert_eq!(
+            table.indexes[0].key_sort_directions,
+            vec![SortDirection::Desc]
+        );
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_index_when_trigger_name_collides() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER, payload TEXT);")
+            .unwrap();
+        conn.execute("CREATE TRIGGER idx_collision AFTER INSERT ON t BEGIN SELECT 1; END;")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_collision ON t(old_col);")
+            .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_collision';")
+            .unwrap();
+        let index_sql = row_values(&rows[0])[0].to_text();
+        assert!(index_sql.contains("new_col"), "{index_sql}");
+        assert!(!index_sql.contains("old_col"), "{index_sql}");
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='idx_collision';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        assert!(trigger_sql.contains("CREATE TRIGGER"), "{trigger_sql}");
+        assert!(!trigger_sql.contains("CREATE INDEX"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_to_updates_implicit_autoindex_name() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER UNIQUE);")
+            .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME TO renamed_t;").unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT name, tbl_name, sql FROM sqlite_master \
+                 WHERE type='index' ORDER BY name;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let values = row_values(&rows[0]);
+        assert_eq!(
+            values[0],
+            SqliteValue::Text("sqlite_autoindex_renamed_t_1".into())
+        );
+        assert_eq!(values[1], SqliteValue::Text("renamed_t".into()));
+        assert_eq!(values[2], SqliteValue::Null);
+
+        let schema = conn.schema.borrow();
+        let table = schema
+            .iter()
+            .find(|table| table.name == "renamed_t")
+            .unwrap();
+        assert_eq!(table.indexes[0].name, "sqlite_autoindex_renamed_t_1");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_expression_index_sql() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col TEXT, payload TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t_lower_key ON t(lower(old_col) COLLATE NOCASE DESC);")
+            .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_t_lower_key';")
+            .unwrap();
+        let sql = row_values(&rows[0])[0].to_text();
+        let lower_sql = sql.to_ascii_lowercase();
+        assert!(lower_sql.contains("lower(new_col)"), "{sql}");
+        assert!(lower_sql.contains("collate nocase"), "{sql}");
+        assert!(lower_sql.contains("desc"), "{sql}");
+        assert!(!lower_sql.contains("old_col"), "{sql}");
+
+        let schema = conn.schema.borrow();
+        let table = schema.iter().find(|table| table.name == "t").unwrap();
+        assert!(table.indexes[0].columns.is_empty());
+        assert_eq!(table.indexes[0].key_expressions.len(), 1);
+        assert!(table.indexes[0].key_expressions[0].contains("new_col"));
+        assert!(!table.indexes[0].key_expressions[0].contains("old_col"));
+        assert_eq!(
+            table.indexes[0].key_sort_directions,
+            vec![SortDirection::Desc]
+        );
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_partial_index_where_sql() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER, payload TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE INDEX idx_t_payload_active ON t(payload) \
+             WHERE old_col > 0 AND payload <> 'old_col';",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_t_payload_active';",
+            )
+            .unwrap();
+        let sql = row_values(&rows[0])[0].to_text();
+        let lower_sql = sql.to_ascii_lowercase();
+        assert!(lower_sql.contains("new_col > 0"), "{sql}");
+        assert!(lower_sql.contains("'old_col'"), "{sql}");
+        assert!(!lower_sql.contains("old_col > 0"), "{sql}");
+
+        let schema = conn.schema.borrow();
+        let table = schema.iter().find(|table| table.name == "t").unwrap();
+        assert_eq!(
+            table.indexes[0].where_clause.as_deref(),
+            Some("(new_col > 0) AND (payload != 'old_col')")
+        );
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_check_constraint_sql() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE t (
+                old_col INTEGER,
+                payload TEXT,
+                CHECK(old_col > 0 AND payload <> 'old_col')
+            );",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='table' AND name='t';")
+            .unwrap();
+        let sql = row_values(&rows[0])[0].to_text();
+        let lower_sql = sql.to_ascii_lowercase();
+        assert!(lower_sql.contains("new_col > 0"), "{sql}");
+        assert!(lower_sql.contains("'old_col'"), "{sql}");
+        assert!(!lower_sql.contains("old_col > 0"), "{sql}");
+
+        let err = conn.execute("INSERT INTO t (new_col, payload) VALUES (-1, 'ok');");
+        assert!(
+            err.is_err(),
+            "renamed CHECK expression should still enforce"
+        );
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_generated_column_sql() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE t (
+                old_col INTEGER,
+                doubled INTEGER GENERATED ALWAYS AS (old_col * 2) STORED
+            );",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='table' AND name='t';")
+            .unwrap();
+        let sql = row_values(&rows[0])[0].to_text();
+        let lower_sql = sql.to_ascii_lowercase();
+        assert!(
+            lower_sql.contains("generated always as (new_col * 2)"),
+            "{sql}"
+        );
+        assert!(!lower_sql.contains("old_col * 2"), "{sql}");
+
+        let schema = conn.schema.borrow();
+        let table = schema.iter().find(|table| table.name == "t").unwrap();
+        assert_eq!(
+            table.columns[1].generated_expr.as_deref(),
+            Some("new_col * 2")
+        );
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_dependent_view_sql_and_query() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER, payload TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (9, 'kept');").unwrap();
+        conn.execute(
+            "CREATE VIEW v AS \
+             SELECT t.old_col FROM t WHERE t.old_col > 0 ORDER BY old_col;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        assert!(view_sql.contains("new_col"), "{view_sql}");
+        assert!(!view_sql.contains("old_col"), "{view_sql}");
+
+        let rows = conn.query("SELECT new_col FROM v;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(9));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_view_with_derived_source_without_old_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (7);").unwrap();
+        conn.execute(
+            "CREATE VIEW v AS
+             SELECT old_col AS seen
+             FROM t
+             JOIN (SELECT 1 AS helper_col) AS helper ON helper.helper_col = 1;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(lower_view_sql.contains("new_col as seen"), "{view_sql}");
+        assert!(!lower_view_sql.contains("old_col"), "{view_sql}");
+
+        let rows = conn.query("SELECT seen FROM v;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(7));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_view_through_derived_source_output() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (11);").unwrap();
+        conn.execute(
+            "CREATE VIEW v AS
+	             SELECT old_col AS seen
+	             FROM (SELECT old_col FROM t) AS derived
+	             ORDER BY old_col;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(
+            lower_view_sql.contains("select new_col as seen"),
+            "{view_sql}"
+        );
+        assert!(
+            lower_view_sql.contains("select new_col from t"),
+            "{view_sql}"
+        );
+        assert!(!lower_view_sql.contains("old_col"), "{view_sql}");
+
+        let rows = conn.query("SELECT seen FROM v;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(11));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_keeps_cte_shadowed_view_subquery_refs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute(
+            "CREATE VIEW v AS
+             WITH t AS (SELECT 1 AS old_col)
+             SELECT (SELECT old_col FROM t) AS seen;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(lower_view_sql.contains("select 1 as old_col"), "{view_sql}");
+        assert!(
+            lower_view_sql.contains("select old_col from t"),
+            "{view_sql}"
+        );
+        assert!(!lower_view_sql.contains("new_col"), "{view_sql}");
+
+        let rows = conn.query("SELECT seen FROM v;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_keeps_cte_shadowing_dependent_view_output() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (9);").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT old_col FROM t;")
+            .unwrap();
+        conn.execute(
+            "CREATE VIEW wrapper AS
+             WITH v(old_col) AS (SELECT 1)
+             SELECT old_col AS seen FROM v;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let dependent_view_sql = row_values(&rows[0])[0].to_text();
+        assert!(
+            dependent_view_sql.to_ascii_lowercase().contains("new_col"),
+            "{dependent_view_sql}"
+        );
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='wrapper';")
+            .unwrap();
+        let wrapper_sql = row_values(&rows[0])[0].to_text();
+        let lower_wrapper_sql = wrapper_sql.to_ascii_lowercase();
+        assert!(
+            lower_wrapper_sql.contains("with v(old_col)"),
+            "{wrapper_sql}"
+        );
+        assert!(
+            lower_wrapper_sql.contains("select old_col as seen from v"),
+            "CTE output should shadow the same-named dependent view: {wrapper_sql}"
+        );
+        assert!(!lower_wrapper_sql.contains("new_col"), "{wrapper_sql}");
+
+        let rows = conn.query("SELECT seen FROM wrapper;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_preserves_view_order_alias() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col TEXT);").unwrap();
+        conn.execute(
+            "CREATE VIEW v AS \
+             SELECT old_col AS old_col FROM t ORDER BY old_col COLLATE binary;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(lower_view_sql.contains("new_col as old_col"), "{view_sql}");
+        assert!(
+            lower_view_sql.contains("order by old_col collate binary"),
+            "{view_sql}"
+        );
+        assert!(!lower_view_sql.contains("order by new_col"), "{view_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_compound_view_order_by() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute(
+            "CREATE VIEW v AS \
+             SELECT old_col FROM t \
+             UNION ALL \
+             SELECT old_col FROM t \
+             ORDER BY old_col;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(lower_view_sql.contains("order by new_col"), "{view_sql}");
+        assert!(!lower_view_sql.contains("order by old_col"), "{view_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_preserves_compound_view_order_alias() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute(
+            "CREATE VIEW v AS \
+             SELECT old_col AS old_col FROM t \
+             UNION ALL \
+             SELECT old_col FROM t \
+             ORDER BY old_col;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(lower_view_sql.contains("new_col as old_col"), "{view_sql}");
+        assert!(lower_view_sql.contains("order by old_col"), "{view_sql}");
+        assert!(!lower_view_sql.contains("order by new_col"), "{view_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_keeps_compound_view_order_scope_in_first_core() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE target (old_col INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE other (old_col INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE VIEW v AS \
+             SELECT t.old_col FROM other AS t \
+             UNION ALL \
+             SELECT t.old_col FROM target AS t \
+             ORDER BY t.old_col;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE target RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(
+            lower_view_sql.contains("select t.old_col from other as t"),
+            "{view_sql}"
+        );
+        assert!(
+            lower_view_sql.contains("select t.new_col from target as t"),
+            "{view_sql}"
+        );
+        assert!(lower_view_sql.contains("order by t.old_col"), "{view_sql}");
+        assert!(!lower_view_sql.contains("order by t.new_col"), "{view_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_view_correlated_subquery_refs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute(
+            "CREATE VIEW v AS
+             SELECT old_col AS seen
+             FROM t
+             WHERE EXISTS (SELECT 1 WHERE old_col = t.old_col);",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(
+            lower_view_sql.contains("select 1 where new_col = t.new_col"),
+            "{view_sql}"
+        );
+        assert!(!lower_view_sql.contains("old_col"), "{view_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_respects_inner_view_subquery_scope() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE other (old_col INTEGER, y INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE VIEW v AS
+             SELECT old_col AS seen
+             FROM t
+             WHERE EXISTS (
+                 SELECT 1
+                 FROM other
+                 WHERE t.old_col > other.y AND old_col = 0
+             );",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(lower_view_sql.contains("t.new_col > other.y"), "{view_sql}");
+        assert!(
+            lower_view_sql.contains("old_col = 0"),
+            "inner local column should not be renamed: {view_sql}"
+        );
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_view_outer_ref_through_inner_table_without_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE other (y INTEGER);").unwrap();
+        conn.execute(
+            "CREATE VIEW v AS
+             SELECT old_col AS seen
+             FROM t
+             WHERE EXISTS (
+                 SELECT 1
+                 FROM other
+                 WHERE old_col > y
+             );",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(lower_view_sql.contains("where new_col > y"), "{view_sql}");
+        assert!(!lower_view_sql.contains("old_col > y"), "{view_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_view_outer_ref_through_cte_without_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute(
+            "CREATE VIEW v AS
+             WITH c(y) AS (SELECT 1)
+             SELECT old_col AS seen
+             FROM t
+             WHERE EXISTS (SELECT 1 FROM c WHERE old_col > y);",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(lower_view_sql.contains("new_col as seen"), "{view_sql}");
+        assert!(lower_view_sql.contains("where new_col > y"), "{view_sql}");
+        assert!(!lower_view_sql.contains("old_col > y"), "{view_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_view_chained_cte_outputs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (23);").unwrap();
+        conn.execute(
+            "CREATE VIEW v AS
+             WITH
+                c1 AS (SELECT old_col FROM t),
+                c2 AS (SELECT old_col FROM c1)
+             SELECT old_col AS seen FROM c2;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(
+            lower_view_sql.contains("select new_col from t"),
+            "{view_sql}"
+        );
+        assert!(
+            lower_view_sql.contains("select new_col from c1"),
+            "{view_sql}"
+        );
+        assert!(
+            lower_view_sql.contains("select new_col as seen from c2"),
+            "{view_sql}"
+        );
+        assert!(!lower_view_sql.contains("old_col"), "{view_sql}");
+
+        let rows = conn.query("SELECT seen FROM v;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(23));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_view_star_cte_outputs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (29);").unwrap();
+        conn.execute(
+            "CREATE VIEW v AS
+             WITH
+                c1 AS (SELECT * FROM t),
+                c2 AS (SELECT old_col FROM c1)
+             SELECT old_col AS seen FROM c2;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(lower_view_sql.contains("select * from t"), "{view_sql}");
+        assert!(
+            lower_view_sql.contains("select new_col from c1"),
+            "{view_sql}"
+        );
+        assert!(
+            lower_view_sql.contains("select new_col as seen from c2"),
+            "{view_sql}"
+        );
+        assert!(!lower_view_sql.contains("old_col"), "{view_sql}");
+
+        let rows = conn.query("SELECT seen FROM v;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(29));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_view_star_subquery_outputs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (31);").unwrap();
+        conn.execute(
+            "CREATE VIEW v AS
+             SELECT old_col AS seen FROM (SELECT * FROM t) AS s;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(
+            lower_view_sql.contains("select new_col as seen from (select * from t) as s"),
+            "{view_sql}"
+        );
+        assert!(!lower_view_sql.contains("old_col"), "{view_sql}");
+
+        let rows = conn.query("SELECT seen FROM v;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(31));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_chained_view_outputs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (41);").unwrap();
+        conn.execute("CREATE VIEW v1 AS SELECT * FROM t;").unwrap();
+        conn.execute("CREATE VIEW v2 AS SELECT old_col AS seen FROM v1;")
+            .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v2';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(
+            lower_view_sql.contains("select new_col as seen from v1"),
+            "{view_sql}"
+        );
+        assert!(!lower_view_sql.contains("old_col"), "{view_sql}");
+
+        let rows = conn.query("SELECT seen FROM v2;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(41));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_schema_qualified_chained_view_outputs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (42);").unwrap();
+        conn.execute("CREATE VIEW v1 AS SELECT * FROM t;").unwrap();
+        conn.execute("CREATE VIEW v2 AS SELECT old_col AS seen FROM main.v1;")
+            .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v2';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(
+            lower_view_sql.contains("select new_col as seen from main.v1"),
+            "{view_sql}"
+        );
+        assert!(!lower_view_sql.contains("old_col"), "{view_sql}");
+
+        let rows = conn.query("SELECT seen FROM v2;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(42));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_keeps_attached_schema_view_refs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT old_col AS seen FROM aux.t;")
+            .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(
+            lower_view_sql.contains("select old_col as seen from aux.t"),
+            "{view_sql}"
+        );
+        assert!(
+            !lower_view_sql.contains("select new_col as seen from aux.t"),
+            "{view_sql}"
+        );
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_refs_through_dependent_view() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE src (seed INTEGER);").unwrap();
+        conn.execute("CREATE TABLE audit_log (seen INTEGER);")
+            .unwrap();
+        conn.execute("CREATE VIEW v1 AS SELECT * FROM t;").unwrap();
+        conn.execute(
+            "CREATE TRIGGER src_ai AFTER INSERT ON src
+             BEGIN
+                INSERT INTO audit_log SELECT old_col FROM v1;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='src_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("select new_col from v1"),
+            "{trigger_sql}"
+        );
+        assert!(!lower_trigger_sql.contains("old_col"), "{trigger_sql}");
+
+        conn.execute("INSERT INTO t(new_col) VALUES (43);").unwrap();
+        conn.execute("INSERT INTO src(seed) VALUES (1);").unwrap();
+        let rows = conn.query("SELECT seen FROM audit_log;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(43));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_keeps_cte_output_column_shadowing_outer_view_ref() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute(
+            "CREATE VIEW v AS
+             WITH c(old_col) AS (SELECT 1)
+             SELECT old_col AS seen
+             FROM t
+             WHERE EXISTS (SELECT 1 FROM c WHERE old_col > 0);",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(lower_view_sql.contains("new_col as seen"), "{view_sql}");
+        assert!(
+            lower_view_sql.contains("where old_col > 0"),
+            "CTE output column should keep local unqualified refs: {view_sql}"
+        );
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_keeps_inner_alias_shadowing_outer_view_ref() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE other (old_col INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE VIEW v AS
+             SELECT old_col AS seen
+             FROM t
+             WHERE EXISTS (SELECT 1 FROM other AS t WHERE t.old_col = 0);",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='view' AND name='v';")
+            .unwrap();
+        let view_sql = row_values(&rows[0])[0].to_text();
+        let lower_view_sql = view_sql.to_ascii_lowercase();
+        assert!(
+            lower_view_sql.contains("from other as t where t.old_col = 0"),
+            "inner alias should shadow outer table qualifier: {view_sql}"
+        );
+        assert!(lower_view_sql.contains("new_col as seen"), "{view_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_new_old_refs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE audit_log (seen INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                INSERT INTO audit_log VALUES (NEW.old_col);
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+        conn.execute("INSERT INTO t(new_col) VALUES (12);").unwrap();
+
+        let rows = conn.query("SELECT seen FROM audit_log;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(12));
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        assert!(trigger_sql.contains("NEW.new_col"), "{trigger_sql}");
+        assert!(!trigger_sql.contains("NEW.old_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_update_of_columns() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER, other INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE audit_log (seen INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_au AFTER UPDATE OF old_col ON t
+             BEGIN
+                INSERT INTO audit_log VALUES (NEW.old_col);
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+        conn.execute("UPDATE t SET other = 11;").unwrap();
+        conn.execute("UPDATE t SET new_col = 7;").unwrap();
+
+        let rows = conn.query("SELECT seen FROM audit_log;").unwrap();
+        assert_eq!(rows.len(), 1, "trigger should only fire for renamed column");
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(7));
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_au';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        assert!(trigger_sql.contains("UPDATE OF new_col"), "{trigger_sql}");
+        assert!(trigger_sql.contains("NEW.new_col"), "{trigger_sql}");
+        assert!(!trigger_sql.contains("old_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_bare_when_refs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE audit_log (seen INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             WHEN old_col > 0
+             BEGIN
+                INSERT INTO audit_log VALUES (NEW.old_col);
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+        conn.execute("INSERT INTO t(new_col) VALUES (0);").unwrap();
+        conn.execute("INSERT INTO t(new_col) VALUES (5);").unwrap();
+
+        let rows = conn.query("SELECT seen FROM audit_log;").unwrap();
+        assert_eq!(rows.len(), 1, "renamed WHEN clause should still filter");
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(5));
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("when new_col > 0"),
+            "{trigger_sql}"
+        );
+        assert!(!lower_trigger_sql.contains("old_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_bare_select_body_refs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE audit_log (kind TEXT, seen INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                INSERT INTO audit_log(kind, seen) SELECT 'select', old_col;
+                INSERT INTO audit_log(kind, seen) VALUES ('values', old_col);
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+        conn.execute("INSERT INTO t(new_col) VALUES (15);").unwrap();
+
+        let rows = conn
+            .query("SELECT kind, seen FROM audit_log ORDER BY kind;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("select".into()));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Integer(15));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("values".into()));
+        assert_eq!(row_values(&rows[1])[1], SqliteValue::Integer(15));
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("select 'select', new_col"),
+            "{trigger_sql}"
+        );
+        assert!(
+            lower_trigger_sql.contains("values ('values', new_col)"),
+            "{trigger_sql}"
+        );
+        assert!(!lower_trigger_sql.contains("old_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_keeps_trigger_bare_select_source_column_refs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE source_rows (old_col INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE audit_log (seen INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO source_rows VALUES (21);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                INSERT INTO audit_log SELECT old_col FROM source_rows;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+        conn.execute("INSERT INTO t(new_col) VALUES (99);").unwrap();
+
+        let rows = conn.query("SELECT seen FROM audit_log;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(21));
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("select old_col from source_rows"),
+            "{trigger_sql}"
+        );
+        assert!(
+            !lower_trigger_sql.contains("select new_col from source_rows"),
+            "{trigger_sql}"
+        );
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_bare_ref_through_new_subquery_output() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE audit_log (seen INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                INSERT INTO audit_log
+                SELECT old_col FROM (SELECT NEW.old_col) AS projected;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+        conn.execute("INSERT INTO t(new_col) VALUES (24);").unwrap();
+
+        let rows = conn.query("SELECT seen FROM audit_log;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(24));
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("select new_col from (select new.new_col) as projected"),
+            "{trigger_sql}"
+        );
+        assert!(!lower_trigger_sql.contains("old_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_does_not_rewrite_trigger_alias_named_new() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE source_rows (old_col INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE audit_log (seen INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                INSERT INTO audit_log
+                SELECT new.old_col FROM source_rows AS new;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("source_rows as new"),
+            "{trigger_sql}"
+        );
+        assert!(lower_trigger_sql.contains("new.old_col"), "{trigger_sql}");
+        assert!(!lower_trigger_sql.contains("new.new_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_rewrites_trigger_alias_named_new_without_old_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE source_rows (id INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                SELECT new.old_col FROM source_rows AS new;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("source_rows as new"),
+            "{trigger_sql}"
+        );
+        assert!(lower_trigger_sql.contains("new.new_col"), "{trigger_sql}");
+        assert!(!lower_trigger_sql.contains("new.old_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_rewrites_trigger_subquery_alias_named_new_without_old_column()
+    {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                SELECT new.old_col FROM (SELECT 1 AS id) AS new;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(lower_trigger_sql.contains("new.new_col"), "{trigger_sql}");
+        assert!(!lower_trigger_sql.contains("new.old_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_keeps_trigger_alias_scope_per_compound_core() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE source_rows (old_col INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                SELECT new.old_col FROM source_rows AS new
+                UNION ALL
+                SELECT NEW.old_col;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(lower_trigger_sql.contains("new.old_col"), "{trigger_sql}");
+        assert!(trigger_sql.contains("NEW.new_col"), "{trigger_sql}");
+        assert!(!trigger_sql.contains("NEW.old_col"), "{trigger_sql}");
+        assert!(!trigger_sql.contains("new.new_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_keeps_trigger_compound_order_alias_shadow() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE source_rows (old_col INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                SELECT new.old_col FROM source_rows AS new
+                UNION ALL
+                SELECT NEW.old_col
+                ORDER BY new.old_col;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("select new.old_col from source_rows as new"),
+            "{trigger_sql}"
+        );
+        assert!(trigger_sql.contains("NEW.new_col"), "{trigger_sql}");
+        assert!(
+            lower_trigger_sql.contains("order by new.old_col"),
+            "{trigger_sql}"
+        );
+        assert!(
+            !lower_trigger_sql.contains("order by new.new_col"),
+            "{trigger_sql}"
+        );
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_keeps_trigger_cte_name_from_shadowing_new_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE audit_log (seen INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                WITH new AS (SELECT NEW.old_col AS seen)
+                INSERT INTO audit_log SELECT seen FROM new;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+        conn.execute("INSERT INTO t(new_col) VALUES (37);").unwrap();
+
+        let rows = conn.query("SELECT seen FROM audit_log;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(37));
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        assert!(trigger_sql.contains("NEW.new_col"), "{trigger_sql}");
+        assert!(!trigger_sql.contains("NEW.old_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_rewrites_trigger_cte_named_new_without_old_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                WITH new(id) AS (SELECT 1)
+                SELECT new.old_col FROM new;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(lower_trigger_sql.contains("new.new_col"), "{trigger_sql}");
+        assert!(!lower_trigger_sql.contains("new.old_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_keeps_trigger_cte_named_new_with_old_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                WITH new(old_col) AS (SELECT 1)
+                SELECT new.old_col FROM new;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(lower_trigger_sql.contains("new.old_col"), "{trigger_sql}");
+        assert!(!lower_trigger_sql.contains("new.new_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_keeps_trigger_new_ref_in_update_target_named_new() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE new (seen INTEGER);").unwrap();
+        conn.execute("INSERT INTO new VALUES (0);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                UPDATE new SET seen = NEW.old_col;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+        conn.execute("INSERT INTO t(new_col) VALUES (44);").unwrap();
+
+        let rows = conn.query("SELECT seen FROM new;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(44));
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        assert!(trigger_sql.contains("NEW.new_col"), "{trigger_sql}");
+        assert!(!trigger_sql.contains("NEW.old_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_keeps_update_target_named_new_shadowing_new_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE new (old_col INTEGER, seen INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO new VALUES (44, 0), (45, 0);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                UPDATE new SET seen = 1 WHERE NEW.old_col = old_col;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+        conn.execute("INSERT INTO t(new_col) VALUES (44);").unwrap();
+
+        let rows = conn
+            .query("SELECT seen FROM new ORDER BY old_col;")
+            .unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(1));
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        assert!(trigger_sql.contains("NEW.old_col"), "{trigger_sql}");
+        assert!(!trigger_sql.contains("NEW.new_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_keeps_delete_target_named_new_shadowing_new_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE new (old_col INTEGER);").unwrap();
+        conn.execute("INSERT INTO new VALUES (44), (45);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                DELETE FROM new WHERE NEW.old_col = old_col;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+        conn.execute("INSERT INTO t(new_col) VALUES (44);").unwrap();
+
+        let rows = conn
+            .query("SELECT old_col FROM new ORDER BY old_col;")
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "target table named new should keep shadowing NEW.old_col"
+        );
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        assert!(trigger_sql.contains("NEW.old_col"), "{trigger_sql}");
+        assert!(!trigger_sql.contains("NEW.new_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_dml_with_clause_refs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE src (seed INTEGER);").unwrap();
+        conn.execute("CREATE TABLE audit_log (seen INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER src_ai AFTER INSERT ON src
+             BEGIN
+                WITH c AS (SELECT old_col FROM t)
+                INSERT INTO audit_log SELECT old_col FROM c;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='src_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("select new_col from t"),
+            "{trigger_sql}"
+        );
+        assert!(
+            lower_trigger_sql.contains("select new_col from c"),
+            "{trigger_sql}"
+        );
+        assert!(
+            !lower_trigger_sql.contains("old_col from t"),
+            "{trigger_sql}"
+        );
+        assert!(
+            !lower_trigger_sql.contains("old_col from c"),
+            "{trigger_sql}"
+        );
+
+        conn.execute("INSERT INTO t(new_col) VALUES (5);").unwrap();
+        conn.execute("INSERT INTO src(seed) VALUES (1);").unwrap();
+        let rows = conn.query("SELECT seen FROM audit_log;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(5));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_chained_cte_outputs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE src (seed INTEGER);").unwrap();
+        conn.execute("CREATE TABLE audit_log (seen INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER src_ai AFTER INSERT ON src
+             BEGIN
+                WITH
+                    c1 AS (SELECT old_col FROM t),
+                    c2 AS (SELECT old_col FROM c1)
+                INSERT INTO audit_log SELECT old_col FROM c2;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='src_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("select new_col from t"),
+            "{trigger_sql}"
+        );
+        assert!(
+            lower_trigger_sql.contains("select new_col from c1"),
+            "{trigger_sql}"
+        );
+        assert!(
+            lower_trigger_sql.contains("select new_col from c2"),
+            "{trigger_sql}"
+        );
+        assert!(!lower_trigger_sql.contains("old_col"), "{trigger_sql}");
+
+        conn.execute("INSERT INTO t(new_col) VALUES (8);").unwrap();
+        conn.execute("INSERT INTO src(seed) VALUES (1);").unwrap();
+        let rows = conn.query("SELECT seen FROM audit_log;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(8));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_star_cte_outputs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE src (seed INTEGER);").unwrap();
+        conn.execute("CREATE TABLE audit_log (seen INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER src_ai AFTER INSERT ON src
+             BEGIN
+                WITH
+                    c1 AS (SELECT * FROM t),
+                    c2 AS (SELECT old_col FROM c1)
+                INSERT INTO audit_log SELECT old_col FROM c2;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='src_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("select * from t"),
+            "{trigger_sql}"
+        );
+        assert!(
+            lower_trigger_sql.contains("select new_col from c1"),
+            "{trigger_sql}"
+        );
+        assert!(
+            lower_trigger_sql.contains("select new_col from c2"),
+            "{trigger_sql}"
+        );
+        assert!(!lower_trigger_sql.contains("old_col"), "{trigger_sql}");
+
+        conn.execute("INSERT INTO t(new_col) VALUES (11);").unwrap();
+        conn.execute("INSERT INTO src(seed) VALUES (1);").unwrap();
+        let rows = conn.query("SELECT seen FROM audit_log;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(11));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_star_subquery_outputs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE src (seed INTEGER);").unwrap();
+        conn.execute("CREATE TABLE audit_log (seen INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER src_ai AFTER INSERT ON src
+             BEGIN
+                INSERT INTO audit_log
+                SELECT old_col FROM (SELECT * FROM t) AS s;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='src_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("select new_col from (select * from t) as s"),
+            "{trigger_sql}"
+        );
+        assert!(!lower_trigger_sql.contains("old_col"), "{trigger_sql}");
+
+        conn.execute("INSERT INTO t(new_col) VALUES (13);").unwrap();
+        conn.execute("INSERT INTO src(seed) VALUES (1);").unwrap();
+        let rows = conn.query("SELECT seen FROM audit_log;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(13));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_correlated_subquery_refs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE src (seed INTEGER);").unwrap();
+        conn.execute("CREATE TABLE audit_log (seen INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER src_ai AFTER INSERT ON src
+             BEGIN
+                INSERT INTO audit_log
+                SELECT old_col
+                FROM t
+                WHERE EXISTS (SELECT 1 WHERE t.old_col = old_col);
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='src_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("select new_col from t"),
+            "{trigger_sql}"
+        );
+        assert!(
+            lower_trigger_sql.contains("select 1 where t.new_col = new_col"),
+            "{trigger_sql}"
+        );
+        assert!(!lower_trigger_sql.contains("old_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_outer_ref_through_inner_table_without_column()
+    {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE other (y INTEGER);").unwrap();
+        conn.execute("CREATE TABLE src (seed INTEGER);").unwrap();
+        conn.execute("CREATE TABLE audit_log (seen INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER src_ai AFTER INSERT ON src
+             BEGIN
+                INSERT INTO audit_log
+                SELECT old_col
+                FROM t
+                WHERE EXISTS (SELECT 1 FROM other WHERE old_col > y);
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='src_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("where new_col > y"),
+            "{trigger_sql}"
+        );
+        assert!(!lower_trigger_sql.contains("old_col > y"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_outer_ref_through_cte_without_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE src (seed INTEGER);").unwrap();
+        conn.execute("CREATE TABLE audit_log (seen INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER src_ai AFTER INSERT ON src
+             BEGIN
+                WITH c(y) AS (SELECT 1)
+                INSERT INTO audit_log
+                SELECT old_col
+                FROM t
+                WHERE EXISTS (SELECT 1 FROM c WHERE old_col > y);
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='src_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("select new_col from t"),
+            "{trigger_sql}"
+        );
+        assert!(
+            lower_trigger_sql.contains("where new_col > y"),
+            "{trigger_sql}"
+        );
+        assert!(!lower_trigger_sql.contains("old_col > y"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_upsert_refs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER UNIQUE, payload TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE src (value INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER src_ai AFTER INSERT ON src
+             BEGIN
+                INSERT INTO t(old_col, payload) VALUES (NEW.value, 'a')
+                ON CONFLICT(old_col) DO UPDATE
+                SET old_col = excluded.old_col, payload = 'b';
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='src_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("t (new_col, payload)"),
+            "{trigger_sql}"
+        );
+        assert!(
+            lower_trigger_sql.contains("on conflict (new_col)"),
+            "{trigger_sql}"
+        );
+        assert!(
+            lower_trigger_sql.contains("new_col = excluded.new_col"),
+            "{trigger_sql}"
+        );
+        assert!(!lower_trigger_sql.contains("old_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_keeps_upsert_target_named_new_shadowing_new_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("CREATE TABLE new (old_col INTEGER UNIQUE, seen INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO new VALUES (44, 0);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t
+             BEGIN
+                INSERT INTO new(old_col, seen) VALUES (NEW.old_col, 0)
+                ON CONFLICT(old_col) DO UPDATE
+                SET seen = CASE WHEN NEW.old_col = old_col THEN 1 ELSE 2 END;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+        conn.execute("INSERT INTO t(new_col) VALUES (44);").unwrap();
+
+        let rows = conn.query("SELECT seen FROM new;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='t_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        assert!(trigger_sql.contains("VALUES (NEW.new_col"), "{trigger_sql}");
+        assert!(trigger_sql.contains("NEW.old_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_update_from_refs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, old_col INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE src (seed INTEGER);").unwrap();
+        conn.execute("CREATE TABLE target (id INTEGER, seen INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER src_ai AFTER INSERT ON src
+             BEGIN
+                UPDATE target
+                SET seen = t.old_col
+                FROM t
+                WHERE target.id = t.id;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='src_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("seen = t.new_col"),
+            "{trigger_sql}"
+        );
+        assert!(!lower_trigger_sql.contains("t.old_col"), "{trigger_sql}");
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_trigger_update_column_list_target() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER, payload TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE src (value INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER src_ai AFTER INSERT ON src
+             BEGIN
+                UPDATE t
+                SET (old_col, payload) = (NEW.value, 'updated')
+                WHERE old_col = NEW.value;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='src_ai';")
+            .unwrap();
+        let trigger_sql = row_values(&rows[0])[0].to_text();
+        let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
+        assert!(
+            lower_trigger_sql.contains("(new_col, payload)"),
+            "{trigger_sql}"
+        );
+        assert!(
+            lower_trigger_sql.contains("where new_col = new.value"),
+            "{trigger_sql}"
+        );
+        assert!(!lower_trigger_sql.contains("old_col"), "{trigger_sql}");
     }
 
     #[test]
@@ -85964,6 +94856,7 @@ mod tests {
         assert_eq!(table.indexes.len(), 1);
         assert_eq!(table.indexes[0].name, "idx_name");
         assert_eq!(table.indexes[0].columns, vec!["name"]);
+        assert!(table.indexes[0].key_expressions.is_empty());
     }
 
     #[test]
@@ -86009,6 +94902,15 @@ mod tests {
         assert_eq!(
             table.indexes[0].columns,
             vec!["name".to_string(), "created_ts".to_string()]
+        );
+        assert!(table.indexes[0].key_expressions.is_empty());
+        assert_eq!(
+            table.indexes[0].key_collations,
+            vec![Some("NOCASE".to_owned()), None]
+        );
+        assert_eq!(
+            table.indexes[0].key_sort_directions,
+            vec![SortDirection::Desc, SortDirection::Asc]
         );
     }
 
@@ -89088,6 +97990,53 @@ mod tests {
         let rows = conn.query("SELECT msg FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Text("fired".into()));
+    }
+
+    #[test]
+    fn test_trigger_when_subquery_matches_rusqlite_with_bound_new_values() {
+        let conn = Connection::open(":memory:").unwrap();
+        let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE gate (id INTEGER PRIMARY KEY, threshold INTEGER);",
+            "CREATE TABLE src (id INTEGER PRIMARY KEY, qty INTEGER);",
+            "CREATE TABLE log (id INTEGER, qty INTEGER);",
+            "INSERT INTO gate VALUES (1, 10);",
+            "CREATE TRIGGER trg_when_oracle AFTER INSERT ON src \
+             WHEN NEW.qty > (SELECT threshold FROM gate WHERE id = 1) \
+             BEGIN INSERT INTO log VALUES (NEW.id, NEW.qty); END;",
+        ] {
+            conn.execute(sql).unwrap();
+            sqlite.execute_batch(sql).unwrap();
+        }
+
+        for sql in [
+            "INSERT INTO src VALUES (1, 5);",
+            "INSERT INTO src VALUES (2, 12);",
+            "INSERT INTO src VALUES (3, NULL);",
+            "INSERT INTO src VALUES (4, 11);",
+        ] {
+            conn.execute(sql).unwrap();
+            sqlite.execute_batch(sql).unwrap();
+        }
+
+        let rows = conn.query("SELECT id, qty FROM log ORDER BY id;").unwrap();
+        let mut stmt = sqlite
+            .prepare("SELECT id, qty FROM log ORDER BY id;")
+            .unwrap();
+        let expected = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.values()[0].clone(), row.values()[1].clone()))
+                .collect::<Vec<_>>(),
+            expected
+                .into_iter()
+                .map(|(id, qty)| (SqliteValue::Integer(id), SqliteValue::Integer(qty)))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -96883,7 +105832,7 @@ mod tests {
     }
 
     #[test]
-    fn test_failed_implicit_savepoint_does_not_leave_transaction_open() {
+    fn test_implicit_savepoint_does_not_call_inactive_vtab_savepoint_hook() {
         let _serial = super::fsqlite_core_test_serializer();
         // Use a file-backed database because :memory: now uses serialized
         // mode which may bypass vtab savepoint hooks.
@@ -96898,30 +105847,13 @@ mod tests {
             .unwrap();
         with_txn_test_vtab(&conn, "vt", |vtab| vtab.fail_savepoint_at = Some(0));
 
-        let err = conn
-            .execute("SAVEPOINT sp_fail;")
-            .expect_err("savepoint failure outside an explicit transaction should abort the implicit transaction");
-        let err_text = err.to_string();
+        conn.execute("SAVEPOINT sp_inactive_vtab;").unwrap();
+        let hook_log = with_txn_test_vtab(&conn, "vt", |vtab| vtab.hook_log.clone());
         assert!(
-            err_text.contains("savepoint(0) failed"),
-            "expected the VTAB savepoint hook failure to surface: {err_text}",
+            !hook_log.iter().any(|entry| entry == "savepoint:0"),
+            "inactive virtual table should not receive a SAVEPOINT hook: {hook_log:?}"
         );
-        assert!(
-            !conn.in_transaction(),
-            "failed SAVEPOINT outside a transaction must not leave the implicit transaction open"
-        );
-        assert!(
-            conn.active_txn.borrow().is_none(),
-            "failed implicit SAVEPOINT must tear down the pager transaction"
-        );
-        assert!(
-            conn.concurrent_session_id.borrow().is_none(),
-            "failed implicit SAVEPOINT must tear down the concurrent session"
-        );
-        assert!(
-            conn.savepoints.borrow().is_empty(),
-            "failed implicit SAVEPOINT must not leave a dangling savepoint entry"
-        );
+        conn.execute("ROLLBACK;").unwrap();
     }
 
     #[test]
@@ -98122,6 +107054,9 @@ mod tests {
         assert!(!conn.in_transaction());
         assert!(!conn.has_concurrent_session());
         assert!(conn.active_txn.borrow().is_none());
+        assert!(conn.savepoints.borrow().is_empty());
+        assert!(!conn.implicit_txn.get());
+        assert!(!conn.concurrent_txn.get());
     }
 
     #[test]
@@ -105230,6 +114165,47 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
+    fn test_drop_trigger_preserves_same_named_table_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drop_trigger_name_collision.db");
+        let path_str = path.to_string_lossy().into_owned();
+
+        {
+            let conn = Connection::open(&path_str).unwrap();
+            conn.execute("CREATE TABLE collision_name (id INTEGER);")
+                .unwrap();
+            conn.execute("CREATE TABLE fire_table (id INTEGER);")
+                .unwrap();
+            conn.execute(
+                "CREATE TRIGGER collision_name AFTER INSERT ON fire_table BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+            conn.execute("DROP TRIGGER collision_name").unwrap();
+            conn.close().unwrap();
+        }
+
+        {
+            let conn = Connection::open(&path_str).unwrap();
+            let rows = conn
+                .query(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='collision_name';",
+                )
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            let table_sql = row_values(&rows[0])[0].to_text();
+            assert!(table_sql.contains("CREATE TABLE"), "{table_sql}");
+            assert!(!table_sql.contains("CREATE TRIGGER"), "{table_sql}");
+            assert!(
+                conn.triggers
+                    .borrow()
+                    .iter()
+                    .all(|trigger| !trigger.name.eq_ignore_ascii_case("collision_name")),
+                "dropped trigger should not reload from sqlite_master"
+            );
+        }
+    }
+
+    #[test]
     fn test_select_star_group_by_join() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute(
@@ -105988,6 +114964,41 @@ mod sqlite_master_btree_tests {
                 || off_err.to_string().contains("no such table"),
             "unexpected DELETE error after writable_schema is OFF: {off_err}"
         );
+    }
+
+    #[test]
+    fn test_writable_schema_delete_trigger_preserves_same_named_table_ddl_cache() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE collision_name (id INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE fire_table (id INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER collision_name AFTER INSERT ON fire_table BEGIN SELECT 1; END;",
+        )
+        .unwrap();
+
+        assert!(
+            conn.original_ddl_sql
+                .borrow()
+                .contains_key("collision_name"),
+            "same-named table DDL cache should exist before raw trigger delete"
+        );
+
+        conn.execute("PRAGMA writable_schema = ON;").unwrap();
+        let deleted = conn
+            .execute(
+                "DELETE FROM sqlite_master WHERE type = 'trigger' AND name = 'collision_name';",
+            )
+            .unwrap();
+        assert_eq!(deleted, 1);
+
+        let ddl_cache = conn.original_ddl_sql.borrow();
+        let table_sql = ddl_cache
+            .get("collision_name")
+            .expect("raw trigger delete must not evict same-named table DDL");
+        assert!(table_sql.contains("CREATE TABLE"), "{table_sql}");
+        assert!(!table_sql.contains("CREATE TRIGGER"), "{table_sql}");
     }
 
     #[test]
@@ -107610,6 +116621,122 @@ mod autocommit_txn_tests {
     }
 
     #[test]
+    fn test_retained_autocommit_commit_without_begin_flushes_pending_batch_like_sqlite_autocommit()
+    {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir
+            .path()
+            .join("retained_autocommit_commit_without_begin_flush.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+            .unwrap();
+        conn.execute("CREATE TABLE commit_flush (id INTEGER PRIMARY KEY, val TEXT NOT NULL);")
+            .unwrap();
+
+        let oracle = rusqlite::Connection::open_in_memory().unwrap();
+        oracle
+            .execute(
+                "CREATE TABLE commit_flush (id INTEGER PRIMARY KEY, val TEXT NOT NULL);",
+                [],
+            )
+            .unwrap();
+
+        for (id, val) in [(1_i64, "alpha"), (2, "beta"), (3, "gamma")] {
+            conn.execute_with_params(
+                "INSERT INTO commit_flush (id, val) VALUES (?1, ?2);",
+                &[SqliteValue::Integer(id), SqliteValue::Text(val.into())],
+            )
+            .unwrap();
+            oracle
+                .execute(
+                    "INSERT INTO commit_flush (id, val) VALUES (?1, ?2);",
+                    rusqlite::params![id, val],
+                )
+                .unwrap();
+        }
+
+        assert!(
+            conn.retained_autocommit_txn.borrow().is_some(),
+            "autocommit writes should be parked before the explicit COMMIT boundary"
+        );
+        let sqlite_before_commit = rusqlite::Connection::open(&db_path).unwrap();
+        let count_before_commit: i64 = sqlite_before_commit
+            .query_row("SELECT COUNT(*) FROM commit_flush;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count_before_commit, 0,
+            "parked retained writes stay invisible to external readers until a boundary flush"
+        );
+        drop(sqlite_before_commit);
+
+        reset_hot_path_profile();
+        let fsqlite_commit = conn.execute("COMMIT;");
+        let sqlite_commit = oracle.execute("COMMIT;", []);
+        assert!(sqlite_commit.is_err());
+        let error = fsqlite_commit.expect_err("COMMIT without BEGIN should remain a SQLite error");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot commit - no transaction is active"),
+            "expected SQLite-compatible no-active-transaction error, got {error}"
+        );
+
+        let profile = hot_path_profile_snapshot();
+        assert!(
+            profile.retained_autocommit_flushes >= 1,
+            "COMMIT should flush the parked retained-autocommit batch before returning the no-active-transaction error: {profile:?}"
+        );
+        assert!(
+            conn.retained_autocommit_txn.borrow().is_none(),
+            "COMMIT boundary should consume the parked retained-autocommit txn"
+        );
+
+        let mut oracle_stmt = oracle
+            .prepare("SELECT id, val FROM commit_flush ORDER BY id;")
+            .unwrap();
+        let oracle_rows = oracle_stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        let fsqlite_rows = conn
+            .query("SELECT id, val FROM commit_flush ORDER BY id;")
+            .unwrap();
+        let fsqlite_values = fsqlite_rows
+            .iter()
+            .map(|row| {
+                let values = row_values(row);
+                let id = match &values[0] {
+                    SqliteValue::Integer(id) => *id,
+                    other => panic!("expected integer id, got {other:?}"),
+                };
+                let val = match &values[1] {
+                    SqliteValue::Text(val) => val.to_string(),
+                    other => panic!("expected text val, got {other:?}"),
+                };
+                (id, val)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fsqlite_values, oracle_rows);
+
+        let sqlite_after_commit = rusqlite::Connection::open(&db_path).unwrap();
+        let durable_count: i64 = sqlite_after_commit
+            .query_row("SELECT COUNT(*) FROM commit_flush;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            durable_count,
+            i64::try_from(oracle_rows.len()).unwrap(),
+            "explicit COMMIT boundary must publish the retained autocommit batch durably"
+        );
+    }
+
+    #[test]
     fn test_retained_autocommit_connection_close_flushes_pending_batch() {
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let dir = tempfile::tempdir().unwrap();
@@ -108514,6 +117641,164 @@ SELECT x FROM t;
         }
     }
 
+    /// bd-e6zfc regression helper: assert each case-insensitive side index agrees
+    /// with its backing Vec at the point of call. Mirrors `validate_schema_index`
+    /// but as a plain assertion so it also holds in release test builds (where
+    /// `debug_assertions` is off and the in-engine check compiles to a no-op).
+    fn assert_schema_indices_consistent(conn: &Connection) {
+        {
+            let schema = conn.schema.borrow();
+            let idx = conn.schema_by_name.borrow();
+            assert_eq!(
+                schema.len(),
+                idx.len(),
+                "schema_by_name size {} != schema len {}",
+                idx.len(),
+                schema.len()
+            );
+            for (k, &i) in idx.iter() {
+                let entry = schema
+                    .get(i)
+                    .unwrap_or_else(|| panic!("schema_by_name[{k}] -> out-of-bounds {i}"));
+                assert!(
+                    entry.name.eq_ignore_ascii_case(k),
+                    "schema_by_name[{k}] -> {i} but schema[{i}].name = {}",
+                    entry.name
+                );
+            }
+        }
+        {
+            let views = conn.views.borrow();
+            let idx = conn.views_by_name.borrow();
+            assert_eq!(views.len(), idx.len(), "views_by_name size mismatch");
+            for (k, &i) in idx.iter() {
+                let entry = views
+                    .get(i)
+                    .unwrap_or_else(|| panic!("views_by_name[{k}] -> out-of-bounds {i}"));
+                assert!(entry.name.eq_ignore_ascii_case(k));
+            }
+        }
+        {
+            let triggers = conn.triggers.borrow();
+            let idx = conn.triggers_by_name.borrow();
+            assert_eq!(triggers.len(), idx.len(), "triggers_by_name size mismatch");
+            for (k, &i) in idx.iter() {
+                let entry = triggers
+                    .get(i)
+                    .unwrap_or_else(|| panic!("triggers_by_name[{k}] -> out-of-bounds {i}"));
+                assert!(entry.name.eq_ignore_ascii_case(k));
+            }
+        }
+    }
+
+    /// bd-e6zfc: `ROLLBACK TO SAVEPOINT` restores the schema/views/triggers Vecs
+    /// together with their side indices in one atomic publish (see
+    /// `restore_snapshot`). After the restore the index<->Vec correspondence must
+    /// hold and name lookups must resolve to the right objects.
+    #[test]
+    fn test_savepoint_rollback_keeps_schema_indices_consistent_with_vecs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER, b TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (x INTEGER);").unwrap();
+        conn.execute("CREATE VIEW v1 AS SELECT a FROM t1;").unwrap();
+        conn.execute("CREATE TRIGGER tr1 AFTER INSERT ON t2 BEGIN UPDATE t2 SET x = x + 1; END;")
+            .unwrap();
+        assert_schema_indices_consistent(&conn);
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("SAVEPOINT sp;").unwrap();
+        // Mutations that append new entries to all three Vecs after the snapshot.
+        conn.execute("CREATE TABLE t3 (z INTEGER);").unwrap();
+        conn.execute("CREATE VIEW v2 AS SELECT x FROM t2;").unwrap();
+        conn.execute("CREATE TRIGGER tr2 BEFORE INSERT ON t1 BEGIN SELECT 1; END;")
+            .unwrap();
+        assert_schema_indices_consistent(&conn);
+
+        // ROLLBACK TO drives restore_snapshot, the atomic-publish path under test.
+        conn.execute("ROLLBACK TO sp;").unwrap();
+        conn.execute("RELEASE SAVEPOINT sp;").unwrap();
+        assert_schema_indices_consistent(&conn);
+        conn.execute("COMMIT;").unwrap();
+        assert_schema_indices_consistent(&conn);
+
+        // Pre-savepoint objects intact; post-savepoint objects rolled back.
+        assert!(conn.schema_index_of("t1").is_some());
+        assert!(conn.schema_index_of("t2").is_some());
+        assert!(
+            conn.schema_index_of("t3").is_none(),
+            "table created after the savepoint must be rolled back"
+        );
+        assert!(conn.views_by_name.borrow().contains_key("v1"));
+        assert!(
+            !conn.views_by_name.borrow().contains_key("v2"),
+            "view created after the savepoint must be rolled back"
+        );
+        assert!(conn.triggers_by_name.borrow().contains_key("tr1"));
+        assert!(
+            !conn.triggers_by_name.borrow().contains_key("tr2"),
+            "trigger created after the savepoint must be rolled back"
+        );
+
+        // The restored index points at the right table, and the restored view
+        // still queries through to its base table.
+        let t1_idx = conn.schema_index_of("t1").unwrap();
+        assert_eq!(conn.schema.borrow()[t1_idx].name, "t1");
+        conn.execute("INSERT INTO t1 VALUES (7, 'hi');").unwrap();
+        let rows = conn.query("SELECT a FROM v1;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(7));
+    }
+
+    /// bd-e6zfc: reopening a file-backed database rebuilds schema/views/triggers
+    /// from `sqlite_master` via `reload_memdb_from_txn_with_mode`, which now
+    /// publishes each data Vec together with its side index. Verify the
+    /// correspondence and that lookups resolve after the reload.
+    #[test]
+    fn test_memdb_reload_keeps_schema_indices_consistent_with_vecs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("schema_index_reload.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE alpha (id INTEGER PRIMARY KEY, name TEXT);")
+                .unwrap();
+            conn.execute("CREATE TABLE beta (v INTEGER);").unwrap();
+            conn.execute("CREATE VIEW alpha_names AS SELECT name FROM alpha;")
+                .unwrap();
+            conn.execute("CREATE TRIGGER beta_guard AFTER INSERT ON beta BEGIN SELECT 1; END;")
+                .unwrap();
+            conn.execute("INSERT INTO alpha (name) VALUES ('a'), ('b');")
+                .unwrap();
+        }
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            // A read forces the memdb reload path to materialize schema state.
+            let names = conn
+                .query("SELECT name FROM alpha_names ORDER BY name;")
+                .unwrap();
+            assert_eq!(names.len(), 2);
+            assert_schema_indices_consistent(&conn);
+
+            assert!(conn.schema_index_of("alpha").is_some());
+            assert!(conn.schema_index_of("beta").is_some());
+            assert!(conn.views_by_name.borrow().contains_key("alpha_names"));
+            assert!(conn.triggers_by_name.borrow().contains_key("beta_guard"));
+
+            // Side indices point at the matching Vec entries after reload.
+            let alpha_idx = conn.schema_index_of("alpha").unwrap();
+            assert!(
+                conn.schema.borrow()[alpha_idx]
+                    .name
+                    .eq_ignore_ascii_case("alpha")
+            );
+            let view_idx = conn.views_by_name.borrow()["alpha_names"];
+            assert_eq!(conn.views.borrow()[view_idx].name, "alpha_names");
+        }
+    }
+
     #[test]
     fn test_reopen_reads_every_sqlite_master_row_when_page1_is_interior() {
         let dir = tempfile::tempdir().unwrap();
@@ -108814,6 +118099,481 @@ SELECT x FROM t;
             integrity_rows[0].values()[0],
             SqliteValue::Text("ok".into())
         );
+    }
+
+    #[test]
+    fn test_reopen_stock_fts5_catalog_matches_rusqlite_root_and_shadow_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stock_fts5_catalog.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let rconn = rusqlite::Connection::open(&db_path).unwrap();
+        rconn
+            .execute_batch(
+                r"
+                CREATE VIRTUAL TABLE docs_fts USING fts5(title, body);
+                INSERT INTO docs_fts(rowid, title, body)
+                VALUES (1, 'Rust storage', 'shadow tables are the source of truth');
+                ",
+            )
+            .unwrap();
+
+        let master_sql = "\
+            SELECT type, name, tbl_name, rootpage \
+            FROM sqlite_master \
+            WHERE name = 'docs_fts' OR name LIKE 'docs_fts_%' \
+            ORDER BY name";
+        let expected = {
+            let mut stmt = rconn.prepare(master_sql).unwrap();
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        assert!(
+            expected
+                .iter()
+                .any(|(_, name, _, rootpage)| name == "docs_fts" && *rootpage == 0),
+            "rusqlite fixture must expose the FTS5 root with rootpage=0: {expected:?}"
+        );
+        drop(rconn);
+
+        let conn = Connection::open(&db_str).unwrap();
+        let actual = conn
+            .query(master_sql)
+            .unwrap()
+            .into_iter()
+            .map(|row| match row.values() {
+                [
+                    SqliteValue::Text(type_),
+                    SqliteValue::Text(name),
+                    SqliteValue::Text(tbl_name),
+                    SqliteValue::Integer(rootpage),
+                ] => (
+                    type_.to_string(),
+                    name.to_string(),
+                    tbl_name.to_string(),
+                    *rootpage,
+                ),
+                values => panic!("unexpected sqlite_master row shape: {values:?}"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual, expected,
+            "FrankenSQLite should expose the same FTS5 root/shadow catalog rows as rusqlite"
+        );
+
+        let schema = conn.schema.borrow();
+        let root = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case("docs_fts"))
+            .expect("stock FTS5 root should be represented in schema");
+        assert_eq!(
+            root.root_page, 0,
+            "stock FTS5 virtual roots must remain rootpage=0, not materialized"
+        );
+        drop(schema);
+        assert!(
+            conn.db.borrow().get_table(0).is_none(),
+            "rootpage=0 virtual roots must not allocate a MemDatabase row table"
+        );
+        assert_eq!(
+            conn.catalog_shadow_owner_for_table("docs_fts_data")
+                .as_deref(),
+            Some("docs_fts")
+        );
+        assert_eq!(
+            conn.catalog_shadow_owner_for_table("docs_fts_idx")
+                .as_deref(),
+            Some("docs_fts")
+        );
+
+        let integrity_rows = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(integrity_rows.len(), 1);
+        assert_eq!(
+            integrity_rows[0].values()[0],
+            SqliteValue::Text("ok".into())
+        );
+    }
+
+    #[test]
+    fn test_reopen_stock_fts5_rootpage_zero_connects_live_match_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stock_fts5_live_match.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let expected = {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE VIRTUAL TABLE docs_fts USING fts5(title, body, tokenize='porter');
+                    INSERT INTO docs_fts(rowid, title, body) VALUES
+                        (1, 'Rust search', 'running engines with fearless code'),
+                        (2, 'Other note', 'unrelated content'),
+                        (3, 'Rust storage', 'page backed search runtime');
+                    ",
+                )
+                .unwrap();
+            let mut stmt = rconn
+                .prepare(
+                    "SELECT rowid, title, body \
+                     FROM docs_fts \
+                     WHERE docs_fts MATCH 'rust' \
+                     ORDER BY rowid;",
+                )
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok(vec![
+                    SqliteValue::Integer(row.get::<_, i64>(0)?),
+                    SqliteValue::Text(row.get::<_, String>(1)?.into()),
+                    SqliteValue::Text(row.get::<_, String>(2)?.into()),
+                ])
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+        };
+
+        for _ in 0..2 {
+            let conn = Connection::open(&db_str).unwrap();
+            assert!(
+                conn.has_live_vtab_instance("docs_fts"),
+                "stock rootpage=0 FTS5 root should reconnect as a live virtual table"
+            );
+            let rows = conn
+                .query(
+                    "SELECT rowid, title, body \
+                     FROM docs_fts \
+                     WHERE docs_fts MATCH 'rust' \
+                     ORDER BY rowid;",
+                )
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                expected,
+                "FrankenSQLite MATCH results should match rusqlite after stock FTS5 reconnect"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reopen_stock_fts5_rootpage_zero_rejects_missing_content_shadow() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stock_fts5_missing_content.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE VIRTUAL TABLE docs_fts USING fts5(title, body);
+                    PRAGMA writable_schema = ON;
+                    DELETE FROM sqlite_master
+                    WHERE type = 'table' AND name = 'docs_fts_content';
+                    PRAGMA writable_schema = OFF;
+                    ",
+                )
+                .unwrap();
+        }
+
+        let err = Connection::open(&db_str)
+            .expect_err("missing required FTS5 content shadow table should fail reconnect");
+        let message = err.to_string();
+        assert!(
+            message.contains("missing required content shadow table")
+                || message.contains("docs_fts_content"),
+            "unexpected reconnect error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_drop_rootpage_zero_virtual_table_parses_shadow_module_with_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vtab_rootpage_zero_whitespace.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+                    CREATE VIRTUAL TABLE docs_fts USING fts5(title, body, content=docs, content_rowid=id);
+                    PRAGMA writable_schema = ON;
+                    UPDATE sqlite_master
+                    SET sql = 'CREATE VIRTUAL TABLE docs_fts
+USING
+fts5(title, body, content=docs, content_rowid=id)'
+                    WHERE type = 'table' AND name = 'docs_fts';
+                    PRAGMA writable_schema = OFF;
+                    ",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute("DROP TABLE docs_fts;").unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE name = 'docs_fts' OR name LIKE 'docs_fts_%';",
+            )
+            .unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(0),
+            "DROP TABLE should cascade valid FTS shadow tables even when legacy sqlite_master SQL has unusual whitespace"
+        );
+    }
+
+    #[test]
+    fn test_drop_rootpage_zero_fts5_preserves_non_fts5_prefixed_user_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vtab_rootpage_zero_fts5_user_prefix.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE VIRTUAL TABLE docs_fts USING fts5(content);
+                    CREATE TABLE docs_fts_segments (marker INTEGER);
+                    INSERT INTO docs_fts_segments VALUES (42);
+                    ",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute("DROP TABLE docs_fts;").unwrap();
+
+        let dropped = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE name = 'docs_fts' \
+                    OR name IN (
+                        'docs_fts_data',
+                        'docs_fts_idx',
+                        'docs_fts_content',
+                        'docs_fts_docsize',
+                        'docs_fts_config'
+                    );",
+            )
+            .unwrap();
+        assert_eq!(dropped[0].values()[0], SqliteValue::Integer(0));
+        let preserved = conn.query("SELECT marker FROM docs_fts_segments;").unwrap();
+        assert_eq!(preserved[0].values()[0], SqliteValue::Integer(42));
+    }
+
+    #[test]
+    fn test_drop_rootpage_zero_fts5_preserves_external_content_and_docsize_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir
+            .path()
+            .join("vtab_rootpage_zero_fts5_external_content.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE TABLE docs_fts_content (
+                        id INTEGER PRIMARY KEY,
+                        body TEXT,
+                        marker INTEGER
+                    );
+                    CREATE TABLE docs_fts_docsize (marker INTEGER);
+                    INSERT INTO docs_fts_content VALUES (1, 'alpha beta', 73);
+                    INSERT INTO docs_fts_docsize VALUES (74);
+                    CREATE VIRTUAL TABLE docs_fts USING fts5(
+                        body,
+                        content=docs_fts_content,
+                        content_rowid=id,
+                        columnsize=0
+                    );
+                    ",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute("DROP TABLE docs_fts;").unwrap();
+
+        let dropped = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE name = 'docs_fts' \
+                    OR name IN ('docs_fts_data', 'docs_fts_idx', 'docs_fts_config');",
+            )
+            .unwrap();
+        assert_eq!(dropped[0].values()[0], SqliteValue::Integer(0));
+        let content = conn
+            .query("SELECT marker FROM docs_fts_content WHERE id = 1;")
+            .unwrap();
+        assert_eq!(content[0].values()[0], SqliteValue::Integer(73));
+        let docsize = conn.query("SELECT marker FROM docs_fts_docsize;").unwrap();
+        assert_eq!(docsize[0].values()[0], SqliteValue::Integer(74));
+    }
+
+    #[test]
+    fn test_drop_rootpage_zero_fts4_removes_stat_shadow_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vtab_rootpage_zero_fts4_stat.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE VIRTUAL TABLE docs_fts USING fts4(content);
+                    INSERT INTO docs_fts(content) VALUES ('alpha beta');
+                    ",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute("DROP TABLE docs_fts;").unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE name = 'docs_fts' OR name LIKE 'docs_fts_%';",
+            )
+            .unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(0),
+            "DROP TABLE should remove every owned FTS4 shadow table, including _stat"
+        );
+    }
+
+    #[test]
+    fn test_drop_rootpage_zero_fts4_preserves_external_content_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir
+            .path()
+            .join("vtab_rootpage_zero_fts4_external_content.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE TABLE docs_fts_content (
+                        docid INTEGER PRIMARY KEY,
+                        content TEXT,
+                        marker INTEGER
+                    );
+                    INSERT INTO docs_fts_content VALUES (1, 'alpha beta', 91);
+                    CREATE VIRTUAL TABLE docs_fts USING fts4(
+                        content,
+                        content=docs_fts_content
+                    );
+                    ",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute("DROP TABLE docs_fts;").unwrap();
+
+        let dropped = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE name = 'docs_fts' \
+                    OR name IN (
+                        'docs_fts_segments',
+                        'docs_fts_segdir',
+                        'docs_fts_docsize',
+                        'docs_fts_stat'
+                    );",
+            )
+            .unwrap();
+        assert_eq!(dropped[0].values()[0], SqliteValue::Integer(0));
+        let content = conn
+            .query("SELECT marker FROM docs_fts_content WHERE docid = 1;")
+            .unwrap();
+        assert_eq!(content[0].values()[0], SqliteValue::Integer(91));
+    }
+
+    #[test]
+    fn test_drop_rootpage_zero_fts4_matchinfo_fts3_preserves_docsize_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vtab_rootpage_zero_fts4_matchinfo_fts3.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE TABLE docs_fts_docsize (marker INTEGER);
+                    INSERT INTO docs_fts_docsize VALUES (112);
+                    CREATE VIRTUAL TABLE docs_fts USING fts4(
+                        content,
+                        matchinfo=fts3
+                    );
+                    INSERT INTO docs_fts(content) VALUES ('alpha beta');
+                    ",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute("DROP TABLE docs_fts;").unwrap();
+
+        let dropped = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE name = 'docs_fts' \
+                    OR name IN (
+                        'docs_fts_content',
+                        'docs_fts_segments',
+                        'docs_fts_segdir',
+                        'docs_fts_stat'
+                    );",
+            )
+            .unwrap();
+        assert_eq!(dropped[0].values()[0], SqliteValue::Integer(0));
+        let docsize = conn.query("SELECT marker FROM docs_fts_docsize;").unwrap();
+        assert_eq!(docsize[0].values()[0], SqliteValue::Integer(112));
+    }
+
+    #[test]
+    fn test_drop_materialized_virtual_table_preserves_shadow_named_user_tables() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(content)")
+            .unwrap();
+        conn.execute("CREATE TABLE docs_data (marker INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO docs_data VALUES (42);").unwrap();
+
+        conn.execute("DROP TABLE docs;").unwrap();
+
+        let dropped = conn
+            .query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'docs';")
+            .unwrap();
+        assert_eq!(dropped[0].values()[0], SqliteValue::Integer(0));
+        let preserved = conn.query("SELECT marker FROM docs_data;").unwrap();
+        assert_eq!(preserved[0].values()[0], SqliteValue::Integer(42));
     }
 
     #[test]
@@ -109933,6 +119693,136 @@ SELECT x FROM t;
     }
 
     #[test]
+    fn test_rowid_alias_inflater_keeps_shifted_integer_payload_column_alignment() {
+        let column =
+            |name: &str, affinity: char, is_ipk: bool| ColumnInfo::basic(name, affinity, is_ipk);
+        let table = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                column("id", 'D', true),
+                column("source_id", 'D', false),
+                column("locality", 'B', false),
+                column("session", 'B', false),
+            ],
+            indexes: Vec::new(),
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        };
+        let payload_values = [
+            SqliteValue::Integer(1),
+            SqliteValue::Text("local".into()),
+            SqliteValue::Text("dup-session".into()),
+        ];
+
+        let values = Connection::inflate_table_row_values_for_storage_reload_for_test(
+            &table,
+            1,
+            &payload_values,
+            Some(0),
+        )
+        .unwrap();
+
+        assert_eq!(values[0], SqliteValue::Integer(1));
+        assert_eq!(values[1], SqliteValue::Integer(1));
+        assert_eq!(values[2], SqliteValue::Text("local".into()));
+        assert_eq!(values[3], SqliteValue::Text("dup-session".into()));
+    }
+
+    #[test]
+    fn test_rowid_alias_inflater_keeps_shifted_null_payload_column_alignment() {
+        let column =
+            |name: &str, affinity: char, is_ipk: bool| ColumnInfo::basic(name, affinity, is_ipk);
+        let mut required = column("required", 'B', false);
+        required.notnull = true;
+        let mut extra = column("extra", 'B', false);
+        extra.default_value = Some("'x'".to_owned());
+        let mut note = column("note", 'D', false);
+        note.default_value = Some("9".to_owned());
+        let table = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                column("prefix", 'B', false),
+                column("id", 'D', true),
+                column("nullable", 'B', false),
+                required,
+                extra,
+                note,
+            ],
+            indexes: Vec::new(),
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        };
+        let payload_values = [
+            SqliteValue::Text("p".into()),
+            SqliteValue::Null,
+            SqliteValue::Text("keep".into()),
+        ];
+
+        let values = Connection::inflate_table_row_values_for_storage_reload_for_test(
+            &table,
+            7,
+            &payload_values,
+            Some(1),
+        )
+        .unwrap();
+
+        assert_eq!(values[0], SqliteValue::Text("p".into()));
+        assert_eq!(values[1], SqliteValue::Integer(7));
+        assert_eq!(values[2], SqliteValue::Null);
+        assert_eq!(values[3], SqliteValue::Text("keep".into()));
+        assert_eq!(values[4], SqliteValue::Text("x".into()));
+        assert_eq!(values[5], SqliteValue::Integer(9));
+    }
+
+    #[test]
+    fn test_rowid_alias_inflater_parses_parenthesized_added_column_defaults() {
+        let column =
+            |name: &str, affinity: char, is_ipk: bool| ColumnInfo::basic(name, affinity, is_ipk);
+        let mut score = column("score", 'D', false);
+        score.default_value = Some("(9)".to_owned());
+        let mut tag = column("tag", 'B', false);
+        tag.default_value = Some("('fallback')".to_owned());
+        let table = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                column("id", 'D', true),
+                column("name", 'B', false),
+                score,
+                tag,
+            ],
+            indexes: Vec::new(),
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        };
+        let payload_values = [SqliteValue::Null, SqliteValue::Text("alpha".into())];
+
+        let values = Connection::inflate_table_row_values_for_storage_reload_for_test(
+            &table,
+            3,
+            &payload_values,
+            Some(0),
+        )
+        .unwrap();
+
+        assert_eq!(values[0], SqliteValue::Integer(3));
+        assert_eq!(values[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(values[2], SqliteValue::Integer(9));
+        assert_eq!(values[3], SqliteValue::Text("fallback".into()));
+    }
+
+    #[test]
     fn test_rowid_alias_alter_add_column_preserves_old_row_alignment() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("ipk-alter-add-column.db");
@@ -109955,6 +119845,225 @@ SELECT x FROM t;
 
         let integrity = conn.query("PRAGMA integrity_check;").unwrap();
         assert_eq!(integrity[0].values()[0], SqliteValue::Text("ok".into()));
+    }
+
+    #[test]
+    fn test_alter_add_column_parenthesized_defaults_pad_existing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("alter-parenthesized-defaults.db");
+        let db_str = db_path.to_str().unwrap();
+
+        let conn = Connection::open(db_str).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t(id, name) VALUES (3, 'alpha');")
+            .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN score INTEGER DEFAULT (9);")
+            .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN tag TEXT DEFAULT ('fallback');")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT id, name, score, tag FROM t ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Integer(9));
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("fallback".into()));
+
+        let integrity = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(integrity[0].values()[0], SqliteValue::Text("ok".into()));
+    }
+
+    #[test]
+    fn test_alter_add_column_expression_defaults_pad_existing_rows_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("alter-expression-defaults.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO t(id, name) VALUES (3, 'alpha');")
+                .unwrap();
+            conn.execute("ALTER TABLE t ADD COLUMN score INTEGER DEFAULT (1 + 2);")
+                .unwrap();
+            conn.execute("ALTER TABLE t ADD COLUMN tag TEXT DEFAULT ('x' || 'y');")
+                .unwrap();
+
+            let rows = conn
+                .query("SELECT id, name, score, tag FROM t ORDER BY id;")
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
+            assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
+            assert_eq!(rows[0].values()[2], SqliteValue::Integer(3));
+            assert_eq!(rows[0].values()[3], SqliteValue::Text("xy".into()));
+        }
+
+        let conn = Connection::open(db_str).unwrap();
+        let rows = conn
+            .query("SELECT id, name, score, tag FROM t ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Integer(3));
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("xy".into()));
+
+        let integrity = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(integrity[0].values()[0], SqliteValue::Text("ok".into()));
+    }
+
+    #[test]
+    fn test_rowid_alias_integrity_check_accepts_multi_alter_short_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ipk-multi-alter-integrity.db");
+        let db_str = db_path.to_str().unwrap();
+
+        let conn = Connection::open(db_str).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alpha');").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN extra TEXT DEFAULT 'x';")
+            .unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN note TEXT DEFAULT 'n';")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t_val ON t(val);").unwrap();
+
+        let rows = conn
+            .query("SELECT id, val, extra, note FROM t ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("x".into()));
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("n".into()));
+
+        let integrity = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(integrity[0].values()[0], SqliteValue::Text("ok".into()));
+    }
+
+    #[test]
+    fn test_reopen_rowid_alias_multi_alter_short_rows_keep_null_tail_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ipk-multi-alter-null-tail-reopen.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute(
+                "CREATE TABLE t (
+                    prefix TEXT,
+                    id INTEGER PRIMARY KEY,
+                    nullable TEXT,
+                    required TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO t(prefix, id, nullable, required)
+                 VALUES ('p', 7, NULL, 'keep');",
+            )
+            .unwrap();
+            conn.execute("ALTER TABLE t ADD COLUMN extra TEXT DEFAULT 'x';")
+                .unwrap();
+            conn.execute("ALTER TABLE t ADD COLUMN note TEXT DEFAULT 'n';")
+                .unwrap();
+        }
+
+        let conn = Connection::open(db_str).unwrap();
+        let rows = conn
+            .query("SELECT prefix, id, nullable, required, extra, note FROM t;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("p".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(7));
+        assert_eq!(rows[0].values()[2], SqliteValue::Null);
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("keep".into()));
+        assert_eq!(rows[0].values()[4], SqliteValue::Text("x".into()));
+        assert_eq!(rows[0].values()[5], SqliteValue::Text("n".into()));
+
+        let integrity = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(integrity[0].values()[0], SqliteValue::Text("ok".into()));
+    }
+
+    #[test]
+    fn test_open_c_sqlite_rowid_alias_multi_alter_short_rows_keep_null_tail_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from-c-ipk-multi-alter-null-tail.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    "CREATE TABLE t (
+                        prefix TEXT,
+                        id INTEGER PRIMARY KEY,
+                        nullable TEXT,
+                        required TEXT NOT NULL
+                     );
+                     INSERT INTO t(prefix, id, nullable, required)
+                     VALUES ('p', 7, NULL, 'keep');
+                     ALTER TABLE t ADD COLUMN extra TEXT DEFAULT 'x';
+                     ALTER TABLE t ADD COLUMN note TEXT DEFAULT 'n';
+                     CREATE INDEX idx_t_required ON t(required);",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(db_str).unwrap();
+        let rows = conn
+            .query("SELECT prefix, id, nullable, required, extra, note FROM t;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("p".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(7));
+        assert_eq!(rows[0].values()[2], SqliteValue::Null);
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("keep".into()));
+        assert_eq!(rows[0].values()[4], SqliteValue::Text("x".into()));
+        assert_eq!(rows[0].values()[5], SqliteValue::Text("n".into()));
+
+        let integrity = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(integrity[0].values()[0], SqliteValue::Text("ok".into()));
+    }
+
+    #[test]
+    fn test_open_c_sqlite_short_row_projected_defaults_use_sqlite_default_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from-c-short-row-projected-defaults.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r#"CREATE TABLE t (name TEXT);
+                     INSERT INTO t(name) VALUES ('alpha');
+                     ALTER TABLE t ADD COLUMN active BOOLEAN DEFAULT TRUE;
+                     ALTER TABLE t ADD COLUMN tag TEXT DEFAULT "fallback";"#,
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(db_str).unwrap();
+        let tag_rows = conn.query("SELECT tag FROM t;").unwrap();
+        assert_eq!(tag_rows.len(), 1);
+        assert_eq!(
+            tag_rows[0].values()[0],
+            SqliteValue::Text("fallback".into())
+        );
+
+        let active_rows = conn.query("SELECT active FROM t;").unwrap();
+        assert_eq!(active_rows.len(), 1);
+        assert_eq!(active_rows[0].values()[0], SqliteValue::Integer(1));
+
+        let sum_rows = conn.query("SELECT count(*), sum(active) FROM t;").unwrap();
+        assert_eq!(sum_rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(sum_rows[0].values()[1], SqliteValue::Integer(1));
     }
 
     #[test]
@@ -115485,6 +125594,374 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_t6741_simple_inner_join_uses_vdbe_storage_cursors() -> Result<()> {
+        let (_dir, conn) = open_t6751_file_backed_connection("strict_inner_join_vdbe_storage.db")?;
+        conn.execute("CREATE TABLE customers (id INTEGER, name TEXT);")?;
+        conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER, label TEXT);")?;
+        conn.execute("INSERT INTO customers VALUES (1, 'alice'), (2, 'bob'), (3, 'cara');")?;
+        conn.execute(
+            "INSERT INTO orders VALUES \
+             (10, 1, 'first'), (11, 1, 'second'), (12, 2, 'third'), (13, NULL, 'orphan');",
+        )?;
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+
+        let sql = "SELECT c.name, o.label \
+                   FROM customers AS c \
+                   INNER JOIN orders AS o ON c.id = o.customer_id \
+                   ORDER BY c.id, o.id;";
+        let select = parse_t6751_select(sql)?;
+        assert!(
+            select_join_is_vdbe_eligible(&select),
+            "simple file-backed INNER JOIN should be eligible for VDBE storage cursor execution"
+        );
+        let program = conn.compile_table_select(&select)?;
+        assert!(
+            !program.requires_attached_memdb(),
+            "simple INNER JOIN should compile to pager-backed VDBE storage cursors without MemDatabase"
+        );
+        let open_read_count = program
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::OpenRead)
+            .count();
+        assert!(
+            open_read_count >= 2,
+            "simple INNER JOIN should open storage cursors for both input tables; program: {program:?}"
+        );
+
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::filter::Targets::new()
+                    .with_target("fsqlite.storage_wiring", tracing::Level::DEBUG),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(T6751LogCaptureWriter(std::sync::Arc::clone(&capture))),
+            );
+
+        let rows = tracing::subscriber::with_default(subscriber, || conn.query(sql))?;
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].values(),
+            vec![
+                SqliteValue::Text("alice".into()),
+                SqliteValue::Text("first".into()),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[1].values(),
+            vec![
+                SqliteValue::Text("alice".into()),
+                SqliteValue::Text("second".into()),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[2].values(),
+            vec![
+                SqliteValue::Text("bob".into()),
+                SqliteValue::Text("third".into()),
+            ]
+            .as_slice()
+        );
+
+        let logs = captured_t6751_logs(&capture)?;
+        assert!(
+            !logs.contains("join_or_subquery_fallback"),
+            "simple INNER JOIN must not route through fallback: {logs}"
+        );
+        let dispatch_line = logs
+            .lines()
+            .find(|line| line.contains("completed pager-backed VDBE join/derived dispatch"))
+            .ok_or_else(|| {
+                FrankenError::internal(format!(
+                    "missing simple INNER JOIN VDBE storage dispatch log in: {logs}"
+                ))
+            })?;
+        for field in [
+            "trace_id",
+            "run_id",
+            "scenario_id",
+            "backend_identity",
+            "fallback_policy",
+            "join_shape",
+            "join_order",
+            "derived_source_count",
+            "temp_materialization_mode",
+            "rows_out",
+            "elapsed_ns",
+            "first_failure_diag",
+        ] {
+            assert_t6751_storage_log_field(dispatch_line, field);
+        }
+        assert_t6751_storage_log_field(
+            dispatch_line,
+            "decision_reason=\"join_vdbe_storage_cursors\"",
+        );
+        assert_t6751_storage_log_field(dispatch_line, "derived_source_count=0");
+        assert_t6751_storage_log_field(
+            dispatch_line,
+            "temp_materialization_mode=\"vdbe_storage_cursors\"",
+        );
+        assert_t6751_storage_log_field(dispatch_line, "rows_out=3");
+        Ok(())
+    }
+
+    #[test]
+    fn test_t6741_simple_derived_from_source_flattens_to_vdbe_storage_cursors() -> Result<()> {
+        let (_dir, conn) =
+            open_t6751_file_backed_connection("strict_derived_from_vdbe_storage.db")?;
+        conn.execute("CREATE TABLE orders (id INTEGER, customer TEXT, amount INTEGER);")?;
+        conn.execute(
+            "INSERT INTO orders VALUES \
+             (1, 'alice', 10), (2, 'alice', 10), (3, 'alice', 20), \
+             (4, 'bob', 7), (5, 'cara', NULL), (6, 'drew', 4);",
+        )?;
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+
+        let sql = "SELECT d.customer, d.amount \
+                   FROM ( \
+                       SELECT id, customer, amount \
+                       FROM orders \
+                       WHERE amount >= 5 \
+                   ) AS d \
+                   WHERE d.amount <> 7 \
+                   ORDER BY d.customer, d.amount, d.id;";
+        let select = parse_t6751_select(sql)?;
+        assert!(
+            has_subquery_source(&select),
+            "test setup should start with a derived FROM source"
+        );
+        assert_eq!(
+            count_derived_sources(&select),
+            1,
+            "test setup should track the derived source before flattening"
+        );
+        let statement = Statement::Select(select.clone());
+        let rewritten = conn.rewrite_subquery_statement(&statement, None)?;
+        let std::borrow::Cow::Owned(Statement::Select(flattened)) = rewritten else {
+            return Err(FrankenError::internal(
+                "expected simple derived source to flatten before VDBE codegen",
+            ));
+        };
+        assert!(
+            !has_subquery_source(&flattened),
+            "simple derived FROM source should flatten to a table-backed SELECT"
+        );
+        let program = conn.compile_table_select(&flattened)?;
+        assert!(
+            !program.requires_attached_memdb(),
+            "flattened derived FROM source should compile to pager-backed VDBE without MemDatabase"
+        );
+        assert!(
+            program.ops().iter().any(|op| op.opcode == Opcode::OpenRead),
+            "flattened derived FROM source should read the base table through a storage cursor; program: {program:?}"
+        );
+
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::filter::Targets::new()
+                    .with_target("fsqlite.storage_wiring", tracing::Level::DEBUG),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(T6751LogCaptureWriter(std::sync::Arc::clone(&capture))),
+            );
+
+        let rows = tracing::subscriber::with_default(subscriber, || conn.query(sql))?;
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].values(),
+            vec![SqliteValue::Text("alice".into()), SqliteValue::Integer(10),].as_slice()
+        );
+        assert_eq!(
+            rows[1].values(),
+            vec![SqliteValue::Text("alice".into()), SqliteValue::Integer(10),].as_slice()
+        );
+        assert_eq!(
+            rows[2].values(),
+            vec![SqliteValue::Text("alice".into()), SqliteValue::Integer(20),].as_slice()
+        );
+
+        let logs = captured_t6751_logs(&capture)?;
+        assert!(
+            !logs.contains("join_or_subquery_fallback"),
+            "simple derived FROM source must not route through fallback: {logs}"
+        );
+        let dispatch_line = logs
+            .lines()
+            .find(|line| line.contains("completed pager-backed VDBE join/derived dispatch"))
+            .ok_or_else(|| {
+                FrankenError::internal(format!(
+                    "missing simple derived FROM VDBE storage dispatch log in: {logs}"
+                ))
+            })?;
+        for field in [
+            "trace_id",
+            "run_id",
+            "scenario_id",
+            "backend_identity",
+            "fallback_policy",
+            "join_shape",
+            "join_order",
+            "derived_source_count",
+            "temp_materialization_mode",
+            "rows_out",
+            "elapsed_ns",
+            "first_failure_diag",
+        ] {
+            assert_t6751_storage_log_field(dispatch_line, field);
+        }
+        assert_t6751_storage_log_field(
+            dispatch_line,
+            "decision_reason=\"derived_source_flattened_vdbe_storage_cursors\"",
+        );
+        assert_t6751_storage_log_field(dispatch_line, "join_shape=derived_only");
+        assert_t6751_storage_log_field(dispatch_line, "derived_source_count=1");
+        assert_t6751_storage_log_field(
+            dispatch_line,
+            "temp_materialization_mode=\"vdbe_storage_cursors\"",
+        );
+        assert_t6751_storage_log_field(dispatch_line, "rows_out=3");
+        Ok(())
+    }
+
+    #[test]
+    fn test_t6741_left_join_uses_vdbe_storage_cursors() -> Result<()> {
+        let (_dir, conn) = open_t6751_file_backed_connection("strict_left_join_vdbe_storage.db")?;
+        conn.execute("CREATE TABLE customers (id INTEGER, name TEXT);")?;
+        conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER, label TEXT);")?;
+        conn.execute("INSERT INTO customers VALUES (1, 'alice'), (2, 'bob'), (3, 'cara');")?;
+        conn.execute(
+            "INSERT INTO orders VALUES \
+             (10, 1, 'first'), (11, 1, 'second'), (12, 2, 'third'), (13, 99, 'dangling');",
+        )?;
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+
+        let sql = "SELECT c.name, o.label \
+                   FROM customers AS c \
+                   LEFT JOIN orders AS o ON c.id = o.customer_id \
+                   ORDER BY c.id, o.id;";
+        let select = parse_t6751_select(sql)?;
+        assert!(
+            select_join_is_vdbe_eligible(&select),
+            "LEFT JOIN shape should use the VDBE storage cursor path"
+        );
+        let program = conn.compile_table_select(&select)?;
+        assert!(
+            !program.requires_attached_memdb(),
+            "LEFT JOIN should compile to pager-backed VDBE storage cursors without MemDatabase"
+        );
+        let open_read_count = program
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::OpenRead)
+            .count();
+        assert!(
+            open_read_count >= 2,
+            "LEFT JOIN should open storage cursors for both input tables; program: {program:?}"
+        );
+        assert!(
+            program.ops().iter().any(|op| op.opcode == Opcode::NullRow),
+            "LEFT JOIN should emit NullRow for unmatched right-side rows; program: {program:?}"
+        );
+
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::filter::Targets::new()
+                    .with_target("fsqlite.storage_wiring", tracing::Level::DEBUG),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(T6751LogCaptureWriter(std::sync::Arc::clone(&capture))),
+            );
+
+        let rows = tracing::subscriber::with_default(subscriber, || conn.query(sql))?;
+
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[0].values(),
+            vec![
+                SqliteValue::Text("alice".into()),
+                SqliteValue::Text("first".into()),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[1].values(),
+            vec![
+                SqliteValue::Text("alice".into()),
+                SqliteValue::Text("second".into()),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[2].values(),
+            vec![
+                SqliteValue::Text("bob".into()),
+                SqliteValue::Text("third".into()),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[3].values(),
+            vec![SqliteValue::Text("cara".into()), SqliteValue::Null,].as_slice()
+        );
+
+        let logs = captured_t6751_logs(&capture)?;
+        assert!(
+            !logs.contains("join_or_subquery_fallback"),
+            "LEFT JOIN must not route through fallback: {logs}"
+        );
+        let dispatch_line = logs
+            .lines()
+            .find(|line| line.contains("completed pager-backed VDBE join/derived dispatch"))
+            .ok_or_else(|| {
+                FrankenError::internal(format!(
+                    "missing LEFT JOIN VDBE storage dispatch log in: {logs}"
+                ))
+            })?;
+        for field in [
+            "trace_id",
+            "run_id",
+            "scenario_id",
+            "backend_identity",
+            "fallback_policy",
+            "join_shape",
+            "join_order",
+            "derived_source_count",
+            "temp_materialization_mode",
+            "rows_out",
+            "elapsed_ns",
+            "first_failure_diag",
+        ] {
+            assert_t6751_storage_log_field(dispatch_line, field);
+        }
+        assert_t6751_storage_log_field(
+            dispatch_line,
+            "decision_reason=\"join_vdbe_storage_cursors\"",
+        );
+        assert_t6751_storage_log_field(dispatch_line, "join_shape=LEFT");
+        assert_t6751_storage_log_field(dispatch_line, "join_order=c->o");
+        assert_t6751_storage_log_field(dispatch_line, "derived_source_count=0");
+        assert_t6751_storage_log_field(
+            dispatch_line,
+            "temp_materialization_mode=\"vdbe_storage_cursors\"",
+        );
+        assert_t6751_storage_log_field(dispatch_line, "rows_out=4");
+        Ok(())
+    }
+
+    #[test]
     fn test_zjisk1_strict_mode_allows_file_backed_simple_derived_join_dispatch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("strict_derived_native.db");
@@ -115585,27 +126062,40 @@ mod pager_routing_tests {
     }
 
     #[test]
-    fn test_t6751_strict_mode_allows_file_backed_group_by_storage_substrate() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_t6751_strict_mode_allows_file_backed_group_by_storage_substrate() -> Result<()> {
+        let dir = tempfile::tempdir()
+            .map_err(|err| FrankenError::internal(format!("tempdir failed: {err}")))?;
         let path = dir.path().join("strict_group_by_storage_substrate.db");
-        let conn = Connection::open(path.to_str().unwrap()).unwrap();
-        conn.execute("CREATE TABLE orders (customer TEXT, amount INTEGER);")
-            .unwrap();
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| FrankenError::internal("temp path is not valid UTF-8"))?;
+        let conn = Connection::open(path_str)?;
+        conn.execute("CREATE TABLE orders (customer TEXT, amount INTEGER);")?;
         conn.execute(
             "INSERT INTO orders VALUES ('alice', 10), ('alice', 20), ('bob', 5), ('cara', 9);",
-        )
-        .unwrap();
-        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
-            .unwrap();
+        )?;
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
 
-        let rows = conn
-            .query(
-                "SELECT customer, COUNT(*), SUM(amount) \
-                 FROM orders \
-                 GROUP BY customer \
-                 ORDER BY customer;",
-            )
-            .unwrap();
+        let sql = "SELECT customer, COUNT(*), SUM(amount) \
+                   FROM orders \
+                   GROUP BY customer \
+                   ORDER BY customer;";
+        let statement = super::parse_single_statement(sql)?;
+        let Statement::Select(select) = statement else {
+            return Err(FrankenError::internal("expected SELECT"));
+        };
+        let program = conn.compile_table_select(&select)?;
+        assert!(
+            !program.requires_attached_memdb(),
+            "file-backed GROUP BY aggregate should compile to a VDBE sorter substrate without MemDatabase"
+        );
+        let prepared = conn.prepare(sql)?;
+        assert!(
+            prepared.deferred_query_statement.is_none(),
+            "file-backed GROUP BY aggregate should prepare on the table-backed VDBE path"
+        );
+
+        let rows = conn.query(sql)?;
 
         assert_eq!(rows.len(), 3);
         assert_eq!(
@@ -115635,27 +126125,323 @@ mod pager_routing_tests {
             ]
             .as_slice()
         );
+        Ok(())
+    }
+
+    fn parse_t6751_select(sql: &str) -> Result<SelectStatement> {
+        let statement = super::parse_single_statement(sql)?;
+        let Statement::Select(select) = statement else {
+            return Err(FrankenError::internal("expected SELECT"));
+        };
+        Ok(select)
+    }
+
+    fn open_t6751_file_backed_connection(db_name: &str) -> Result<(tempfile::TempDir, Connection)> {
+        let dir = tempfile::tempdir()
+            .map_err(|err| FrankenError::internal(format!("tempdir failed: {err}")))?;
+        let path = dir.path().join(db_name);
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| FrankenError::internal("temp path is not valid UTF-8"))?;
+        let conn = Connection::open(path_str)?;
+        Ok((dir, conn))
+    }
+
+    #[derive(Clone)]
+    struct T6751LogCaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct T6751LogCaptureGuard(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for T6751LogCaptureWriter {
+        type Writer = T6751LogCaptureGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            T6751LogCaptureGuard(std::sync::Arc::clone(&self.0))
+        }
+    }
+
+    impl std::io::Write for T6751LogCaptureGuard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            lock_unpoisoned(self.0.as_ref()).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured_t6751_logs(capture: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> Result<String> {
+        String::from_utf8(lock_unpoisoned(capture.as_ref()).clone()).map_err(|err| {
+            FrankenError::internal(format!(
+                "captured storage wiring logs were not UTF-8: {err}"
+            ))
+        })
+    }
+
+    fn assert_t6751_storage_log_field(line: &str, field: &str) {
+        assert!(
+            line.contains(field),
+            "expected storage substrate log field `{field}` in line: {line}"
+        );
     }
 
     #[test]
-    fn test_t6751_strict_mode_allows_file_backed_window_storage_substrate() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("strict_window_storage_substrate.db");
-        let conn = Connection::open(path.to_str().unwrap()).unwrap();
-        conn.execute("CREATE TABLE scores (name TEXT, score INTEGER);")
-            .unwrap();
-        conn.execute("INSERT INTO scores VALUES ('alice', 10), ('bob', 20), ('cara', 15);")
-            .unwrap();
-        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
-            .unwrap();
+    fn test_t6751_aggregate_window_storage_substrate_logs_required_fields() -> Result<()> {
+        let (_dir, conn) = open_t6751_file_backed_connection("strict_group_by_structured_log.db")?;
+        conn.execute("CREATE TABLE orders (customer TEXT, amount INTEGER);")?;
+        conn.execute(
+            "INSERT INTO orders VALUES ('alice', 10), ('alice', 20), ('bob', 5), ('cara', 9);",
+        )?;
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
 
-        let rows = conn
-            .query(
-                "SELECT name, score, ROW_NUMBER() OVER (ORDER BY score DESC) AS rn \
-                 FROM scores \
-                 ORDER BY score DESC;",
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::filter::Targets::new()
+                    .with_target("fsqlite.storage_wiring", tracing::Level::DEBUG),
             )
-            .unwrap();
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(T6751LogCaptureWriter(std::sync::Arc::clone(&capture))),
+            );
+
+        let sql = "SELECT customer, COUNT(*), MAX(amount) \
+                   FROM orders \
+                   GROUP BY customer \
+                   ORDER BY customer;";
+        let rows = tracing::subscriber::with_default(subscriber, || conn.query(sql))?;
+
+        assert_eq!(rows.len(), 3);
+        let logs = captured_t6751_logs(&capture)?;
+        let complete_line = logs
+            .lines()
+            .find(|line| line.contains("completed pager-backed aggregate/window substrate"))
+            .ok_or_else(|| {
+                FrankenError::internal(format!(
+                    "missing aggregate/window storage completion log in: {logs}"
+                ))
+            })?;
+        for field in [
+            "trace_id",
+            "run_id",
+            "scenario_id",
+            "backend_identity",
+            "fallback_policy",
+            "group_key_count",
+            "aggregate_kind_set",
+            "window_stage_count",
+            "temp_store_strategy",
+            "spill_bytes",
+            "rows_in",
+            "rows_out",
+            "elapsed_ns",
+            "first_failure_diag",
+        ] {
+            assert_t6751_storage_log_field(complete_line, field);
+        }
+        assert_t6751_storage_log_field(complete_line, "group_key_count=1");
+        assert_t6751_storage_log_field(complete_line, "aggregate_kind_set=\"count,max\"");
+        assert_t6751_storage_log_field(complete_line, "window_stage_count=0");
+        assert_t6751_storage_log_field(complete_line, "temp_store_strategy=\"vdbe_sorter\"");
+        assert_t6751_storage_log_field(complete_line, "spill_bytes=0");
+        assert_t6751_storage_log_field(complete_line, "rows_out=3");
+        Ok(())
+    }
+
+    #[test]
+    fn test_t6751_distinct_order_by_group_by_storage_substrate_preserves_order() -> Result<()> {
+        let (_dir, conn) = open_t6751_file_backed_connection("strict_distinct_group_by_order.db")?;
+        conn.execute("CREATE TABLE orders (customer TEXT, amount INTEGER);")?;
+        conn.execute(
+            "INSERT INTO orders VALUES \
+             ('bob', 5), ('alice', 10), ('alice', 20), ('cara', 9), ('bob', 8);",
+        )?;
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+
+        let sql = "SELECT DISTINCT customer, COUNT(*), SUM(amount) \
+                   FROM orders \
+                   GROUP BY customer \
+                   ORDER BY customer;";
+        let select = parse_t6751_select(sql)?;
+        assert!(
+            conn.select_group_by_storage_substrate_is_vdbe_eligible(&select),
+            "DISTINCT with a GROUP BY-prefix ORDER BY should remain on the storage substrate"
+        );
+        let program = conn.compile_table_select(&select)?;
+        assert!(
+            !program.requires_attached_memdb(),
+            "DISTINCT GROUP BY should compile to pager-backed VDBE without MemDatabase"
+        );
+
+        let rows = conn.query(sql)?;
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].values(),
+            vec![
+                SqliteValue::Text("alice".into()),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(30),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[1].values(),
+            vec![
+                SqliteValue::Text("bob".into()),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(13),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[2].values(),
+            vec![
+                SqliteValue::Text("cara".into()),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(9),
+            ]
+            .as_slice()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_t6751_distinct_group_by_storage_substrate_orders_null_group_first() -> Result<()> {
+        let (_dir, conn) =
+            open_t6751_file_backed_connection("strict_distinct_group_by_null_order.db")?;
+        conn.execute("CREATE TABLE orders (customer TEXT, amount INTEGER);")?;
+        conn.execute(
+            "INSERT INTO orders VALUES \
+             ('bob', 5), (NULL, 7), ('alice', 10), (NULL, 11), ('bob', 8);",
+        )?;
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+
+        let sql = "SELECT DISTINCT customer, COUNT(*), SUM(amount) \
+                   FROM orders \
+                   GROUP BY customer \
+                   ORDER BY customer;";
+        let select = parse_t6751_select(sql)?;
+        assert!(
+            conn.select_group_by_storage_substrate_is_vdbe_eligible(&select),
+            "NULL grouping with DISTINCT should stay on the storage substrate"
+        );
+        let program = conn.compile_table_select(&select)?;
+        assert!(
+            !program.requires_attached_memdb(),
+            "NULL grouping should compile to pager-backed VDBE without MemDatabase"
+        );
+
+        let rows = conn.query(sql)?;
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].values(),
+            vec![
+                SqliteValue::Null,
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(18),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[1].values(),
+            vec![
+                SqliteValue::Text("alice".into()),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(10),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[2].values(),
+            vec![
+                SqliteValue::Text("bob".into()),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(13),
+            ]
+            .as_slice()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_t6751_group_by_storage_substrate_empty_input_returns_no_groups() -> Result<()> {
+        let (_dir, conn) = open_t6751_file_backed_connection("strict_group_by_empty.db")?;
+        conn.execute("CREATE TABLE orders (customer TEXT, amount INTEGER);")?;
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+
+        let sql = "SELECT DISTINCT customer, COUNT(*), SUM(amount) \
+                   FROM orders \
+                   GROUP BY customer \
+                   ORDER BY customer;";
+        let select = parse_t6751_select(sql)?;
+        assert!(
+            conn.select_group_by_storage_substrate_is_vdbe_eligible(&select),
+            "empty grouped input should still use the storage substrate"
+        );
+        let program = conn.compile_table_select(&select)?;
+        assert!(
+            !program.requires_attached_memdb(),
+            "empty grouped input should compile without MemDatabase"
+        );
+
+        let rows = conn.query(sql)?;
+
+        assert!(rows.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_t6751_empty_implicit_aggregate_uses_file_backed_vdbe() -> Result<()> {
+        let (_dir, conn) = open_t6751_file_backed_connection("strict_empty_implicit_aggregate.db")?;
+        conn.execute("CREATE TABLE orders (customer TEXT, amount INTEGER);")?;
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+
+        let sql = "SELECT COUNT(*), SUM(amount) FROM orders;";
+        let select = parse_t6751_select(sql)?;
+        let program = conn.compile_table_select(&select)?;
+        assert!(
+            !program.requires_attached_memdb(),
+            "empty implicit aggregate should compile to pager-backed VDBE without MemDatabase"
+        );
+
+        let rows = conn.query(sql)?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values(),
+            vec![SqliteValue::Integer(0), SqliteValue::Null].as_slice()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_t6751_strict_mode_allows_file_backed_window_storage_substrate() -> Result<()> {
+        let dir = tempfile::tempdir()
+            .map_err(|err| FrankenError::internal(format!("tempdir failed: {err}")))?;
+        let path = dir.path().join("strict_window_storage_substrate.db");
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| FrankenError::internal("temp path is not valid UTF-8"))?;
+        let conn = Connection::open(path_str)?;
+        conn.execute("CREATE TABLE scores (name TEXT, score INTEGER);")?;
+        conn.execute("INSERT INTO scores VALUES ('alice', 10), ('bob', 20), ('cara', 15);")?;
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+
+        let sql = "SELECT name, score, ROW_NUMBER() OVER (ORDER BY score DESC) AS rn \
+                   FROM scores \
+                   ORDER BY score DESC;";
+        let select = parse_t6751_select(sql)?;
+        assert_eq!(
+            Connection::aggregate_window_stage_counts(&select),
+            (0, 1),
+            "plain window query should report one window stage and no GROUP BY keys"
+        );
+
+        let rows = conn.query(sql)?;
 
         assert_eq!(rows.len(), 3);
         assert_eq!(
@@ -115685,32 +126471,303 @@ mod pager_routing_tests {
             ]
             .as_slice()
         );
+        Ok(())
     }
 
     #[test]
-    fn test_t6751_strict_mode_allows_file_backed_group_by_window_storage_substrate() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_t6751_window_stage_count_tracks_named_window_instances() -> Result<()> {
+        let dir = tempfile::tempdir()
+            .map_err(|err| FrankenError::internal(format!("tempdir failed: {err}")))?;
+        let path = dir.path().join("strict_named_window_stage_substrate.db");
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| FrankenError::internal("temp path is not valid UTF-8"))?;
+        let conn = Connection::open(path_str)?;
+        conn.execute("CREATE TABLE scores (name TEXT, score INTEGER);")?;
+        conn.execute("INSERT INTO scores VALUES ('alice', 10), ('bob', 20), ('cara', 15);")?;
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+
+        let sql = "SELECT name, score, \
+                          ROW_NUMBER() OVER ranked AS rn, \
+                          RANK() OVER ranked AS rnk \
+                   FROM scores \
+                   WINDOW ranked AS (ORDER BY score DESC) \
+                   ORDER BY rn;";
+        let select = parse_t6751_select(sql)?;
+        assert_eq!(
+            Connection::aggregate_window_stage_counts(&select),
+            (0, 3),
+            "two window function columns plus one named window definition should be logged as three stages"
+        );
+
+        let rows = conn.query(sql)?;
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].values(),
+            vec![
+                SqliteValue::Text("bob".into()),
+                SqliteValue::Integer(20),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[1].values(),
+            vec![
+                SqliteValue::Text("cara".into()),
+                SqliteValue::Integer(15),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(2),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[2].values(),
+            vec![
+                SqliteValue::Text("alice".into()),
+                SqliteValue::Integer(10),
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(3),
+            ]
+            .as_slice()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_t6751_window_partition_aggregate_lifecycle_resets_per_partition() -> Result<()> {
+        let (_dir, conn) =
+            open_t6751_file_backed_connection("strict_window_partition_aggregate_lifecycle.db")?;
+        conn.execute("CREATE TABLE sales (region TEXT, day INTEGER, amount INTEGER);")?;
+        conn.execute(
+            "INSERT INTO sales VALUES \
+             ('west', 2, 3), ('east', 1, 10), ('west', 1, 7), \
+             ('east', 2, 15), ('west', 3, 5);",
+        )?;
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+
+        let sql = "SELECT region, day, amount, \
+                          SUM(amount) OVER ( \
+                              PARTITION BY region \
+                              ORDER BY day \
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW \
+                          ) AS running_total, \
+                          COUNT(amount) OVER (PARTITION BY region) AS partition_count \
+                   FROM sales \
+                   ORDER BY region, day;";
+        let select = parse_t6751_select(sql)?;
+        assert_eq!(
+            Connection::aggregate_window_stage_counts(&select),
+            (0, 2),
+            "two partitioned aggregate window columns should report two window stages"
+        );
+
+        let rows = conn.query(sql)?;
+
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0].values(),
+            vec![
+                SqliteValue::Text("east".into()),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(10),
+                SqliteValue::Integer(10),
+                SqliteValue::Integer(2),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[1].values(),
+            vec![
+                SqliteValue::Text("east".into()),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(15),
+                SqliteValue::Integer(25),
+                SqliteValue::Integer(2),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[2].values(),
+            vec![
+                SqliteValue::Text("west".into()),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(7),
+                SqliteValue::Integer(7),
+                SqliteValue::Integer(3),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[3].values(),
+            vec![
+                SqliteValue::Text("west".into()),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(10),
+                SqliteValue::Integer(3),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[4].values(),
+            vec![
+                SqliteValue::Text("west".into()),
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(5),
+                SqliteValue::Integer(15),
+                SqliteValue::Integer(3),
+            ]
+            .as_slice()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_t6751_named_window_partition_aggregate_logs_stage_lifecycle() -> Result<()> {
+        let (_dir, conn) =
+            open_t6751_file_backed_connection("strict_named_window_partition_aggregate_log.db")?;
+        conn.execute("CREATE TABLE sales (region TEXT, day INTEGER, amount INTEGER);")?;
+        conn.execute(
+            "INSERT INTO sales VALUES \
+             ('west', 2, 3), ('east', 1, 10), ('west', 1, 7), \
+             ('east', 2, 15), ('west', 3, 5);",
+        )?;
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::filter::Targets::new()
+                    .with_target("fsqlite.storage_wiring", tracing::Level::DEBUG),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(T6751LogCaptureWriter(std::sync::Arc::clone(&capture))),
+            );
+
+        let sql = "SELECT region, day, \
+                          SUM(amount) OVER regional AS running_total, \
+                          COUNT(amount) OVER regional AS running_count \
+                   FROM sales \
+                   WINDOW regional AS ( \
+                       PARTITION BY region \
+                       ORDER BY day \
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW \
+                   ) \
+                   ORDER BY region, day;";
+        let select = parse_t6751_select(sql)?;
+        assert_eq!(
+            Connection::aggregate_window_stage_counts(&select),
+            (0, 3),
+            "two aggregate window calls plus the named partition window should report three stages"
+        );
+
+        let rows = tracing::subscriber::with_default(subscriber, || conn.query(sql))?;
+
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0].values(),
+            vec![
+                SqliteValue::Text("east".into()),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(10),
+                SqliteValue::Integer(1),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[1].values(),
+            vec![
+                SqliteValue::Text("east".into()),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(25),
+                SqliteValue::Integer(2),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[2].values(),
+            vec![
+                SqliteValue::Text("west".into()),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(7),
+                SqliteValue::Integer(1),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[3].values(),
+            vec![
+                SqliteValue::Text("west".into()),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(10),
+                SqliteValue::Integer(2),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[4].values(),
+            vec![
+                SqliteValue::Text("west".into()),
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(15),
+                SqliteValue::Integer(3),
+            ]
+            .as_slice()
+        );
+
+        let logs = captured_t6751_logs(&capture)?;
+        let dispatch_line = logs
+            .lines()
+            .find(|line| line.contains("using pager-backed aggregate/window substrate"))
+            .ok_or_else(|| {
+                FrankenError::internal(format!(
+                    "missing aggregate/window storage dispatch log in: {logs}"
+                ))
+            })?;
+        assert_t6751_storage_log_field(dispatch_line, "group_key_count=0");
+        assert_t6751_storage_log_field(dispatch_line, "window_stage_count=3");
+        assert_t6751_storage_log_field(dispatch_line, "aggregate_kind_set=count,sum");
+        assert_t6751_storage_log_field(dispatch_line, "temp_store_strategy=\"window_pipeline\"");
+        assert_t6751_storage_log_field(dispatch_line, "spill_bytes=0");
+        assert_t6751_storage_log_field(dispatch_line, "rows_out_known=false");
+        assert_t6751_storage_log_field(dispatch_line, "first_failure_diag=\"none\"");
+        Ok(())
+    }
+
+    #[test]
+    fn test_t6751_strict_mode_allows_file_backed_group_by_window_storage_substrate() -> Result<()> {
+        let dir = tempfile::tempdir()
+            .map_err(|err| FrankenError::internal(format!("tempdir failed: {err}")))?;
         let path = dir
             .path()
             .join("strict_group_by_window_storage_substrate.db");
-        let conn = Connection::open(path.to_str().unwrap()).unwrap();
-        conn.execute("CREATE TABLE orders (customer TEXT, amount INTEGER);")
-            .unwrap();
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| FrankenError::internal("temp path is not valid UTF-8"))?;
+        let conn = Connection::open(path_str)?;
+        conn.execute("CREATE TABLE orders (customer TEXT, amount INTEGER);")?;
         conn.execute(
             "INSERT INTO orders VALUES ('alice', 10), ('alice', 20), ('bob', 5), ('cara', 9);",
-        )
-        .unwrap();
-        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
-            .unwrap();
+        )?;
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
 
-        let rows = conn
-            .query(
-                "SELECT customer, COUNT(*) AS cnt, ROW_NUMBER() OVER (ORDER BY customer) AS rn \
-                 FROM orders \
-                 GROUP BY customer \
-                 ORDER BY customer;",
-            )
-            .unwrap();
+        let sql = "SELECT customer, COUNT(*) AS cnt, ROW_NUMBER() OVER (ORDER BY customer) AS rn \
+                   FROM orders \
+                   GROUP BY customer \
+                   ORDER BY customer;";
+        let select = parse_t6751_select(sql)?;
+        assert_eq!(
+            Connection::aggregate_window_stage_counts(&select),
+            (1, 1),
+            "GROUP BY + ROW_NUMBER query should report one group key and one window stage"
+        );
+
+        let rows = conn.query(sql)?;
 
         assert_eq!(rows.len(), 3);
         assert_eq!(
@@ -115740,6 +126797,7 @@ mod pager_routing_tests {
             ]
             .as_slice()
         );
+        Ok(())
     }
 
     #[test]
@@ -119401,8 +130459,8 @@ mod pager_routing_tests {
 
     #[test]
     fn test_alter_table_add_column_new_rows() {
-        // Known limitation: ALTER TABLE ADD COLUMN with DEFAULT doesn't backfill
-        // existing rows. Test verifies new inserts use the default.
+        // Rows inserted after ALTER TABLE ADD COLUMN still use the column
+        // default through the normal insert path.
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE acd (id INTEGER PRIMARY KEY, a TEXT);")
             .unwrap();
@@ -123502,6 +134560,32 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_prepared_schema_guard_matches_rusqlite_before_and_rejects_after_ddl() {
+        let conn = Connection::open(":memory:").unwrap();
+        let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE prep_schema_guard (id INTEGER PRIMARY KEY, val TEXT);",
+            "INSERT INTO prep_schema_guard VALUES (1, 'alpha'), (2, 'beta');",
+        ] {
+            conn.execute(sql).unwrap();
+            sqlite.execute_batch(sql).unwrap();
+        }
+
+        let sql = "SELECT val FROM prep_schema_guard WHERE id = 2";
+        let stmt = conn.prepare(sql).unwrap();
+        let row = stmt.query_row().unwrap();
+        let expected: String = sqlite.query_row(sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(row.values(), &[SqliteValue::Text(expected.into())]);
+
+        conn.execute("CREATE TABLE prep_schema_guard_bump (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let err = stmt
+            .query_row()
+            .expect_err("schema-changing DDL must invalidate prepared SELECT");
+        assert!(matches!(err, FrankenError::SchemaChanged));
+    }
+
+    #[test]
     fn test_prepared_dml_rejects_schema_change() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE prep_schema_dml (id INTEGER PRIMARY KEY, val TEXT);")
@@ -125852,6 +136936,22 @@ mod pager_routing_tests {
         assert_eq!(
             profile.record_decode.parse_record_into_calls, 0,
             "fixed-width REAL update should patch the existing payload without decoding it: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_direct_update_leaf_patch_run_start_attempts, 1,
+            "first fixed-width REAL update should attempt to retain a leaf patch run: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_direct_update_leaf_patch_run_start_hits, 1,
+            "first fixed-width REAL update should retain and patch the current leaf: {profile:?}"
+        );
+        assert!(
+            profile.prepared_direct_update_leaf_patch_run_start_time_ns > 0,
+            "fixed-width REAL update should attribute leaf patch-run start time: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_direct_update_leaf_patch_run_active_attempts, 0,
+            "single-row update should not use an already-active leaf patch run: {profile:?}"
         );
 
         conn.execute("COMMIT").unwrap();
@@ -128792,6 +139892,26 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_evaluate_column_default_value_handles_quoted_sqlite_literals() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        let single = conn
+            .evaluate_column_default_value(Some("('a)b')"))
+            .expect("single-quoted default literal with paren should evaluate");
+        assert_eq!(single, SqliteValue::Text("a)b".into()));
+
+        let double = conn
+            .evaluate_column_default_value(Some(r#"("fallback")"#))
+            .expect("double-quoted SQLite default literal should evaluate");
+        assert_eq!(double, SqliteValue::Text("fallback".into()));
+
+        let ast_normalized = conn
+            .evaluate_column_default_value(Some("fallback"))
+            .expect("AST-normalized string default should evaluate as text");
+        assert_eq!(ast_normalized, SqliteValue::Text("fallback".into()));
+    }
+
+    #[test]
     fn test_scalar_function_registration_invalidates_prepared_and_plan_caches() {
         use fsqlite_func::ScalarFunction;
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
@@ -130567,6 +141687,81 @@ mod pager_routing_tests {
                 .collect::<Vec<_>>(),
             vec![SqliteValue::Text("aux-row".into())]
         );
+    }
+
+    #[test]
+    fn test_create_index_on_attached_schema_delegates_to_attached_database() -> Result<()> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute("ATTACH DATABASE ':memory:' AS aux;")?;
+        conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT);")?;
+        conn.execute("INSERT INTO aux.t VALUES (1, 'beta'), (2, 'alpha');")?;
+
+        conn.execute("CREATE INDEX aux.idx_t_value ON t(value);")?;
+
+        let index_rows = conn.query(
+            "SELECT name
+             FROM aux.sqlite_master
+             WHERE type = 'index' AND name = 'idx_t_value';",
+        )?;
+        if index_rows.len() != 1
+            || index_rows[0].values()[0] != SqliteValue::Text("idx_t_value".into())
+        {
+            return Err(FrankenError::Internal(format!(
+                "expected one aux.sqlite_master row for idx_t_value, got {index_rows:?}"
+            )));
+        }
+
+        let rows =
+            conn.query("SELECT id, value FROM aux.t WHERE value >= 'alpha' ORDER BY value;")?;
+        let actual = rows
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>();
+        let expected = vec![
+            vec![SqliteValue::Integer(2), SqliteValue::Text("alpha".into())],
+            vec![SqliteValue::Integer(1), SqliteValue::Text("beta".into())],
+        ];
+        if actual != expected {
+            return Err(FrankenError::Internal(format!(
+                "expected attached index query rows {expected:?}, got {actual:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_unique_create_index_on_attached_schema_validates_existing_rows() -> Result<()> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute("ATTACH DATABASE ':memory:' AS aux;")?;
+        conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT);")?;
+        conn.execute("INSERT INTO aux.t VALUES (1, 'dup'), (2, 'dup');")?;
+
+        let Err(err) = conn.execute("CREATE UNIQUE INDEX aux.idx_t_value ON t(value);") else {
+            return Err(FrankenError::Internal(
+                "attached unique-index backfill accepted duplicate keys".into(),
+            ));
+        };
+        let err_text = err.to_string();
+        if !(matches!(&err, FrankenError::UniqueViolation { .. })
+            || err_text.contains("UNIQUE constraint failed")
+            || err_text.contains("secondary-index conflict"))
+        {
+            return Err(FrankenError::Internal(format!(
+                "expected unique violation from attached CREATE UNIQUE INDEX, got {err}"
+            )));
+        }
+
+        let rows = conn.query(
+            "SELECT name
+             FROM aux.sqlite_master
+             WHERE type = 'index' AND name = 'idx_t_value';",
+        )?;
+        if !rows.is_empty() {
+            return Err(FrankenError::Internal(format!(
+                "failed attached CREATE UNIQUE INDEX persisted sqlite_master rows: {rows:?}"
+            )));
+        }
+        Ok(())
     }
 
     #[test]
@@ -155061,6 +166256,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_prepared_direct_update_leaf_patch_run_flushes_before_read() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let conn = Connection::open(":memory:").unwrap();
         conn.execute(
             "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL NOT NULL);",
@@ -155088,6 +166284,7 @@ mod pager_routing_tests {
             .prepare("UPDATE bench SET value = ?2 WHERE id = ?1;")
             .unwrap();
         conn.execute("BEGIN;").unwrap();
+        reset_hot_path_profile();
         for rowid in (0_i64..=90_i64).step_by(10) {
             let rowid_float = f64::from(i32::try_from(rowid).unwrap());
             conn.execute_prepared_with_params(
@@ -155103,6 +166300,31 @@ mod pager_routing_tests {
             conn.pending_direct_update_leaf_patch_run.borrow().is_some(),
             "same-leaf fixed-width REAL updates should stay buffered until a read boundary"
         );
+        let profile_before_read = hot_path_profile_snapshot();
+        assert_eq!(
+            profile_before_read.prepared_direct_update_leaf_patch_run_start_attempts, 1,
+            "the first fixed-width REAL update should start one retained leaf patch run: {profile_before_read:?}"
+        );
+        assert_eq!(
+            profile_before_read.prepared_direct_update_leaf_patch_run_start_hits, 1,
+            "the first fixed-width REAL update should retain the leaf patch run: {profile_before_read:?}"
+        );
+        assert_eq!(
+            profile_before_read.prepared_direct_update_leaf_patch_run_active_attempts, 9,
+            "subsequent same-leaf fixed-width REAL updates should probe the active run: {profile_before_read:?}"
+        );
+        assert_eq!(
+            profile_before_read.prepared_direct_update_leaf_patch_run_active_hits, 9,
+            "subsequent same-leaf fixed-width REAL updates should patch through the active run: {profile_before_read:?}"
+        );
+        assert_eq!(
+            profile_before_read.prepared_direct_update_leaf_patch_run_active_misses, 0,
+            "same-leaf fixed-width REAL updates should not miss the active run before the read boundary: {profile_before_read:?}"
+        );
+        assert_eq!(
+            profile_before_read.prepared_direct_update_leaf_patch_run_flushes, 0,
+            "the retained update leaf patch run should not flush before a read boundary: {profile_before_read:?}"
+        );
 
         let row = conn
             .query_row("SELECT value FROM bench WHERE id = 90;")
@@ -155112,12 +166334,114 @@ mod pager_routing_tests {
             conn.pending_direct_update_leaf_patch_run.borrow().is_none(),
             "read boundary should leave no pending update leaf patch run"
         );
+        let profile_after_read = hot_path_profile_snapshot();
+        assert_eq!(
+            profile_after_read.prepared_direct_update_leaf_patch_run_flushes, 1,
+            "the read boundary should flush the retained update leaf patch run once: {profile_after_read:?}"
+        );
+        assert_eq!(
+            profile_after_read.prepared_direct_update_leaf_patch_run_dirty_flushes, 1,
+            "the read boundary should flush one dirty update leaf patch run: {profile_after_read:?}"
+        );
         conn.execute("COMMIT;").unwrap();
 
         let row = conn
             .query_row("SELECT value FROM bench WHERE id = 0;")
             .expect("committed patched row should remain visible");
         assert_eq!(row.values()[0], SqliteValue::Float(1000.0));
+    }
+
+    #[test]
+    fn test_prepared_direct_update_leaf_patch_run_profile_counts_incompatible_flush() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL NOT NULL);",
+        )
+        .unwrap();
+        let insert = conn
+            .prepare("INSERT INTO bench VALUES (?1, ?2, ?3);")
+            .unwrap();
+        conn.execute("BEGIN;").unwrap();
+        for rowid in 1_i64..=4_i64 {
+            conn.execute_prepared_with_params(
+                &insert,
+                &[
+                    SqliteValue::Integer(rowid),
+                    SqliteValue::Text(format!("user_{rowid}").into()),
+                    SqliteValue::Float(f64::from(i32::try_from(rowid).unwrap())),
+                ],
+            )
+            .expect("setup insert should execute");
+        }
+        conn.execute("COMMIT;").unwrap();
+
+        let update_value = conn
+            .prepare("UPDATE bench SET value = ?2 WHERE id = ?1;")
+            .unwrap();
+        let update_name = conn
+            .prepare("UPDATE bench SET name = ?2 WHERE id = ?1;")
+            .unwrap();
+        conn.execute("BEGIN;").unwrap();
+        reset_hot_path_profile();
+        assert_eq!(
+            conn.execute_prepared_with_params(
+                &update_value,
+                &[SqliteValue::Integer(1), SqliteValue::Float(42.5)],
+            )
+            .expect("fixed-width REAL update should execute"),
+            1
+        );
+        assert_eq!(
+            conn.execute_prepared_with_params(
+                &update_name,
+                &[SqliteValue::Integer(2), SqliteValue::Text("renamed".into())],
+            )
+            .expect("incompatible update should execute after flushing the retained run"),
+            1
+        );
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.prepared_direct_update_leaf_patch_run_start_attempts, 1,
+            "first fixed-width REAL update should start one retained run: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_direct_update_leaf_patch_run_active_attempts, 1,
+            "the incompatible update should still count as an active retained-run probe: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_direct_update_leaf_patch_run_active_hits, 0,
+            "the incompatible update should not patch through the active retained run: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_direct_update_leaf_patch_run_active_misses, 1,
+            "the incompatible update should count the forced flush as an active miss: {profile:?}"
+        );
+        assert!(
+            profile.prepared_direct_update_leaf_patch_run_active_time_ns > 0,
+            "the incompatible update should attribute active retained-run probe time: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_direct_update_leaf_patch_run_flushes, 1,
+            "the incompatible update should flush the retained run exactly once: {profile:?}"
+        );
+        assert!(
+            conn.pending_direct_update_leaf_patch_run.borrow().is_none(),
+            "the incompatible update should leave no retained update leaf patch run"
+        );
+        conn.execute("COMMIT;").unwrap();
+
+        let rows = conn
+            .query("SELECT id, name, value FROM bench WHERE id IN (1, 2) ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("user_1".into()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Float(42.5));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("renamed".into()));
+        assert_eq!(rows[1].values()[2], SqliteValue::Float(2.0));
     }
 
     #[test]
@@ -155283,6 +166607,99 @@ mod pager_routing_tests {
             .query_row("SELECT count(*) FROM bench;")
             .expect("committed delete run should remain visible");
         assert_eq!(row.values()[0], SqliteValue::Integer(92));
+    }
+
+    #[test]
+    fn test_prepared_direct_delete_profile_counts_fixed_costs_and_leaf_flush() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")
+            .unwrap();
+        let insert = conn.prepare("INSERT INTO bench VALUES (?1, ?2);").unwrap();
+        conn.execute("BEGIN;").unwrap();
+        for rowid in 1_i64..=32_i64 {
+            conn.execute_prepared_with_params(
+                &insert,
+                &[
+                    SqliteValue::Integer(rowid),
+                    SqliteValue::Text(format!("user_{rowid}").into()),
+                ],
+            )
+            .expect("setup insert should execute");
+        }
+        conn.execute("COMMIT;").unwrap();
+
+        let delete = conn.prepare("DELETE FROM bench WHERE id = ?1;").unwrap();
+        conn.execute("BEGIN;").unwrap();
+        reset_hot_path_profile();
+        for rowid in 1_i64..=8_i64 {
+            assert_eq!(
+                conn.execute_prepared_with_params(&delete, &[SqliteValue::Integer(rowid)])
+                    .expect("prepared delete should execute"),
+                1
+            );
+        }
+
+        let profile_before_read = hot_path_profile_snapshot();
+        assert_eq!(
+            profile_before_read.prepared_direct_delete_executions, 8,
+            "prepared DELETE should stay on the direct delete path: {profile_before_read:?}"
+        );
+        assert!(
+            profile_before_read.prepared_direct_delete_preflush_time_ns > 0,
+            "direct DELETE should attribute preflush guard time: {profile_before_read:?}"
+        );
+        assert!(
+            profile_before_read.prepared_direct_delete_rowid_lookup_time_ns > 0,
+            "direct DELETE should attribute rowid lookup/coercion time: {profile_before_read:?}"
+        );
+        assert!(
+            profile_before_read.prepared_direct_delete_active_leaf_probe_time_ns > 0,
+            "direct DELETE should attribute active retained-run probe time: {profile_before_read:?}"
+        );
+        assert!(
+            profile_before_read.prepared_direct_delete_cursor_setup_time_ns > 0,
+            "direct DELETE should attribute cursor setup time for the first physical delete: {profile_before_read:?}"
+        );
+        assert!(
+            profile_before_read.prepared_direct_delete_memdb_abandon_calls > 0,
+            "direct DELETE should count MemDatabase mirror invalidations: {profile_before_read:?}"
+        );
+        assert!(
+            profile_before_read.prepared_direct_delete_memdb_abandon_time_ns > 0,
+            "direct DELETE should attribute MemDatabase mirror invalidation time: {profile_before_read:?}"
+        );
+        assert_eq!(
+            profile_before_read.prepared_direct_delete_memory_sync_calls, 8,
+            "each affected direct DELETE should pass through memory concurrent-page sync accounting: {profile_before_read:?}"
+        );
+        assert!(
+            profile_before_read.prepared_direct_delete_memory_sync_time_ns > 0,
+            "direct DELETE should attribute memory concurrent-page sync guard time: {profile_before_read:?}"
+        );
+        assert_eq!(
+            profile_before_read.prepared_direct_delete_leaf_run_flushes, 0,
+            "same-leaf direct deletes should stay buffered before a read boundary: {profile_before_read:?}"
+        );
+
+        let row = conn
+            .query_row("SELECT count(*) FROM bench WHERE id <= 8;")
+            .expect("read should flush the pending delete leaf run");
+        assert_eq!(row.values()[0], SqliteValue::Integer(0));
+        let profile_after_read = hot_path_profile_snapshot();
+        assert_eq!(
+            profile_after_read.prepared_direct_delete_leaf_run_flushes, 1,
+            "read boundary should profile one retained DELETE leaf-run flush: {profile_after_read:?}"
+        );
+        assert_eq!(
+            profile_after_read.prepared_direct_delete_leaf_run_dirty_flushes, 1,
+            "read boundary should profile one dirty retained DELETE leaf-run flush: {profile_after_read:?}"
+        );
+        assert!(
+            profile_after_read.prepared_direct_delete_leaf_run_flush_time_ns > 0,
+            "read boundary should attribute retained DELETE leaf-run flush time: {profile_after_read:?}"
+        );
+        conn.execute("COMMIT;").unwrap();
     }
 
     #[test]
@@ -155780,12 +167197,120 @@ mod pager_routing_tests {
             "large explicit-txn inserts should attribute direct-record cell planning time: {profile:?}"
         );
         assert!(
+            profile.prepared_direct_insert_preserialize_eval_time_ns > 0,
+            "large explicit-txn inserts should attribute direct-record expression evaluation time: {profile:?}"
+        );
+        assert!(
+            profile.prepared_direct_insert_preserialize_affinity_time_ns > 0,
+            "large explicit-txn inserts should attribute direct-record affinity coercion time: {profile:?}"
+        );
+        assert!(
+            profile.prepared_direct_insert_preserialize_layout_time_ns > 0,
+            "large explicit-txn inserts should attribute direct-record cell layout time: {profile:?}"
+        );
+        assert!(
             profile.prepared_direct_insert_preserialize_encode_time_ns > 0,
             "large explicit-txn inserts should attribute direct-record byte encoding time: {profile:?}"
         );
         assert_eq!(
             profile.prepared_direct_insert_row_value_build_time_ns, 0,
             "large explicit-txn inserts should not rebuild row values after direct-record preserialization: {profile:?}"
+        );
+
+        let row = conn
+            .query_row(
+                "SELECT first_name, department, title, address, notes, score FROM t WHERE id = 17;",
+            )
+            .unwrap();
+        assert_eq!(row.values()[0], SqliteValue::Text("FirstName_17".into()));
+        assert_eq!(
+            row.values()[1],
+            SqliteValue::Text("Engineering_Dept_17".into())
+        );
+        assert_eq!(
+            row.values()[2],
+            SqliteValue::Text("Senior Software Engineer Level 2".into())
+        );
+        assert_eq!(
+            row.values()[3],
+            SqliteValue::Text(
+                "17 Technology Park, Building 17, Suite 17, Innovation City, CA 94000".into()
+            )
+        );
+        assert_eq!(
+            row.values()[4],
+            SqliteValue::Text("Internal notes: Employee 17 - Performance rating: Exceeds Expectations. Last review date: 2026-01-15. Next review: 2026-07-15. Skills: Rust, C++, SQL, distributed systems, leadership.".into())
+        );
+        assert_eq!(row.values()[5], SqliteValue::Integer(221));
+    }
+
+    #[test]
+    fn test_prepared_direct_insert_preserialize_fallback_does_not_publish_child_profile() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, score INTEGER);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("INSERT INTO t VALUES (?1, ('not_numeric_' || ?1));")
+            .unwrap();
+        let direct = stmt
+            .precompiled_dml()
+            .and_then(|dispatch| dispatch.direct_simple_insert.as_ref())
+            .expect("concat INSERT should still precompute direct metadata");
+        assert!(
+            !Connection::direct_simple_insert_prefers_reusable_table_program(direct),
+            "concat INSERT should stay on the direct simple-insert path"
+        );
+
+        reset_hot_path_profile();
+        conn.execute("BEGIN;").unwrap();
+        for id in 1..=16 {
+            assert_eq!(
+                conn.execute_prepared_with_params(&stmt, &[SqliteValue::Integer(id)])
+                    .unwrap(),
+                1
+            );
+        }
+        conn.execute("COMMIT;").unwrap();
+
+        let profile = hot_path_profile_snapshot();
+        assert!(
+            profile.prepared_direct_insert_preserialize_time_ns > 0,
+            "the memory explicit-txn path should attempt direct-record preserialization: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_direct_insert_preserialize_cell_time_ns, 0,
+            "fallback attempts must not publish successful direct-record cell planning time: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_direct_insert_preserialize_eval_time_ns, 0,
+            "fallback attempts must not publish successful direct-record expression evaluation time: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_direct_insert_preserialize_affinity_time_ns, 0,
+            "fallback attempts must not publish successful direct-record affinity coercion time: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_direct_insert_preserialize_layout_time_ns, 0,
+            "fallback attempts must not publish successful direct-record cell layout time: {profile:?}"
+        );
+        assert!(
+            profile.prepared_direct_insert_row_value_build_time_ns > 0,
+            "fallback should continue through the row-value builder: {profile:?}"
+        );
+
+        let rows = conn.query("SELECT id, score FROM t ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 16);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(
+            rows[0].values()[1],
+            SqliteValue::Text("not_numeric_1".into())
+        );
+        assert_eq!(rows[15].values()[0], SqliteValue::Integer(16));
+        assert_eq!(
+            rows[15].values()[1],
+            SqliteValue::Text("not_numeric_16".into())
         );
     }
 

@@ -828,6 +828,7 @@ fn multi_row_upsert_with_foreign_keys_uses_fallback_without_failing() {
 /// compare results for parity.
 mod rusqlite_parity {
     use super::*;
+    use fsqlite_func::ScalarFunction;
 
     fn assert_parity(
         label: &str,
@@ -854,6 +855,51 @@ mod rusqlite_parity {
             SqliteValue::Text(s) => s.to_string(),
             SqliteValue::Blob(b) => format!("{b:?}"),
         }
+    }
+
+    fn rusqlite_query_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let column_count = stmt.column_count();
+        stmt.query_map([], |row| {
+            let mut values = Vec::with_capacity(column_count);
+            for idx in 0..column_count {
+                let value = match row.get_ref(idx).unwrap() {
+                    rusqlite::types::ValueRef::Null => "NULL".to_string(),
+                    rusqlite::types::ValueRef::Integer(i) => i.to_string(),
+                    rusqlite::types::ValueRef::Real(f) => format!("{f}"),
+                    rusqlite::types::ValueRef::Text(bytes) => {
+                        String::from_utf8_lossy(bytes).into_owned()
+                    }
+                    rusqlite::types::ValueRef::Blob(bytes) => format!("{bytes:?}"),
+                };
+                values.push(value);
+            }
+            Ok(values)
+        })
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+    }
+
+    fn franken_query_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+        conn.query(sql)
+            .unwrap()
+            .iter()
+            .map(|row| row.values().iter().map(sqlite_val_to_string).collect())
+            .collect()
+    }
+
+    fn assert_query_parity(
+        label: &str,
+        rconn: &rusqlite::Connection,
+        fconn: &Connection,
+        sql: &str,
+    ) {
+        assert_parity(
+            label,
+            rusqlite_query_rows(rconn, sql),
+            franken_query_rows(fconn, sql),
+        );
     }
 
     fn setup_rusqlite() -> rusqlite::Connection {
@@ -894,6 +940,33 @@ mod rusqlite_parity {
         )
         .unwrap();
         conn
+    }
+
+    struct ForceMatch;
+
+    impl ScalarFunction for ForceMatch {
+        fn invoke(&self, args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
+            let [pattern, value] = args else {
+                return Err(FrankenError::FunctionError(
+                    "match() expects exactly two arguments".to_owned(),
+                ));
+            };
+            if matches!(pattern, SqliteValue::Null) || matches!(value, SqliteValue::Null) {
+                return Ok(SqliteValue::Null);
+            }
+            let pattern = pattern.to_text();
+            Ok(SqliteValue::Integer(i64::from(
+                pattern == "force-real-path",
+            )))
+        }
+
+        fn num_args(&self) -> i32 {
+            2
+        }
+
+        fn name(&self) -> &str {
+            "match"
+        }
     }
 
     #[test]
@@ -1153,6 +1226,96 @@ mod rusqlite_parity {
             .collect();
 
         assert_parity("COALESCE", r, f);
+    }
+
+    #[test]
+    fn parity_compound_select_set_operators() {
+        let rconn = setup_rusqlite();
+        let fconn = setup_franken();
+
+        assert_query_parity(
+            "COMPOUND_UNION_DISTINCT",
+            &rconn,
+            &fconn,
+            "SELECT agent FROM msgs WHERE role = 'user'
+             UNION
+             SELECT agent FROM msgs WHERE content IS NULL
+             ORDER BY agent",
+        );
+        assert_query_parity(
+            "COMPOUND_UNION_ALL_MULTIPLICITY",
+            &rconn,
+            &fconn,
+            "SELECT agent FROM msgs WHERE role = 'user'
+             UNION ALL
+             SELECT agent FROM msgs WHERE agent = 'codex'
+             ORDER BY agent",
+        );
+        assert_query_parity(
+            "COMPOUND_INTERSECT",
+            &rconn,
+            &fconn,
+            "SELECT agent FROM msgs WHERE role = 'user'
+             INTERSECT
+             SELECT agent FROM msgs WHERE content IS NOT NULL
+             ORDER BY agent",
+        );
+        assert_query_parity(
+            "COMPOUND_EXCEPT",
+            &rconn,
+            &fconn,
+            "SELECT agent FROM msgs
+             EXCEPT
+             SELECT agent FROM msgs WHERE content IS NULL
+             ORDER BY agent",
+        );
+    }
+
+    #[test]
+    fn parity_match_udf_uses_registered_scalar_path() {
+        let fconn = setup_franken();
+        fconn.register_scalar_function(ForceMatch);
+
+        assert_query_parity(
+            "MATCH_UDF_REAL_PATH",
+            &rusqlite_with_forced_match(),
+            &fconn,
+            "SELECT id FROM msgs WHERE content MATCH 'force-real-path' ORDER BY id",
+        );
+    }
+
+    #[test]
+    fn parity_prepared_match_udf_uses_registered_scalar_path() {
+        let fconn = setup_franken();
+        fconn.register_scalar_function(ForceMatch);
+
+        let stmt = fconn
+            .prepare("SELECT id FROM msgs WHERE content MATCH ?1 ORDER BY id")
+            .unwrap();
+        let rows = stmt
+            .query_with_params(&[SqliteValue::Text("force-real-path".into())])
+            .unwrap();
+        let ids: Vec<String> = rows
+            .iter()
+            .map(|row| sqlite_val_to_string(row.get(0).unwrap()))
+            .collect();
+        assert_eq!(ids, vec!["1", "2", "3", "5"]);
+    }
+
+    fn rusqlite_with_forced_match() -> rusqlite::Connection {
+        let conn = setup_rusqlite();
+        conn.create_scalar_function(
+            "match",
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let pattern = ctx.get::<String>(0)?;
+                let value = ctx.get::<Option<String>>(1)?;
+                Ok(i64::from(pattern == "force-real-path" && value.is_some()))
+            },
+        )
+        .unwrap();
+        conn
     }
 
     #[test]
