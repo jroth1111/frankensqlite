@@ -8,7 +8,7 @@
 //! - [`Savepoint`]: Transaction-local write snapshots for page and cell deltas.
 //! - [`CommitResponse`]: Result type for the commit sequencer.
 
-use std::collections::{BTreeMap, HashMap, btree_map::Entry as BTreeEntry};
+use std::collections::{BTreeMap, HashMap, HashSet, btree_map::Entry as BTreeEntry};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -27,6 +27,7 @@ use crate::cache_aligned::{logical_now_epoch_secs, logical_now_millis};
 use crate::cell_visibility::CellVisibilityLog;
 use crate::core_types::{
     CommitIndex, InProcessPageLockTable, Transaction, TransactionMode, TransactionState,
+    WriteVersionEntry,
 };
 use crate::ebr::{GLOBAL_EBR_METRICS, VersionGuardRegistry, VersionGuardTicket};
 use crate::invariants::{SerializedWriteMutex, TxnManager, VersionStore};
@@ -408,6 +409,13 @@ pub struct Savepoint {
         Arc<HashMap<PageNumber, PageData, fsqlite_types::PageNumberBuildHasher>>,
     /// Number of pages in write_set when savepoint was created.
     pub write_set_len: usize,
+    /// Snapshot of per-page write-version evidence at savepoint creation.
+    pub write_set_versions_snapshot:
+        HashMap<PageNumber, WriteVersionEntry, fsqlite_types::PageNumberBuildHasher>,
+    /// Snapshot of structural page tracking at savepoint creation.
+    pub structural_pages_snapshot: HashSet<PageNumber>,
+    /// Number of intent-log entries at savepoint creation.
+    pub intent_log_len: usize,
     /// Number of cell-level deltas tracked for this transaction at savepoint creation.
     pub cell_delta_len: usize,
 }
@@ -831,6 +839,13 @@ impl TransactionManager {
             .map(|delta| delta.commit_seq)
             .max()
             .unwrap_or(txn.snapshot.high);
+        if let Some(committed_high) = deltas
+            .iter()
+            .filter_map(|delta| (delta.commit_seq <= txn.snapshot.high).then_some(delta.commit_seq))
+            .max()
+        {
+            txn.record_page_read(pgno, committed_high);
+        }
         let materialized_snapshot = Snapshot::new(materialized_high, txn.snapshot.schema_epoch);
         let result = materialize_page(
             &base_page,
@@ -1142,7 +1157,7 @@ impl TransactionManager {
     /// - Release page locks.
     /// - Discard write_set.
     /// - Serialized: release mutex if held.
-    /// - Concurrent: SSI witnesses preserved (safe overapproximation).
+    /// - Discard transaction-local SSI witnesses.
     pub fn abort(&self, txn: &mut Transaction) {
         if txn.state != TransactionState::Active {
             return; // already finalized
@@ -1178,6 +1193,9 @@ impl TransactionManager {
             name: name.to_owned(),
             write_set_snapshot: txn.write_set_data.clone(),
             write_set_len: txn.write_set.len(),
+            write_set_versions_snapshot: txn.write_set_versions.clone(),
+            structural_pages_snapshot: txn.structural_pages.clone(),
+            intent_log_len: txn.intent_log.len(),
             cell_delta_len: self.cell_log.txn_delta_count(txn.token()),
         }
     }
@@ -1204,8 +1222,9 @@ impl TransactionManager {
 
         // Truncate the write_set page list to savepoint length.
         txn.write_set.truncate(savepoint.write_set_len);
-        txn.write_set_versions
-            .retain(|pgno, _| txn.write_set_data.contains_key(pgno));
+        txn.write_set_versions = savepoint.write_set_versions_snapshot.clone();
+        txn.structural_pages = savepoint.structural_pages_snapshot.clone();
+        txn.intent_log.truncate(savepoint.intent_log_len);
 
         tracing::debug!(
             txn_id = %txn.txn_id,
@@ -1276,11 +1295,16 @@ impl TransactionManager {
         if cached_commit_epoch != commit_epoch.get() {
             return None;
         }
+        let cached_schema_epoch = self.snapshot_reuse_schema_epoch.load(Ordering::Acquire);
+        let shared_schema_epoch = self.shm.load_schema_epoch().get();
+        if cached_schema_epoch != shared_schema_epoch {
+            return None;
+        }
         #[cfg(test)]
         self.snapshot_reuse_hits.fetch_add(1, Ordering::Relaxed);
         Some(Snapshot::new(
             commit_epoch,
-            SchemaEpoch::new(self.snapshot_reuse_schema_epoch.load(Ordering::Relaxed)),
+            SchemaEpoch::new(cached_schema_epoch),
         ))
     }
 
@@ -1877,6 +1901,11 @@ impl TransactionManager {
         self.lock_table
             .release_set(txn.page_locks.drain(), txn.txn_id);
         txn.clear_page_access_tracking();
+        txn.write_set.clear();
+        Arc::make_mut(&mut txn.write_set_data).clear();
+        txn.intent_log.clear();
+        txn.read_keys.clear();
+        txn.write_keys.clear();
 
         // Release serialized write mutex if held.
         if txn.serialized_write_lock_held {
@@ -2555,6 +2584,63 @@ mod tests {
     }
 
     #[test]
+    fn test_version_chain_snapshot_visibility_under_concurrent_commit() {
+        let m = mgr();
+        let pgno = PageNumber::new(1_217).unwrap();
+
+        let mut seed = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut seed, pgno, test_data(0x10)).unwrap();
+        let seq1 = m.commit(&mut seed).unwrap();
+        assert!(seq1 > CommitSeq::ZERO);
+
+        let mut pinned_reader = m.begin(BeginKind::Concurrent).unwrap();
+        assert_eq!(
+            pinned_reader.snapshot.high, seq1,
+            "reader must pin the latest committed version at begin"
+        );
+        let first_read = m.read_page(&mut pinned_reader, pgno).unwrap();
+        assert_eq!(first_read.as_bytes()[0], 0x10);
+        assert_eq!(pinned_reader.read_version_for_page(pgno), Some(seq1));
+
+        let mut later_writer = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut later_writer, pgno, test_data(0x20))
+            .unwrap();
+        let seq2 = m.commit(&mut later_writer).unwrap();
+        assert!(seq2 > seq1);
+
+        let pinned_again = m.read_page(&mut pinned_reader, pgno).unwrap();
+        assert_eq!(
+            pinned_again.as_bytes()[0],
+            0x10,
+            "reader snapshot must not see a version committed after begin"
+        );
+        assert_eq!(pinned_reader.read_version_for_page(pgno), Some(seq1));
+
+        let pinned_resolved = m
+            .version_store
+            .resolve_visible_version(pgno, &pinned_reader.snapshot)
+            .expect("pinned snapshot resolves the earlier version");
+        assert_eq!(pinned_resolved.commit_seq, seq1);
+        assert_eq!(pinned_resolved.data.as_bytes()[0], 0x10);
+
+        let mut fresh_reader = m.begin(BeginKind::Concurrent).unwrap();
+        assert!(
+            fresh_reader.snapshot.high >= seq2,
+            "fresh reader must start after the later concurrent commit"
+        );
+        let fresh_read = m.read_page(&mut fresh_reader, pgno).unwrap();
+        assert_eq!(
+            fresh_read.as_bytes()[0],
+            0x20,
+            "fresh snapshot must see the latest committed version"
+        );
+        assert_eq!(fresh_reader.read_version_for_page(pgno), Some(seq2));
+
+        m.abort(&mut pinned_reader);
+        m.abort(&mut fresh_reader);
+    }
+
+    #[test]
     fn test_record_range_scan_tracks_all_pages() {
         let m = mgr();
         let p1 = PageNumber::new(12).unwrap();
@@ -2830,6 +2916,126 @@ mod tests {
             MvccError::BusySnapshot,
             "stale snapshot must return BUSY_SNAPSHOT"
         );
+    }
+
+    #[test]
+    fn test_serialized_stale_deferred_upgrade_releases_baton() {
+        let m = mgr();
+
+        let pgno = PageNumber::new(1).unwrap();
+        let mut seed = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut seed, pgno, test_data(0x01)).unwrap();
+        let seed_commit = m.commit(&mut seed).unwrap();
+
+        let mut reader_then_writer = m.begin(BeginKind::Deferred).unwrap();
+        assert!(
+            !reader_then_writer.snapshot_established,
+            "deferred transaction should not pin a snapshot until first access"
+        );
+        assert_eq!(m.version_guard_registry().active_guard_count(), 1);
+        assert!(m.cached_gc_horizon().is_none());
+
+        assert_eq!(
+            m.read_page(&mut reader_then_writer, pgno),
+            Some(test_data(0x01))
+        );
+        assert!(reader_then_writer.snapshot_established);
+        assert_eq!(reader_then_writer.snapshot.high, seed_commit);
+        assert_eq!(m.cached_gc_horizon(), Some(seed_commit));
+        assert_eq!(m.version_guard_registry().active_guard_count(), 1);
+        assert!(m.write_mutex().holder().is_none());
+
+        let mut later_writer = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(
+            &mut later_writer,
+            PageNumber::new(2).unwrap(),
+            test_data(0x02),
+        )
+        .unwrap();
+        m.commit(&mut later_writer).unwrap();
+
+        let result = m.write_page(
+            &mut reader_then_writer,
+            PageNumber::new(3).unwrap(),
+            test_data(0x03),
+        );
+        assert_eq!(result.unwrap_err(), MvccError::BusySnapshot);
+        assert_eq!(reader_then_writer.state, TransactionState::Active);
+        assert!(
+            !reader_then_writer.serialized_write_lock_held,
+            "stale deferred upgrade must not retain serialized writer exclusion"
+        );
+        assert!(
+            m.write_mutex().holder().is_none(),
+            "BusySnapshot during deferred upgrade must release the writer baton"
+        );
+        assert_eq!(
+            m.cached_gc_horizon(),
+            Some(seed_commit),
+            "the live reader snapshot remains pinned until explicit abort"
+        );
+        assert!(reader_then_writer.has_version_guard());
+        assert_eq!(m.version_guard_registry().active_guard_count(), 1);
+
+        m.abort(&mut reader_then_writer);
+        assert!(m.cached_gc_horizon().is_none());
+        assert_eq!(m.version_guard_registry().active_guard_count(), 0);
+        assert!(m.write_mutex().holder().is_none());
+    }
+
+    #[test]
+    fn test_serialized_schema_drift_deferred_upgrade_releases_baton() {
+        let m = mgr();
+
+        let pgno = PageNumber::new(4).unwrap();
+        let mut seed = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut seed, pgno, test_data(0x04)).unwrap();
+        let seed_commit = m.commit(&mut seed).unwrap();
+
+        let mut reader_then_writer = m.begin(BeginKind::Deferred).unwrap();
+        assert_eq!(
+            m.read_page(&mut reader_then_writer, pgno),
+            Some(test_data(0x04))
+        );
+        assert!(reader_then_writer.snapshot_established);
+        assert_eq!(reader_then_writer.snapshot.high, seed_commit);
+        assert_eq!(m.cached_gc_horizon(), Some(seed_commit));
+        assert_eq!(m.version_guard_registry().active_guard_count(), 1);
+        assert!(m.write_mutex().holder().is_none());
+
+        let newer_schema_epoch =
+            SchemaEpoch::new(reader_then_writer.snapshot.schema_epoch.get() + 1);
+        m.shm
+            .publish_snapshot(seed_commit, newer_schema_epoch, m.shm.load_ecs_epoch());
+
+        let result = m.write_page(
+            &mut reader_then_writer,
+            PageNumber::new(5).unwrap(),
+            test_data(0x05),
+        );
+        assert_eq!(result.unwrap_err(), MvccError::Schema);
+        assert_eq!(reader_then_writer.state, TransactionState::Active);
+        assert!(
+            !reader_then_writer.serialized_write_lock_held,
+            "schema-drift deferred upgrade must not retain serialized writer exclusion"
+        );
+        assert!(
+            m.write_mutex().holder().is_none(),
+            "Schema during deferred upgrade must release the writer baton"
+        );
+        assert_eq!(
+            m.cached_gc_horizon(),
+            Some(seed_commit),
+            "the live reader snapshot remains pinned until explicit abort"
+        );
+        assert!(reader_then_writer.has_version_guard());
+        assert_eq!(m.version_guard_registry().active_guard_count(), 1);
+
+        m.abort(&mut reader_then_writer);
+        assert!(m.cached_gc_horizon().is_none());
+        assert_eq!(m.shm.load_gc_horizon(), CommitSeq::ZERO);
+        assert_eq!(m.version_guard_registry().active_guard_count(), 0);
+        assert!(m.write_mutex().holder().is_none());
     }
 
     #[test]
@@ -3249,6 +3455,10 @@ mod tests {
 
         // Mutex should be released.
         assert!(m.write_mutex().holder().is_none());
+        assert!(txn.write_set.is_empty());
+        assert!(txn.write_set_data.is_empty());
+        assert!(txn.write_set_versions.is_empty());
+        assert!(txn.write_keys.is_empty());
 
         // Version store should have the committed version.
         let snap = Snapshot::new(seq, SchemaEpoch::ZERO);
@@ -3272,6 +3482,48 @@ mod tests {
         let result = m.commit(&mut txn);
         assert_eq!(result.unwrap_err(), MvccError::Schema);
         assert_eq!(txn.state, TransactionState::Aborted);
+    }
+
+    #[test]
+    fn test_schema_epoch_abort_releases_lifecycle_resources() {
+        let mut m = mgr();
+        let pgno = PageNumber::new(8_023).unwrap();
+        let mut txn = m.begin(BeginKind::Immediate).unwrap();
+
+        assert!(txn.snapshot_established);
+        assert!(txn.has_version_guard());
+        assert_eq!(m.cached_gc_horizon(), Some(txn.snapshot.high));
+        assert_eq!(m.shm.load_gc_horizon(), txn.snapshot.high);
+        assert_eq!(m.version_guard_registry().active_guard_count(), 1);
+        assert_eq!(m.write_mutex().holder(), Some(txn.txn_id));
+        assert!(
+            txn.serialized_write_lock_held,
+            "IMMEDIATE transaction should hold serialized writer exclusion"
+        );
+
+        m.write_page(&mut txn, pgno, test_data(0x5E))
+            .expect("writer should stage a page before schema mismatch");
+        m.advance_schema_epoch();
+
+        let result = m.commit(&mut txn);
+        assert_eq!(result.unwrap_err(), MvccError::Schema);
+        assert_eq!(txn.state, TransactionState::Aborted);
+        assert!(
+            !txn.snapshot_established,
+            "schema-mismatch abort must release the active snapshot"
+        );
+        assert!(
+            !txn.has_version_guard(),
+            "schema-mismatch abort must unpin the EBR guard"
+        );
+        assert!(
+            !txn.serialized_write_lock_held,
+            "schema-mismatch abort must release serialized writer exclusion"
+        );
+        assert_eq!(m.version_guard_registry().active_guard_count(), 0);
+        assert!(m.cached_gc_horizon().is_none());
+        assert_eq!(m.shm.load_gc_horizon(), CommitSeq::ZERO);
+        assert!(m.write_mutex().holder().is_none());
     }
 
     #[test]
@@ -3343,6 +3595,10 @@ mod tests {
 
         // Locks should be released.
         assert_eq!(m.lock_table().lock_count(), 0);
+        assert!(txn.write_set.is_empty());
+        assert!(txn.write_set_data.is_empty());
+        assert!(txn.write_set_versions.is_empty());
+        assert!(txn.write_keys.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -3377,6 +3633,22 @@ mod tests {
 
         m.abort(&mut txn);
         assert_eq!(txn.state, TransactionState::Aborted);
+        assert!(
+            txn.write_set.is_empty(),
+            "abort must discard staged page numbers"
+        );
+        assert!(
+            txn.write_set_data.is_empty(),
+            "abort must discard staged page buffers"
+        );
+        assert!(
+            txn.write_set_versions.is_empty(),
+            "abort must discard write-version metadata"
+        );
+        assert!(
+            txn.write_keys.is_empty(),
+            "abort must discard SSI write keys"
+        );
 
         // Data should not be visible to a new transaction.
         let mut txn2 = m.begin(BeginKind::Concurrent).unwrap();
@@ -3400,7 +3672,7 @@ mod tests {
     }
 
     #[test]
-    fn test_abort_concurrent_witnesses_preserved() {
+    fn test_abort_concurrent_witnesses_cleared() {
         let m = mgr();
         let mut txn = m.begin(BeginKind::Concurrent).unwrap();
         let read_pg = PageNumber::new(1).unwrap();
@@ -3421,14 +3693,13 @@ mod tests {
             "write tracking must be cleared on abort"
         );
 
-        // Witnesses are NOT cleared on abort (safe overapproximation per spec).
         assert!(
-            !txn.read_keys.is_empty(),
-            "SSI read witnesses must be preserved after abort"
+            txn.read_keys.is_empty(),
+            "SSI read witnesses must be cleared after transaction finalization"
         );
         assert!(
-            !txn.write_keys.is_empty(),
-            "SSI write witnesses must be preserved after abort"
+            txn.write_keys.is_empty(),
+            "SSI write witnesses must be cleared after transaction finalization"
         );
     }
 
@@ -3510,6 +3781,104 @@ mod tests {
     }
 
     #[test]
+    fn test_rollback_to_savepoint_restores_logical_write_version_tracking() {
+        let m = mgr();
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        let pre_savepoint_page = PageNumber::new(1).unwrap();
+        let post_savepoint_page = PageNumber::new(2).unwrap();
+
+        txn.write_set.push(pre_savepoint_page);
+        txn.record_page_write(pre_savepoint_page, Some(CommitSeq::new(7)));
+        let sp = m.savepoint(&txn, "sp_logical_tracking");
+
+        txn.write_set.push(post_savepoint_page);
+        txn.record_page_write(post_savepoint_page, Some(CommitSeq::new(8)));
+
+        assert!(
+            !txn.write_set_data.contains_key(&pre_savepoint_page),
+            "logical writes should not require full-page write_set_data"
+        );
+        assert!(txn.write_version_for_page(pre_savepoint_page).is_some());
+        assert!(txn.write_version_for_page(post_savepoint_page).is_some());
+
+        m.rollback_to_savepoint(&mut txn, &sp);
+
+        let restored_entry = txn
+            .write_version_for_page(pre_savepoint_page)
+            .expect("pre-savepoint logical write tracking must survive rollback");
+        assert_eq!(restored_entry.old_version, Some(CommitSeq::new(7)));
+        assert_eq!(restored_entry.new_version, None);
+        assert!(
+            txn.write_version_for_page(post_savepoint_page).is_none(),
+            "post-savepoint logical write tracking must be pruned"
+        );
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint_restores_structural_page_tracking() {
+        let m = mgr();
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        let p1 = PageNumber::new(1).unwrap();
+        let p2 = PageNumber::new(2).unwrap();
+
+        m.write_page(&mut txn, p1, test_data(0x01)).unwrap();
+        let sp = m.savepoint(&txn, "sp_structural");
+        m.write_page(&mut txn, p2, test_data(0x02)).unwrap();
+
+        assert!(txn.structural_pages.contains(&p1));
+        assert!(txn.structural_pages.contains(&p2));
+
+        m.rollback_to_savepoint(&mut txn, &sp);
+
+        assert!(
+            txn.structural_pages.contains(&p1),
+            "pre-savepoint structural page must remain tracked"
+        );
+        assert!(
+            !txn.structural_pages.contains(&p2),
+            "rolled-back structural page must not leave stale classification"
+        );
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint_truncates_intent_log_but_keeps_witnesses() {
+        use fsqlite_types::{IntentFootprint, IntentOp, IntentOpKind, RowId, TableId};
+
+        fn insert_intent(rowid: i64, record: &[u8]) -> IntentOp {
+            IntentOp {
+                schema_epoch: 0,
+                footprint: IntentFootprint::empty(),
+                op: IntentOpKind::Insert {
+                    table: TableId::new(1),
+                    key: RowId::new(rowid),
+                    record: record.to_vec(),
+                },
+            }
+        }
+
+        let m = mgr();
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        txn.intent_log.push(insert_intent(1, b"before"));
+        let sp = m.savepoint(&txn, "sp_intent");
+
+        txn.intent_log.push(insert_intent(2, b"after"));
+        txn.read_keys
+            .insert(fsqlite_types::WitnessKey::Page(PageNumber::new(2).unwrap()));
+
+        m.rollback_to_savepoint(&mut txn, &sp);
+
+        assert_eq!(
+            txn.intent_log,
+            vec![insert_intent(1, b"before")],
+            "ROLLBACK TO must discard post-savepoint intent entries"
+        );
+        assert!(
+            !txn.read_keys.is_empty(),
+            "SSI witnesses intentionally survive savepoint rollback"
+        );
+    }
+
+    #[test]
     fn test_rollback_to_savepoint_prunes_cell_deltas() -> Result<(), String> {
         use crate::cell_visibility::CellKey;
         use fsqlite_types::{BtreeRef, TableId};
@@ -3572,6 +3941,48 @@ mod tests {
         );
         assert!(txn.page_locks.contains(&p1));
         assert!(txn.page_locks.contains(&p2));
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint_rewrite_retained_lock_readds_commit_page() {
+        let m = mgr();
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        let p1 = PageNumber::new(1).unwrap();
+        let p2 = PageNumber::new(2).unwrap();
+
+        m.write_page(&mut txn, p1, test_data(0x01)).unwrap();
+        let sp = m.savepoint(&txn, "sp_rewrite");
+        m.write_page(&mut txn, p2, test_data(0x02)).unwrap();
+        assert!(txn.page_locks.contains(&p2));
+
+        m.rollback_to_savepoint(&mut txn, &sp);
+        assert!(
+            txn.page_locks.contains(&p2),
+            "ROLLBACK TO keeps locks for pages written after the savepoint"
+        );
+        assert!(
+            !txn.write_set.contains(&p2),
+            "rolled-back page must be absent from the pending write set before rewrite"
+        );
+        assert!(!txn.write_set_data.contains_key(&p2));
+
+        let rewritten = test_data(0x33);
+        m.write_page(&mut txn, p2, rewritten.clone()).unwrap();
+        assert!(
+            txn.write_set.contains(&p2),
+            "rewriting a retained-lock page must re-add it to the pending write set"
+        );
+        assert!(txn.write_set_data.contains_key(&p2));
+
+        let commit_seq = m.commit(&mut txn).unwrap();
+        assert!(commit_seq > CommitSeq::ZERO);
+
+        let mut reader = m.begin(BeginKind::Concurrent).unwrap();
+        let read_back = m
+            .read_page(&mut reader, p2)
+            .expect("rewritten page must be published");
+        assert_eq!(read_back.as_bytes(), rewritten.as_bytes());
+        m.abort(&mut reader);
     }
 
     #[test]
@@ -3960,6 +4371,55 @@ mod tests {
     }
 
     #[test]
+    fn test_fcw_abort_releases_snapshot_guard_and_page_locks() {
+        let mut m = mgr();
+        m.set_write_merge_policy(WriteMergePolicy::Off)
+            .expect("OFF must be accepted");
+
+        let pgno = PageNumber::new(8_024).unwrap();
+        let mut first = m.begin(BeginKind::Concurrent).unwrap();
+        let mut stale = m.begin(BeginKind::Concurrent).unwrap();
+        let stale_snapshot = stale.snapshot.high;
+
+        assert_eq!(m.cached_gc_horizon(), Some(stale_snapshot));
+        assert_eq!(m.version_guard_registry().active_guard_count(), 2);
+
+        m.write_page(&mut first, pgno, test_data(0x2B))
+            .expect("first writer should stage a page");
+        let first_commit = m.commit(&mut first).expect("first writer commit");
+        assert!(first_commit > stale_snapshot);
+        assert_eq!(m.cached_gc_horizon(), Some(stale_snapshot));
+        assert_eq!(
+            m.version_guard_registry().active_guard_count(),
+            1,
+            "stale writer should be the only remaining active guard"
+        );
+
+        m.write_page(&mut stale, pgno, test_data(0x2C))
+            .expect("stale writer should acquire the page lock before FCW validation");
+        assert!(stale.page_locks.contains(&pgno));
+
+        let result = m.commit(&mut stale);
+        assert_eq!(result.unwrap_err(), MvccError::BusySnapshot);
+        assert_eq!(stale.state, TransactionState::Aborted);
+        assert!(
+            !stale.snapshot_established,
+            "FCW abort must unregister the active snapshot"
+        );
+        assert!(
+            !stale.has_version_guard(),
+            "FCW abort must unpin the EBR guard"
+        );
+        assert!(
+            stale.page_locks.is_empty(),
+            "FCW abort must release page locks held by the stale writer"
+        );
+        assert!(m.cached_gc_horizon().is_none());
+        assert_eq!(m.shm.load_gc_horizon(), CommitSeq::ZERO);
+        assert_eq!(m.version_guard_registry().active_guard_count(), 0);
+    }
+
+    #[test]
     fn test_pragma_write_merge_safe() {
         let mut m = mgr();
         m.set_write_merge_policy(WriteMergePolicy::Safe)
@@ -4319,6 +4779,49 @@ mod tests {
             second.as_bytes()[0],
             0x33,
             "same transaction must keep a stable snapshot view"
+        );
+    }
+
+    #[test]
+    fn test_theorem1_no_read_skew_across_pages() {
+        let m = mgr();
+        let page_a = PageNumber::new(1_203).unwrap();
+        let page_b = PageNumber::new(1_204).unwrap();
+
+        let mut seed = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut seed, page_a, test_data(0x10)).unwrap();
+        m.write_page(&mut seed, page_b, test_data(0x20)).unwrap();
+        m.commit(&mut seed).unwrap();
+
+        let mut reader = m.begin(BeginKind::Concurrent).unwrap();
+        let first_a = m.read_page(&mut reader, page_a).unwrap();
+        assert_eq!(first_a.as_bytes()[0], 0x10);
+
+        let mut writer_a = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut writer_a, page_a, test_data(0xA0))
+            .unwrap();
+        m.commit(&mut writer_a).unwrap();
+
+        let mut writer_b = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut writer_b, page_b, test_data(0xB0))
+            .unwrap();
+        m.commit(&mut writer_b).unwrap();
+
+        let second_b = m.read_page(&mut reader, page_b).unwrap();
+        let second_a = m.read_page(&mut reader, page_a).unwrap();
+        assert_eq!(
+            (second_a.as_bytes()[0], second_b.as_bytes()[0]),
+            (0x10, 0x20),
+            "reader must keep a transaction-consistent pair, not mix old and new page versions"
+        );
+
+        let mut later_reader = m.begin(BeginKind::Concurrent).unwrap();
+        let later_a = m.read_page(&mut later_reader, page_a).unwrap();
+        let later_b = m.read_page(&mut later_reader, page_b).unwrap();
+        assert_eq!(
+            (later_a.as_bytes()[0], later_b.as_bytes()[0]),
+            (0xA0, 0xB0),
+            "later snapshots must observe both committed updates"
         );
     }
 
@@ -6225,8 +6728,25 @@ mod tests {
         assert!(txn3.has_version_guard());
 
         drop(txn1);
-        // Guard drops when Transaction drops (not just on explicit commit/abort).
-        // But note: explicit release_all_resources is needed for proper cleanup.
+        assert_eq!(
+            mgr.version_guard_registry().active_guard_count(),
+            2,
+            "dropping a transaction must unregister its guard ticket"
+        );
+
+        drop(txn2);
+        assert_eq!(
+            mgr.version_guard_registry().active_guard_count(),
+            1,
+            "remaining transactions should keep their guards pinned independently"
+        );
+
+        drop(txn3);
+        assert_eq!(
+            mgr.version_guard_registry().active_guard_count(),
+            0,
+            "all guard tickets should unpin when their transactions drop"
+        );
     }
 
     #[test]
@@ -6293,6 +6813,56 @@ mod tests {
         );
         mgr.abort(&mut reader);
         assert_eq!(mgr.version_guard_registry().active_guard_count(), 0);
+    }
+
+    #[test]
+    fn test_transaction_guard_blocks_recycling_of_retired_versions_until_abort() {
+        let mgr = mgr();
+        let pgno = PageNumber::new(6_006).expect("valid page number");
+
+        let mut pinned = mgr.begin(BeginKind::Deferred).unwrap();
+        assert!(pinned.has_version_guard());
+        assert!(!pinned.snapshot_established);
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 1);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut seed, pgno, test_data(0x10)).unwrap();
+        mgr.commit(&mut seed).unwrap();
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut writer, pgno, test_data(0x20)).unwrap();
+        mgr.commit(&mut writer).unwrap();
+
+        assert_eq!(
+            mgr.version_store().chain_length(pgno),
+            1,
+            "superseded version should be pruned from the visible chain"
+        );
+        let pending_while_pinned = mgr.version_store().pending_recycle_count();
+        assert!(
+            pending_while_pinned > 0,
+            "active transaction guard should keep retired slots pending"
+        );
+        assert_eq!(
+            mgr.version_store()
+                .try_recycle_retired_slots(mgr.version_store().current_epoch()),
+            0,
+            "retired slots must not recycle while the transaction guard is pinned"
+        );
+        assert_eq!(
+            mgr.version_store().pending_recycle_count(),
+            pending_while_pinned,
+            "failed recycle attempts must leave pinned retirements queued"
+        );
+
+        mgr.abort(&mut pinned);
+
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 0);
+        assert_eq!(
+            mgr.version_store().pending_recycle_count(),
+            0,
+            "aborting the pinning transaction should release the guard and drain retired slots"
+        );
     }
 
     #[test]
@@ -6672,6 +7242,52 @@ mod tests {
     }
 
     #[test]
+    fn test_read_only_commit_releases_cached_gc_horizon() {
+        let mgr = mgr();
+        let pgno = PageNumber::new(6_781).unwrap();
+        let data = test_data(0x61);
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut writer, pgno, data.clone())
+            .expect("writer should stage seed page");
+        let commit_seq = mgr.commit(&mut writer).expect("seed writer commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).unwrap();
+        assert_eq!(
+            mgr.cached_gc_horizon(),
+            Some(commit_seq),
+            "active read-only transaction should pin the current snapshot horizon"
+        );
+        assert_eq!(mgr.shm.load_gc_horizon(), commit_seq);
+        assert_eq!(
+            mgr.read_page(&mut reader, pgno),
+            Some(data),
+            "read-only transaction should resolve the committed seed page"
+        );
+
+        let read_only_commit = mgr
+            .commit(&mut reader)
+            .expect("read-only transaction should commit");
+
+        assert_eq!(
+            read_only_commit,
+            CommitSeq::ZERO,
+            "read-only commit should not publish a new commit sequence"
+        );
+        assert_eq!(reader.state, TransactionState::Committed);
+        assert!(
+            !reader.snapshot_established,
+            "read-only commit must mark the snapshot as released"
+        );
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 0);
+        assert!(
+            mgr.cached_gc_horizon().is_none(),
+            "read-only commit should release the last cached GC horizon"
+        );
+        assert_eq!(mgr.shm.load_gc_horizon(), CommitSeq::ZERO);
+    }
+
+    #[test]
     fn test_cached_gc_horizon_tracks_deferred_first_write_lifecycle() {
         let mgr = mgr();
         let pgno = PageNumber::new(6_784).unwrap();
@@ -6849,6 +7465,165 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_reuse_invalidates_when_shared_schema_epoch_advances() {
+        let mgr = mgr();
+
+        let mut first = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("first begin should succeed");
+        let first_snapshot = first.snapshot;
+        assert_eq!(mgr.snapshot_reuse_stats(), (1, 0));
+        mgr.abort(&mut first);
+
+        let published_schema_epoch = SchemaEpoch::new(first_snapshot.schema_epoch.get() + 1);
+        mgr.shm.publish_snapshot(
+            first_snapshot.high,
+            published_schema_epoch,
+            mgr.shm.load_ecs_epoch(),
+        );
+
+        let mut refreshed = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("begin after schema epoch publish should succeed");
+        assert_eq!(
+            refreshed.snapshot,
+            Snapshot::new(first_snapshot.high, published_schema_epoch),
+            "schema epoch changes at the same commit epoch must force a fresh snapshot load"
+        );
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (1, 1),
+            "schema-only publication should miss once and refresh the reuse cache"
+        );
+        mgr.abort(&mut refreshed);
+
+        let mut reused = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("subsequent begin should reuse refreshed schema epoch");
+        assert_eq!(
+            reused.snapshot,
+            Snapshot::new(first_snapshot.high, published_schema_epoch),
+            "refreshed schema epoch should become reusable after the miss"
+        );
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (2, 1),
+            "once refreshed, later begins at the same pair should hit the reuse path"
+        );
+        mgr.abort(&mut reused);
+    }
+
+    #[test]
+    fn test_snapshot_reuse_primes_cache_after_local_commit_epoch_advances() {
+        let mgr = mgr();
+        let pgno = PageNumber::new(8_021).unwrap();
+
+        let mut writer = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("writer begin should use the primed initial snapshot");
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (1, 0),
+            "initial BEGIN should use the commit-epoch reuse path"
+        );
+        mgr.write_page(&mut writer, pgno, test_data(0x2A))
+            .expect("writer should stage a page");
+        let commit_seq = mgr.commit(&mut writer).expect("writer commit");
+
+        let mut reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("reader begin after local commit should succeed");
+        assert_eq!(
+            reader.snapshot,
+            Snapshot::new(commit_seq, SchemaEpoch::ZERO),
+            "local commit publication should update the cached snapshot epoch"
+        );
+        assert_eq!(
+            mgr.read_page(&mut reader, pgno),
+            Some(test_data(0x2A)),
+            "reader should observe the locally committed page at the reused snapshot"
+        );
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (2, 0),
+            "local commit should prime the cache so the next BEGIN does not reload the seqlock"
+        );
+        mgr.abort(&mut reader);
+    }
+
+    #[test]
+    fn test_snapshot_reuse_survives_read_only_commit_without_epoch_advance() {
+        let mgr = mgr();
+        let pgno = PageNumber::new(8_022).unwrap();
+
+        let mut writer = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("writer begin should use the primed initial snapshot");
+        mgr.write_page(&mut writer, pgno, test_data(0x4C))
+            .expect("writer should stage a page");
+        let commit_seq = mgr.commit(&mut writer).expect("writer commit");
+        assert_eq!(mgr.shm.load_commit_seq(), commit_seq);
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (1, 0),
+            "local write commit should publish the new snapshot into the reuse cache"
+        );
+
+        let mut reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("reader begin after local commit should succeed");
+        assert_eq!(
+            reader.snapshot,
+            Snapshot::new(commit_seq, SchemaEpoch::ZERO)
+        );
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (2, 0),
+            "reader should hit the locally published snapshot cache"
+        );
+        assert_eq!(
+            mgr.read_page(&mut reader, pgno),
+            Some(test_data(0x4C)),
+            "reader should observe the committed page before read-only commit"
+        );
+
+        let read_only_commit = mgr
+            .commit(&mut reader)
+            .expect("read-only transaction should commit");
+        assert_eq!(
+            read_only_commit,
+            CommitSeq::ZERO,
+            "read-only commit must not allocate or publish a commit sequence"
+        );
+        assert_eq!(reader.state, TransactionState::Committed);
+        assert_eq!(
+            mgr.shm.load_commit_seq(),
+            commit_seq,
+            "read-only commit must leave the shared commit epoch unchanged"
+        );
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (2, 0),
+            "read-only commit should not reload or invalidate the snapshot cache"
+        );
+
+        let mut next_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("next reader should reuse the unchanged epoch");
+        assert_eq!(
+            next_reader.snapshot,
+            Snapshot::new(commit_seq, SchemaEpoch::ZERO),
+            "next reader should see the same reusable snapshot pair"
+        );
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (3, 0),
+            "next begin should remain on the reuse path after read-only commit"
+        );
+        mgr.abort(&mut next_reader);
+    }
+
+    #[test]
     fn test_commit_releases_writer_pinned_chain_immediately_when_horizon_advances() {
         let mgr = mgr();
         let pgno = PageNumber::new(6_785).unwrap();
@@ -6878,6 +7653,114 @@ mod tests {
             1,
             "once the last older snapshot releases, the next commit should eagerly prune superseded versions",
         );
+    }
+
+    #[test]
+    fn test_gc_bounded_pruning_preserves_oldest_live_snapshot_version() {
+        let mut mgr = mgr();
+        mgr.set_max_chain_length(4);
+        mgr.set_chain_length_warning(2);
+        let pgno = PageNumber::new(6_786).unwrap();
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut seed, pgno, test_data(0x10))
+            .expect("seed writer should stage page");
+        let seq1 = mgr.commit(&mut seed).expect("seed writer should commit");
+
+        let mut oldest_reader = mgr.begin(BeginKind::Concurrent).unwrap();
+        let oldest_visible = mgr.read_page(&mut oldest_reader, pgno).unwrap();
+        assert_eq!(oldest_visible.as_bytes()[0], 0x10);
+        assert_eq!(oldest_reader.read_version_for_page(pgno), Some(seq1));
+
+        let mut writer_a = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut writer_a, pgno, test_data(0x11))
+            .expect("writer_a should stage page");
+        let seq2 = mgr.commit(&mut writer_a).expect("writer_a should commit");
+
+        let mut writer_b = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut writer_b, pgno, test_data(0x12))
+            .expect("writer_b should stage page");
+        let seq3 = mgr.commit(&mut writer_b).expect("writer_b should commit");
+
+        assert_eq!(
+            mgr.version_store()
+                .walk_chain(pgno)
+                .iter()
+                .map(|version| version.commit_seq)
+                .collect::<Vec<_>>(),
+            vec![seq3, seq2, seq1],
+            "oldest live reader should keep the full chain back to seq1"
+        );
+
+        let mut pinned_reader = mgr.begin(BeginKind::Concurrent).unwrap();
+        assert_eq!(
+            pinned_reader.snapshot.high, seq3,
+            "new live reader should pin the newest committed sequence"
+        );
+        let pinned_visible = mgr.read_page(&mut pinned_reader, pgno).unwrap();
+        assert_eq!(pinned_visible.as_bytes()[0], 0x12);
+        assert_eq!(pinned_reader.read_version_for_page(pgno), Some(seq3));
+
+        mgr.abort(&mut oldest_reader);
+        assert_eq!(
+            mgr.cached_gc_horizon(),
+            Some(seq3),
+            "releasing the older reader should advance the GC horizon to the oldest remaining live snapshot"
+        );
+
+        let mut writer_c = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut writer_c, pgno, test_data(0x13))
+            .expect("writer_c should stage page");
+        let seq4 = mgr.commit(&mut writer_c).expect("writer_c should commit");
+
+        let chain_after_prune = mgr
+            .version_store()
+            .walk_chain(pgno)
+            .iter()
+            .map(|version| version.commit_seq)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chain_after_prune,
+            vec![seq4, seq3],
+            "GC must prune versions older than the live horizon and stop at the version visible to the pinned reader"
+        );
+
+        let pinned_after_prune = mgr.read_page(&mut pinned_reader, pgno).unwrap();
+        assert_eq!(
+            pinned_after_prune.as_bytes()[0],
+            0x12,
+            "pinned reader must still see the version visible at its snapshot after GC"
+        );
+        assert_eq!(pinned_reader.read_version_for_page(pgno), Some(seq3));
+
+        let mut writer_d = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut writer_d, pgno, test_data(0x14))
+            .expect("writer_d should stage page");
+        let seq5 = mgr.commit(&mut writer_d).expect("writer_d should commit");
+
+        let chain_after_second_prune = mgr
+            .version_store()
+            .walk_chain(pgno)
+            .iter()
+            .map(|version| version.commit_seq)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chain_after_second_prune,
+            vec![seq5, seq4, seq3],
+            "repeated pruning must remain bounded at the oldest live snapshot instead of chasing past it"
+        );
+        assert!(
+            !chain_after_second_prune.contains(&seq1) && !chain_after_second_prune.contains(&seq2),
+            "versions older than the oldest live snapshot should stay pruned"
+        );
+
+        let mut fresh_reader = mgr.begin(BeginKind::Concurrent).unwrap();
+        let fresh_visible = mgr.read_page(&mut fresh_reader, pgno).unwrap();
+        assert_eq!(fresh_visible.as_bytes()[0], 0x14);
+        assert_eq!(fresh_reader.read_version_for_page(pgno), Some(seq5));
+
+        mgr.abort(&mut pinned_reader);
+        mgr.abort(&mut fresh_reader);
     }
 
     #[test]
@@ -7094,6 +7977,80 @@ mod tests {
     }
 
     #[test]
+    fn test_cell_delta_fcw_abort_releases_lock_and_deltas() {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let first_key = CellKey::table_row(btree, 101);
+        let second_key = CellKey::table_row(btree, 102);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut first = mgr.begin(BeginKind::Concurrent).expect("first begin");
+        let mut second = mgr.begin(BeginKind::Concurrent).expect("second begin");
+        let second_token = second.token();
+        mgr.cell_log()
+            .record_insert(
+                first_key,
+                pgno,
+                leaf_table_cell(101, &[b'a'; 8]),
+                first.token(),
+            )
+            .expect("first logical insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                second_key,
+                pgno,
+                leaf_table_cell(102, &[b'b'; 8]),
+                second_token,
+            )
+            .expect("second logical insert should fit budget");
+
+        let first_seq = mgr.commit(&mut first).expect("first commit");
+        assert_eq!(
+            mgr.lock_table().holder(pgno),
+            None,
+            "successful logical commit should release its page lock"
+        );
+
+        let second_err = mgr
+            .commit(&mut second)
+            .expect_err("stale logical writer must fail FCW validation");
+        assert_eq!(second_err, MvccError::BusySnapshot);
+        assert_eq!(second.state, TransactionState::Aborted);
+        assert!(
+            second.page_locks.is_empty(),
+            "FCW abort should clear the logical commit lock set"
+        );
+        assert!(
+            second.write_version_for_page(pgno).is_none(),
+            "FCW abort should clear logical write-version metadata"
+        );
+        assert_eq!(
+            mgr.lock_table().holder(pgno),
+            None,
+            "FCW abort should release the page lock acquired before validation"
+        );
+        assert_eq!(
+            mgr.cell_log().txn_delta_count(second_token),
+            0,
+            "FCW abort should roll back uncommitted logical deltas"
+        );
+        assert_eq!(
+            mgr.cell_log().resolve(pgno, &second_key, first_seq),
+            None,
+            "rolled-back logical delta must not become visible"
+        );
+        assert_eq!(mgr.commit_index.latest(pgno), Some(first_seq));
+    }
+
+    #[test]
     fn test_cell_delta_only_commit_takes_page_lock_before_publish() {
         use crate::cell_visibility::CellKey;
         use fsqlite_types::{BtreeRef, TableId};
@@ -7141,6 +8098,68 @@ mod tests {
 
         mgr.abort(&mut first);
         mgr.abort(&mut second);
+    }
+
+    #[test]
+    fn test_cell_delta_commit_busy_releases_partial_locks() {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let free_pgno = PageNumber::new(2).expect("valid page");
+        let blocked_pgno = PageNumber::new(3).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+
+        let mut blocker = mgr.begin(BeginKind::Concurrent).expect("blocker begin");
+        mgr.write_page(&mut blocker, blocked_pgno, test_data(0x44))
+            .expect("blocker should acquire the later page lock");
+        assert_eq!(mgr.lock_table().holder(blocked_pgno), Some(blocker.txn_id));
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        let writer_token = writer.token();
+        mgr.cell_log()
+            .record_insert(
+                CellKey::table_row(btree, 20),
+                free_pgno,
+                leaf_table_cell(20, &[b'f'; 8]),
+                writer_token,
+            )
+            .expect("free page logical insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                CellKey::table_row(btree, 21),
+                blocked_pgno,
+                leaf_table_cell(21, &[b'b'; 8]),
+                writer_token,
+            )
+            .expect("blocked page logical insert should fit budget");
+
+        let err = mgr
+            .commit(&mut writer)
+            .expect_err("later page lock conflict should abort the logical commit");
+        assert_eq!(err, MvccError::Busy);
+        assert_eq!(writer.state, TransactionState::Aborted);
+        assert!(
+            writer.page_locks.is_empty(),
+            "abort should clear the partially acquired logical commit lock set"
+        );
+        assert_eq!(
+            mgr.lock_table().holder(free_pgno),
+            None,
+            "abort should release the earlier page lock acquired before Busy"
+        );
+        assert_eq!(
+            mgr.lock_table().holder(blocked_pgno),
+            Some(blocker.txn_id),
+            "failed writer must not disturb the conflicting writer's lock"
+        );
+        assert_eq!(
+            mgr.cell_log().txn_delta_count(writer_token),
+            0,
+            "aborted logical commit should roll back its cell deltas"
+        );
+
+        mgr.abort(&mut blocker);
     }
 
     #[test]
@@ -7222,6 +8241,2128 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_tracks_materialized_commit_horizon()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4243;
+        let payload = vec![b'h'; 131];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        let seed_seq = mgr.commit(&mut seed).expect("seed commit");
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                writer.token(),
+            )
+            .expect("logical insert should fit budget");
+        writer.write_set.push(pgno);
+        let logical_seq = mgr.commit(&mut writer).expect("logical commit");
+        assert!(logical_seq > seed_seq);
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+
+        assert_eq!(materialized_table_payloads(&page)?, vec![(rowid, payload)]);
+        assert_eq!(
+            reader.read_version_for_page(pgno),
+            Some(logical_seq),
+            "logical reads must witness the committed delta horizon, not just the base page"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_pinned_snapshot_horizon() -> fsqlite_error::Result<()>
+    {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4244;
+        let payload = vec![b'p'; 132];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        let seed_seq = mgr.commit(&mut seed).expect("seed commit");
+
+        let mut pinned_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("pinned reader begin");
+        assert_eq!(
+            pinned_reader.snapshot.high, seed_seq,
+            "reader must pin its snapshot before the later logical commit"
+        );
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                writer.token(),
+            )
+            .expect("logical insert should fit budget");
+        writer.write_set.push(pgno);
+        let logical_seq = mgr.commit(&mut writer).expect("logical commit");
+        assert!(logical_seq > pinned_reader.snapshot.high);
+
+        let old_page = mgr
+            .read_page_with_cell_deltas(&mut pinned_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("base page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&old_page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "pinned reader must not materialize a logical commit after its snapshot"
+        );
+        assert_eq!(
+            pinned_reader.read_version_for_page(pgno),
+            Some(seed_seq),
+            "post-snapshot logical commits must not advance the pinned read witness"
+        );
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(rowid, payload)]
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(logical_seq),
+            "fresh logical reads should witness the committed delta horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_uncommitted_delta_out_of_horizon()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4269;
+        let payload = vec![b'u'; 133];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        let seed_seq = mgr.commit(&mut seed).expect("seed commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                txn.token(),
+            )
+            .expect("logical insert should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("base page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(rowid, payload.clone())],
+            "transaction-local reads must materialize their own logical writes"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(seed_seq),
+            "own uncommitted synthetic deltas must not advance the committed read witness"
+        );
+
+        let logical_seq = mgr.commit(&mut txn).expect("logical commit");
+        assert!(logical_seq > seed_seq);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(rowid, payload)]
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(logical_seq),
+            "fresh reads should witness the committed logical delta after publish"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_update_out_of_horizon() -> fsqlite_error::Result<()>
+    {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4270;
+        let original_payload = vec![b'o'; 134];
+        let updated_payload = vec![b'v'; 135];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &original_payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        let insert_seq = mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_update(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &updated_payload),
+                txn.token(),
+            )
+            .expect("logical update should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("inserted page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(rowid, updated_payload.clone())],
+            "transaction-local reads must materialize their own logical updates"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(insert_seq),
+            "own uncommitted updates must preserve the last committed read witness"
+        );
+
+        let update_seq = mgr.commit(&mut txn).expect("update commit");
+        assert!(update_seq > insert_seq);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(rowid, updated_payload)]
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(update_seq),
+            "fresh reads should witness the committed update horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_delete_out_of_horizon() -> fsqlite_error::Result<()>
+    {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4271;
+        let payload = vec![b'd'; 136];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        let insert_seq = mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_delete(cell_key, pgno, txn.token())
+            .expect("logical delete should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("inserted page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "transaction-local reads must materialize their own logical deletes"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(insert_seq),
+            "own uncommitted deletes must preserve the last committed read witness"
+        );
+
+        let delete_seq = mgr.commit(&mut txn).expect("delete commit");
+        assert!(delete_seq > insert_seq);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            Vec::<(i64, Vec<u8>)>::new()
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(delete_seq),
+            "fresh reads should witness the committed delete horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_mixed_batch_out_of_horizon()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4281;
+        let row_b = 4282;
+        let row_c = 4283;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_original = vec![b'm'; 149];
+        let b_original = vec![b'n'; 150];
+        let a_updated = vec![b'o'; 151];
+        let c_inserted = vec![b'p'; 152];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_b,
+                pgno,
+                leaf_table_cell(row_b, &b_original),
+                bootstrap.token(),
+            )
+            .expect("row b insert should fit budget");
+        let committed_seq = mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_updated), txn.token())
+            .expect("row a update should fit budget");
+        mgr.cell_log()
+            .record_delete(key_b, pgno, txn.token())
+            .expect("row b delete should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_c,
+                pgno,
+                leaf_table_cell(row_c, &c_inserted),
+                txn.token(),
+            )
+            .expect("row c insert should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(row_a, a_updated.clone()), (row_c, c_inserted.clone())],
+            "transaction-local reads must materialize their own mixed logical batch"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "own uncommitted mixed batches must preserve the last committed read witness"
+        );
+
+        let batch_seq = mgr.commit(&mut txn).expect("mixed batch commit");
+        assert!(batch_seq > committed_seq);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_a, a_updated), (row_c, c_inserted)]
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(batch_seq),
+            "fresh reads should witness the committed mixed-batch horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_writes_pinned_after_other_batch()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4284;
+        let row_b = 4285;
+        let row_c = 4286;
+        let row_d = 4287;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let key_d = CellKey::table_row(btree, row_d);
+        let a_original = vec![b'q'; 153];
+        let b_original = vec![b'r'; 154];
+        let a_other = vec![b's'; 155];
+        let c_other = vec![b't'; 156];
+        let a_own = vec![b'u'; 157];
+        let d_own = vec![b'v'; 158];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_b,
+                pgno,
+                leaf_table_cell(row_b, &b_original),
+                bootstrap.token(),
+            )
+            .expect("row b insert should fit budget");
+        let committed_seq = mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        assert_eq!(
+            txn.snapshot.high, committed_seq,
+            "transaction must pin the pre-batch snapshot before later commits"
+        );
+
+        let mut other = mgr.begin(BeginKind::Concurrent).expect("other begin");
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_other), other.token())
+            .expect("other row a update should fit budget");
+        mgr.cell_log()
+            .record_delete(key_b, pgno, other.token())
+            .expect("other row b delete should fit budget");
+        mgr.cell_log()
+            .record_insert(key_c, pgno, leaf_table_cell(row_c, &c_other), other.token())
+            .expect("other row c insert should fit budget");
+        let other_seq = mgr.commit(&mut other).expect("other batch commit");
+        assert!(other_seq > committed_seq);
+
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_own), txn.token())
+            .expect("own row a update should fit budget");
+        mgr.cell_log()
+            .record_insert(key_d, pgno, leaf_table_cell(row_d, &d_own), txn.token())
+            .expect("own row d insert should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![
+                (row_a, a_own.clone()),
+                (row_b, b_original.clone()),
+                (row_d, d_own.clone())
+            ],
+            "transaction-local reads must replay own writes without admitting post-snapshot commits"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "own writes and hidden post-snapshot commits must leave the witness at the pinned horizon"
+        );
+
+        mgr.abort(&mut txn);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_a, a_other), (row_c, c_other)],
+            "fresh readers must see the later committed batch after the pinned transaction aborts"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(other_seq),
+            "fresh readers should witness the later committed batch horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_tombstone_pinned_after_other_update()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4288;
+        let row_b = 4289;
+        let row_c = 4290;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_original = vec![b'w'; 159];
+        let a_other = vec![b'x'; 160];
+        let b_other = vec![b'y'; 161];
+        let c_own = vec![b'z'; 162];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        let committed_seq = mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        assert_eq!(
+            txn.snapshot.high, committed_seq,
+            "transaction must pin the row before the later update commits"
+        );
+
+        let mut other = mgr.begin(BeginKind::Concurrent).expect("other begin");
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_other), other.token())
+            .expect("other row a update should fit budget");
+        mgr.cell_log()
+            .record_insert(key_b, pgno, leaf_table_cell(row_b, &b_other), other.token())
+            .expect("other row b insert should fit budget");
+        let other_seq = mgr.commit(&mut other).expect("other batch commit");
+        assert!(other_seq > committed_seq);
+
+        mgr.cell_log()
+            .record_delete(key_a, pgno, txn.token())
+            .expect("own row a delete should fit budget");
+        mgr.cell_log()
+            .record_insert(key_c, pgno, leaf_table_cell(row_c, &c_own), txn.token())
+            .expect("own row c insert should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(row_c, c_own.clone())],
+            "own tombstones must apply to the pinned row without admitting later commits"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "own tombstones and hidden post-snapshot commits must leave the witness at the pinned horizon"
+        );
+
+        mgr.abort(&mut txn);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_a, a_other), (row_b, b_other)],
+            "fresh readers must see the later committed update/insert after abort"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(other_seq),
+            "fresh readers should witness the later committed update horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_update_pinned_after_other_delete()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4291;
+        let row_b = 4292;
+        let row_c = 4293;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_original = vec![b'a'; 163];
+        let b_other = vec![b'c'; 165];
+        let a_own = vec![b'd'; 166];
+        let c_own = vec![b'e'; 167];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        let committed_seq = mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        assert_eq!(
+            txn.snapshot.high, committed_seq,
+            "transaction must pin the row before the later delete commits"
+        );
+
+        let mut other = mgr.begin(BeginKind::Concurrent).expect("other begin");
+        mgr.cell_log()
+            .record_delete(key_a, pgno, other.token())
+            .expect("other row a delete should fit budget");
+        mgr.cell_log()
+            .record_insert(key_b, pgno, leaf_table_cell(row_b, &b_other), other.token())
+            .expect("other row b insert should fit budget");
+        let other_seq = mgr.commit(&mut other).expect("other batch commit");
+        assert!(other_seq > committed_seq);
+
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_own), txn.token())
+            .expect("own row a update should fit budget");
+        mgr.cell_log()
+            .record_insert(key_c, pgno, leaf_table_cell(row_c, &c_own), txn.token())
+            .expect("own row c insert should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(row_a, a_own.clone()), (row_c, c_own.clone())],
+            "own updates must apply to the pinned row without admitting later deletes"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "own updates and hidden post-snapshot deletes must leave the witness at the pinned horizon"
+        );
+
+        mgr.abort(&mut txn);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_b, b_other)],
+            "fresh readers must see the later committed delete/insert after abort"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(other_seq),
+            "fresh readers should witness the later committed delete horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_insert_pinned_after_other_insert()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4294;
+        let row_b = 4295;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let a_other = vec![b'f'; 168];
+        let a_own = vec![b'g'; 169];
+        let b_own = vec![b'h'; 170];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        let committed_seq = mgr.commit(&mut seed).expect("seed commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        assert_eq!(
+            txn.snapshot.high, committed_seq,
+            "transaction must pin the empty page before the later insert commits"
+        );
+
+        let mut other = mgr.begin(BeginKind::Concurrent).expect("other begin");
+        mgr.cell_log()
+            .record_insert(key_a, pgno, leaf_table_cell(row_a, &a_other), other.token())
+            .expect("other row a insert should fit budget");
+        let other_seq = mgr.commit(&mut other).expect("other insert commit");
+        assert!(other_seq > committed_seq);
+
+        mgr.cell_log()
+            .record_insert(key_a, pgno, leaf_table_cell(row_a, &a_own), txn.token())
+            .expect("own row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(key_b, pgno, leaf_table_cell(row_b, &b_own), txn.token())
+            .expect("own row b insert should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("seed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(row_a, a_own.clone()), (row_b, b_own.clone())],
+            "own inserts must replay against the pinned snapshot without admitting later same-key commits"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "own inserts and hidden post-snapshot inserts must leave the witness at the pinned horizon"
+        );
+
+        mgr.abort(&mut txn);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_a, a_other)],
+            "fresh readers must see the later committed same-key insert after abort"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(other_seq),
+            "fresh readers should witness the later committed insert horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_update_pinned_after_other_update()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4296;
+        let row_b = 4297;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let a_original = vec![b'i'; 171];
+        let a_other = vec![b'j'; 172];
+        let b_other = vec![b'k'; 173];
+        let a_own = vec![b'l'; 174];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        let committed_seq = mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        assert_eq!(
+            txn.snapshot.high, committed_seq,
+            "transaction must pin the original row before the later update commits"
+        );
+
+        let mut other = mgr.begin(BeginKind::Concurrent).expect("other begin");
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_other), other.token())
+            .expect("other row a update should fit budget");
+        mgr.cell_log()
+            .record_insert(key_b, pgno, leaf_table_cell(row_b, &b_other), other.token())
+            .expect("other row b insert should fit budget");
+        let other_seq = mgr.commit(&mut other).expect("other batch commit");
+        assert!(other_seq > committed_seq);
+
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_own), txn.token())
+            .expect("own row a update should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(row_a, a_own.clone())],
+            "own updates must replay against the pinned row without admitting later updates"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "own updates and hidden post-snapshot updates must leave the witness at the pinned horizon"
+        );
+
+        mgr.abort(&mut txn);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_a, a_other), (row_b, b_other)],
+            "fresh readers must see the later committed update/insert after abort"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(other_seq),
+            "fresh readers should witness the later committed update horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_delete_pinned_after_other_delete()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4298;
+        let row_b = 4299;
+        let row_c = 4300;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_original = vec![b'm'; 175];
+        let b_other = vec![b'n'; 176];
+        let c_own = vec![b'o'; 177];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        let committed_seq = mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        assert_eq!(
+            txn.snapshot.high, committed_seq,
+            "transaction must pin the original row before the later delete commits"
+        );
+
+        let mut other = mgr.begin(BeginKind::Concurrent).expect("other begin");
+        mgr.cell_log()
+            .record_delete(key_a, pgno, other.token())
+            .expect("other row a delete should fit budget");
+        mgr.cell_log()
+            .record_insert(key_b, pgno, leaf_table_cell(row_b, &b_other), other.token())
+            .expect("other row b insert should fit budget");
+        let other_seq = mgr.commit(&mut other).expect("other batch commit");
+        assert!(other_seq > committed_seq);
+
+        mgr.cell_log()
+            .record_delete(key_a, pgno, txn.token())
+            .expect("own row a delete should fit budget");
+        mgr.cell_log()
+            .record_insert(key_c, pgno, leaf_table_cell(row_c, &c_own), txn.token())
+            .expect("own row c insert should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(row_c, c_own.clone())],
+            "own deletes must replay against the pinned row without admitting later deletes"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "own deletes and hidden post-snapshot deletes must leave the witness at the pinned horizon"
+        );
+
+        mgr.abort(&mut txn);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_b, b_other)],
+            "fresh readers must see the later committed delete/insert after abort"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(other_seq),
+            "fresh readers should witness the later committed delete horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_repeated_own_updates_pinned_after_other_update()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4301;
+        let row_b = 4302;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let a_original = vec![b'p'; 178];
+        let a_other = vec![b'q'; 179];
+        let b_other = vec![b'r'; 180];
+        let a_own_first = vec![b's'; 181];
+        let a_own_second = vec![b't'; 182];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        let committed_seq = mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        assert_eq!(
+            txn.snapshot.high, committed_seq,
+            "transaction must pin the original row before the later update commits"
+        );
+
+        let mut other = mgr.begin(BeginKind::Concurrent).expect("other begin");
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_other), other.token())
+            .expect("other row a update should fit budget");
+        mgr.cell_log()
+            .record_insert(key_b, pgno, leaf_table_cell(row_b, &b_other), other.token())
+            .expect("other row b insert should fit budget");
+        let other_seq = mgr.commit(&mut other).expect("other batch commit");
+        assert!(other_seq > committed_seq);
+
+        mgr.cell_log()
+            .record_update(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_own_first),
+                txn.token(),
+            )
+            .expect("first own row a update should fit budget");
+        mgr.cell_log()
+            .record_update(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_own_second),
+                txn.token(),
+            )
+            .expect("second own row a update should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(row_a, a_own_second.clone())],
+            "repeated own updates must replay in order without admitting later commits"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "repeated own updates and hidden post-snapshot updates must leave the witness at the pinned horizon"
+        );
+
+        mgr.abort(&mut txn);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_a, a_other), (row_b, b_other)],
+            "fresh readers must see the later committed update/insert after abort"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(other_seq),
+            "fresh readers should witness the later committed update horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_update_delete_pinned_after_other_update()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4303;
+        let row_b = 4304;
+        let row_c = 4305;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_original = vec![b'u'; 183];
+        let a_other = vec![b'v'; 184];
+        let b_other = vec![b'w'; 185];
+        let a_own_update = vec![b'x'; 186];
+        let c_own = vec![b'y'; 187];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        let committed_seq = mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        assert_eq!(
+            txn.snapshot.high, committed_seq,
+            "transaction must pin the original row before the later update commits"
+        );
+
+        let mut other = mgr.begin(BeginKind::Concurrent).expect("other begin");
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_other), other.token())
+            .expect("other row a update should fit budget");
+        mgr.cell_log()
+            .record_insert(key_b, pgno, leaf_table_cell(row_b, &b_other), other.token())
+            .expect("other row b insert should fit budget");
+        let other_seq = mgr.commit(&mut other).expect("other batch commit");
+        assert!(other_seq > committed_seq);
+
+        mgr.cell_log()
+            .record_update(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_own_update),
+                txn.token(),
+            )
+            .expect("own row a update should fit budget");
+        mgr.cell_log()
+            .record_delete(key_a, pgno, txn.token())
+            .expect("own row a delete should fit budget");
+        mgr.cell_log()
+            .record_insert(key_c, pgno, leaf_table_cell(row_c, &c_own), txn.token())
+            .expect("own row c insert should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(row_c, c_own.clone())],
+            "own update/delete final state must replay without admitting later commits"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "own update/delete and hidden post-snapshot updates must leave the witness at the pinned horizon"
+        );
+
+        mgr.abort(&mut txn);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_a, a_other), (row_b, b_other)],
+            "fresh readers must see the later committed update/insert after abort"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(other_seq),
+            "fresh readers should witness the later committed update horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_delete_insert_pinned_after_other_update()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4306;
+        let row_b = 4307;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let a_original = vec![b'z'; 188];
+        let a_other = vec![b'0'; 189];
+        let b_other = vec![b'1'; 190];
+        let a_own_replacement = vec![b'2'; 191];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        let committed_seq = mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        assert_eq!(
+            txn.snapshot.high, committed_seq,
+            "transaction must pin the original row before the later update commits"
+        );
+
+        let mut other = mgr.begin(BeginKind::Concurrent).expect("other begin");
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_other), other.token())
+            .expect("other row a update should fit budget");
+        mgr.cell_log()
+            .record_insert(key_b, pgno, leaf_table_cell(row_b, &b_other), other.token())
+            .expect("other row b insert should fit budget");
+        let other_seq = mgr.commit(&mut other).expect("other batch commit");
+        assert!(other_seq > committed_seq);
+
+        mgr.cell_log()
+            .record_delete(key_a, pgno, txn.token())
+            .expect("own row a delete should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_own_replacement),
+                txn.token(),
+            )
+            .expect("own row a replacement should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(row_a, a_own_replacement.clone())],
+            "own delete/insert replacement must replay without admitting later commits"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "own delete/insert replacement and hidden post-snapshot updates must leave the witness at the pinned horizon"
+        );
+
+        mgr.abort(&mut txn);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_a, a_other), (row_b, b_other)],
+            "fresh readers must see the later committed update/insert after abort"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(other_seq),
+            "fresh readers should witness the later committed update horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_insert_delete_pinned_after_other_insert()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4308;
+        let row_b = 4309;
+        let row_c = 4310;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_other = vec![b'3'; 192];
+        let b_other = vec![b'4'; 193];
+        let a_own = vec![b'5'; 194];
+        let c_own = vec![b'6'; 195];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        let committed_seq = mgr.commit(&mut seed).expect("seed commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        assert_eq!(
+            txn.snapshot.high, committed_seq,
+            "transaction must pin the empty page before the later insert commits"
+        );
+
+        let mut other = mgr.begin(BeginKind::Concurrent).expect("other begin");
+        mgr.cell_log()
+            .record_insert(key_a, pgno, leaf_table_cell(row_a, &a_other), other.token())
+            .expect("other row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(key_b, pgno, leaf_table_cell(row_b, &b_other), other.token())
+            .expect("other row b insert should fit budget");
+        let other_seq = mgr.commit(&mut other).expect("other batch commit");
+        assert!(other_seq > committed_seq);
+
+        mgr.cell_log()
+            .record_insert(key_a, pgno, leaf_table_cell(row_a, &a_own), txn.token())
+            .expect("own row a insert should fit budget");
+        mgr.cell_log()
+            .record_delete(key_a, pgno, txn.token())
+            .expect("own row a delete should fit budget");
+        mgr.cell_log()
+            .record_insert(key_c, pgno, leaf_table_cell(row_c, &c_own), txn.token())
+            .expect("own row c insert should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(row_c, c_own.clone())],
+            "own insert/delete final state must not reveal a hidden post-snapshot insert of the same key"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "own insert/delete and hidden post-snapshot inserts must leave the witness at the pinned horizon"
+        );
+
+        mgr.abort(&mut txn);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_a, a_other), (row_b, b_other)],
+            "fresh readers must see the later committed insert batch after abort"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(other_seq),
+            "fresh readers should witness the later committed insert horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_insert_update_pinned_after_other_insert()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4311;
+        let row_b = 4312;
+        let row_c = 4313;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_other = vec![b'7'; 196];
+        let b_other = vec![b'8'; 197];
+        let a_own_first = vec![b'9'; 198];
+        let a_own_second = vec![b'a'; 199];
+        let c_own = vec![b'b'; 200];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        let committed_seq = mgr.commit(&mut seed).expect("seed commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        assert_eq!(
+            txn.snapshot.high, committed_seq,
+            "transaction must pin the empty page before the later insert commits"
+        );
+
+        let mut other = mgr.begin(BeginKind::Concurrent).expect("other begin");
+        mgr.cell_log()
+            .record_insert(key_a, pgno, leaf_table_cell(row_a, &a_other), other.token())
+            .expect("other row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(key_b, pgno, leaf_table_cell(row_b, &b_other), other.token())
+            .expect("other row b insert should fit budget");
+        let other_seq = mgr.commit(&mut other).expect("other batch commit");
+        assert!(other_seq > committed_seq);
+
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_own_first),
+                txn.token(),
+            )
+            .expect("own row a insert should fit budget");
+        mgr.cell_log()
+            .record_update(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_own_second),
+                txn.token(),
+            )
+            .expect("own row a update should fit budget");
+        mgr.cell_log()
+            .record_insert(key_c, pgno, leaf_table_cell(row_c, &c_own), txn.token())
+            .expect("own row c insert should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(row_a, a_own_second.clone()), (row_c, c_own.clone())],
+            "own insert/update final state must not reveal a hidden post-snapshot insert of the same key"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "own insert/update and hidden post-snapshot inserts must leave the witness at the pinned horizon"
+        );
+
+        mgr.abort(&mut txn);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_a, a_other), (row_b, b_other)],
+            "fresh readers must see the later committed insert batch after abort"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(other_seq),
+            "fresh readers should witness the later committed insert horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_repeated_own_inserts_pinned_after_other_insert()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4314;
+        let row_b = 4315;
+        let row_c = 4316;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_other = vec![b'c'; 201];
+        let b_other = vec![b'd'; 202];
+        let a_own_first = vec![b'e'; 203];
+        let a_own_second = vec![b'f'; 204];
+        let c_own = vec![b'g'; 205];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        let committed_seq = mgr.commit(&mut seed).expect("seed commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        assert_eq!(
+            txn.snapshot.high, committed_seq,
+            "transaction must pin the empty page before the later insert commits"
+        );
+
+        let mut other = mgr.begin(BeginKind::Concurrent).expect("other begin");
+        mgr.cell_log()
+            .record_insert(key_a, pgno, leaf_table_cell(row_a, &a_other), other.token())
+            .expect("other row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(key_b, pgno, leaf_table_cell(row_b, &b_other), other.token())
+            .expect("other row b insert should fit budget");
+        let other_seq = mgr.commit(&mut other).expect("other batch commit");
+        assert!(other_seq > committed_seq);
+
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_own_first),
+                txn.token(),
+            )
+            .expect("first own row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_own_second),
+                txn.token(),
+            )
+            .expect("second own row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(key_c, pgno, leaf_table_cell(row_c, &c_own), txn.token())
+            .expect("own row c insert should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(row_a, a_own_second.clone()), (row_c, c_own.clone())],
+            "repeated own inserts must replay in order without admitting hidden post-snapshot inserts"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "repeated own inserts and hidden post-snapshot inserts must leave the witness at the pinned horizon"
+        );
+
+        mgr.abort(&mut txn);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_a, a_other), (row_b, b_other)],
+            "fresh readers must see the later committed insert batch after abort"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(other_seq),
+            "fresh readers should witness the later committed insert horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_other_uncommitted_writes_out_of_horizon()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4272;
+        let row_b = 4273;
+        let row_c = 4274;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_original = vec![b'a'; 137];
+        let b_original = vec![b'b'; 138];
+        let a_uncommitted = vec![b'c'; 139];
+        let c_uncommitted = vec![b'd'; 140];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_b,
+                pgno,
+                leaf_table_cell(row_b, &b_original),
+                bootstrap.token(),
+            )
+            .expect("row b insert should fit budget");
+        let committed_seq = mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        mgr.cell_log()
+            .record_update(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_uncommitted),
+                writer.token(),
+            )
+            .expect("row a update should fit budget");
+        mgr.cell_log()
+            .record_delete(key_b, pgno, writer.token())
+            .expect("row b delete should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_c,
+                pgno,
+                leaf_table_cell(row_c, &c_uncommitted),
+                writer.token(),
+            )
+            .expect("row c insert should fit budget");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let reader_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&reader_page)?,
+            vec![(row_a, a_original.clone()), (row_b, b_original.clone())],
+            "other transactions must not observe uncommitted logical insert/update/delete batches"
+        );
+        assert_eq!(
+            reader.read_version_for_page(pgno),
+            Some(committed_seq),
+            "other uncommitted logical writes must not advance the committed read witness"
+        );
+
+        let writer_page = mgr
+            .read_page_with_cell_deltas(&mut writer, pgno, PageSize::DEFAULT.get())?
+            .expect("writer page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&writer_page)?,
+            vec![(row_a, a_uncommitted), (row_c, c_uncommitted)],
+            "the writer still sees its own uncommitted logical batch"
+        );
+
+        mgr.abort(&mut writer);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_aborted_writes_out_of_horizon()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4275;
+        let row_b = 4276;
+        let row_c = 4277;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_original = vec![b'e'; 141];
+        let b_original = vec![b'f'; 142];
+        let a_aborted = vec![b'g'; 143];
+        let c_aborted = vec![b'h'; 144];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_b,
+                pgno,
+                leaf_table_cell(row_b, &b_original),
+                bootstrap.token(),
+            )
+            .expect("row b insert should fit budget");
+        let committed_seq = mgr.commit(&mut bootstrap).expect("bootstrap commit");
+        let expected_committed = vec![(row_a, a_original), (row_b, b_original)];
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        mgr.cell_log()
+            .record_update(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_aborted),
+                writer.token(),
+            )
+            .expect("row a update should fit budget");
+        mgr.cell_log()
+            .record_delete(key_b, pgno, writer.token())
+            .expect("row b delete should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_c,
+                pgno,
+                leaf_table_cell(row_c, &c_aborted),
+                writer.token(),
+            )
+            .expect("row c insert should fit budget");
+
+        let writer_page = mgr
+            .read_page_with_cell_deltas(&mut writer, pgno, PageSize::DEFAULT.get())?
+            .expect("writer page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&writer_page)?,
+            vec![(row_a, a_aborted), (row_c, c_aborted)],
+            "writer must see its own uncommitted logical batch before abort"
+        );
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let reader_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&reader_page)?,
+            expected_committed.clone(),
+            "reader must ignore another transaction's uncommitted logical batch before abort"
+        );
+        assert_eq!(
+            reader.read_version_for_page(pgno),
+            Some(committed_seq),
+            "uncommitted logical writes must not advance the reader's committed witness"
+        );
+
+        mgr.abort(&mut writer);
+
+        let reader_after_abort = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should remain visible after abort");
+        assert_eq!(
+            materialized_table_payloads(&reader_after_abort)?,
+            expected_committed.clone(),
+            "aborted logical writes must not change an existing reader's view"
+        );
+        assert_eq!(
+            reader.read_version_for_page(pgno),
+            Some(committed_seq),
+            "aborted logical writes must leave the reader's witness at the committed horizon"
+        );
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should stay visible after abort");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            expected_committed,
+            "fresh readers must not replay aborted logical writes"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(committed_seq),
+            "fresh readers should witness only the last committed logical horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_keeps_post_snapshot_batch_out_of_pinned_horizon()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4278;
+        let row_b = 4279;
+        let row_c = 4280;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_original = vec![b'i'; 145];
+        let b_original = vec![b'j'; 146];
+        let a_updated = vec![b'k'; 147];
+        let c_inserted = vec![b'l'; 148];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_b,
+                pgno,
+                leaf_table_cell(row_b, &b_original),
+                bootstrap.token(),
+            )
+            .expect("row b insert should fit budget");
+        let committed_seq = mgr.commit(&mut bootstrap).expect("bootstrap commit");
+        let expected_pinned = vec![(row_a, a_original), (row_b, b_original)];
+
+        let mut pinned_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("pinned reader begin");
+        assert_eq!(
+            pinned_reader.snapshot.high, committed_seq,
+            "reader must pin the pre-batch snapshot"
+        );
+        let pinned_before = mgr
+            .read_page_with_cell_deltas(&mut pinned_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should be visible before batch");
+        assert_eq!(
+            materialized_table_payloads(&pinned_before)?,
+            expected_pinned.clone()
+        );
+        assert_eq!(
+            pinned_reader.read_version_for_page(pgno),
+            Some(committed_seq),
+            "pinned reader should witness the pre-batch committed horizon"
+        );
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        mgr.cell_log()
+            .record_update(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_updated),
+                writer.token(),
+            )
+            .expect("row a update should fit budget");
+        mgr.cell_log()
+            .record_delete(key_b, pgno, writer.token())
+            .expect("row b delete should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_c,
+                pgno,
+                leaf_table_cell(row_c, &c_inserted),
+                writer.token(),
+            )
+            .expect("row c insert should fit budget");
+        let batch_seq = mgr.commit(&mut writer).expect("batch commit");
+        assert!(batch_seq > committed_seq);
+
+        let pinned_after = mgr
+            .read_page_with_cell_deltas(&mut pinned_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("pinned page should stay visible after batch");
+        assert_eq!(
+            materialized_table_payloads(&pinned_after)?,
+            expected_pinned,
+            "pinned reader must hide the logical batch committed after its snapshot"
+        );
+        assert_eq!(
+            pinned_reader.read_version_for_page(pgno),
+            Some(committed_seq),
+            "post-snapshot logical batches must not advance the pinned read witness"
+        );
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible after batch");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_a, a_updated), (row_c, c_inserted)],
+            "fresh readers must see the committed logical batch"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(batch_seq),
+            "fresh readers should witness the batch commit horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_hides_post_snapshot_commit() -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4245;
+        let payload = vec![b's'; 128];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut old_reader = mgr.begin(BeginKind::Concurrent).expect("old reader begin");
+        let old_page_before = mgr
+            .read_page_with_cell_deltas(&mut old_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("seed page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&old_page_before)?,
+            Vec::<(i64, Vec<u8>)>::new()
+        );
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                writer.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.commit(&mut writer).expect("logical commit");
+
+        let old_page_after = mgr
+            .read_page_with_cell_deltas(&mut old_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("old snapshot should still see the base page");
+        assert_eq!(
+            materialized_table_payloads(&old_page_after)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "reader snapshot must hide logical commits published after it began"
+        );
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh snapshot should see the base page");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(rowid, payload)],
+            "fresh snapshot must see the committed logical row"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_hides_post_snapshot_delete() -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4246;
+        let payload = vec![b'x'; 128];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut old_reader = mgr.begin(BeginKind::Concurrent).expect("old reader begin");
+        let old_page_before = mgr
+            .read_page_with_cell_deltas(&mut old_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("inserted row should be visible");
+        assert_eq!(
+            materialized_table_payloads(&old_page_before)?,
+            vec![(rowid, payload.clone())]
+        );
+
+        let mut deleter = mgr.begin(BeginKind::Concurrent).expect("deleter begin");
+        mgr.cell_log()
+            .record_delete(cell_key, pgno, deleter.token())
+            .expect("logical delete should fit budget");
+        mgr.commit(&mut deleter).expect("delete commit");
+
+        let old_page_after = mgr
+            .read_page_with_cell_deltas(&mut old_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("old snapshot should still see the base page");
+        assert_eq!(
+            materialized_table_payloads(&old_page_after)?,
+            vec![(rowid, payload)],
+            "reader snapshot must hide logical deletes published after it began"
+        );
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh snapshot should see the base page");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "fresh snapshot must see the committed logical delete"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_hides_post_snapshot_update() -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4249;
+        let original_payload = vec![b'a'; 126];
+        let updated_payload = vec![b'z'; 134];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &original_payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut old_reader = mgr.begin(BeginKind::Concurrent).expect("old reader begin");
+        let old_page_before = mgr
+            .read_page_with_cell_deltas(&mut old_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("inserted row should be visible");
+        assert_eq!(
+            materialized_table_payloads(&old_page_before)?,
+            vec![(rowid, original_payload.clone())]
+        );
+
+        let mut updater = mgr.begin(BeginKind::Concurrent).expect("updater begin");
+        mgr.cell_log()
+            .record_update(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &updated_payload),
+                updater.token(),
+            )
+            .expect("logical update should fit budget");
+        mgr.commit(&mut updater).expect("update commit");
+
+        let old_page_after = mgr
+            .read_page_with_cell_deltas(&mut old_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("old snapshot should still see the base page");
+        assert_eq!(
+            materialized_table_payloads(&old_page_after)?,
+            vec![(rowid, original_payload)],
+            "reader snapshot must hide logical updates published after it began"
+        );
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh snapshot should see the base page");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(rowid, updated_payload)],
+            "fresh snapshot must see the committed logical update"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_materializes_own_uncommitted_delta()
     -> fsqlite_error::Result<()> {
         use crate::cell_visibility::CellKey;
@@ -7258,6 +10399,1053 @@ mod tests {
             vec![(rowid, payload)],
             "transaction-local read view must replay this txn's own uncommitted delta"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_replays_same_txn_insert_then_update()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4251;
+        let inserted_payload = vec![b'i'; 136];
+        let updated_payload = vec![b'v'; 137];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &inserted_payload),
+                txn.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.cell_log()
+            .record_update(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &updated_payload),
+                txn.token(),
+            )
+            .expect("logical update should fit budget");
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&page)?,
+            vec![(rowid, updated_payload.clone())],
+            "transaction-local reads must replay same-cell deltas in record order"
+        );
+
+        mgr.commit(&mut txn).expect("combined logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let committed_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page)?,
+            vec![(rowid, updated_payload)],
+            "committed reads must preserve the insert-then-update ordering"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_replays_same_txn_insert_then_delete()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4252;
+        let payload = vec![b't'; 138];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                txn.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.cell_log()
+            .record_delete(cell_key, pgno, txn.token())
+            .expect("logical delete should fit budget");
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "transaction-local reads must replay insert-then-delete as absent"
+        );
+
+        mgr.commit(&mut txn).expect("combined logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let committed_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "committed reads must preserve the insert-then-delete ordering"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_replays_same_txn_update_then_delete()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4253;
+        let original_payload = vec![b'o'; 139];
+        let updated_payload = vec![b'w'; 140];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &original_payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_update(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &updated_payload),
+                txn.token(),
+            )
+            .expect("logical update should fit budget");
+        mgr.cell_log()
+            .record_delete(cell_key, pgno, txn.token())
+            .expect("logical delete should fit budget");
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "transaction-local reads must replay update-then-delete as absent"
+        );
+
+        mgr.commit(&mut txn).expect("combined logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let committed_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "committed reads must preserve the update-then-delete ordering"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_replays_same_txn_update_then_insert()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4256;
+        let original_payload = vec![b'a'; 145];
+        let updated_payload = vec![b'b'; 146];
+        let replacement_payload = vec![b'c'; 147];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &original_payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_update(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &updated_payload),
+                txn.token(),
+            )
+            .expect("logical update should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &replacement_payload),
+                txn.token(),
+            )
+            .expect("logical replacement insert should fit budget");
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&page)?,
+            vec![(rowid, replacement_payload.clone())],
+            "transaction-local reads must replay update-then-insert as replacement"
+        );
+
+        mgr.commit(&mut txn).expect("combined logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let committed_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page)?,
+            vec![(rowid, replacement_payload)],
+            "committed reads must preserve the update-then-insert ordering"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_replays_same_txn_repeated_update()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4257;
+        let original_payload = vec![b'd'; 148];
+        let first_payload = vec![b'e'; 149];
+        let final_payload = vec![b'f'; 150];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &original_payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_update(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &first_payload),
+                txn.token(),
+            )
+            .expect("first logical update should fit budget");
+        mgr.cell_log()
+            .record_update(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &final_payload),
+                txn.token(),
+            )
+            .expect("second logical update should fit budget");
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&page)?,
+            vec![(rowid, final_payload.clone())],
+            "transaction-local reads must replay repeated updates in record order"
+        );
+
+        mgr.commit(&mut txn).expect("combined logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let committed_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page)?,
+            vec![(rowid, final_payload)],
+            "committed reads must preserve the final repeated update"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_replays_same_txn_repeated_insert()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4258;
+        let first_payload = vec![b'g'; 151];
+        let final_payload = vec![b'h'; 152];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &first_payload),
+                txn.token(),
+            )
+            .expect("first logical insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &final_payload),
+                txn.token(),
+            )
+            .expect("second logical insert should fit budget");
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&page)?,
+            vec![(rowid, final_payload.clone())],
+            "transaction-local reads must replay repeated inserts in record order"
+        );
+
+        mgr.commit(&mut txn).expect("combined logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let committed_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page)?,
+            vec![(rowid, final_payload)],
+            "committed reads must preserve the final repeated insert"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_replays_same_txn_repeated_delete()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4259;
+        let payload = vec![b'j'; 153];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_delete(cell_key, pgno, txn.token())
+            .expect("first logical delete should fit budget");
+        mgr.cell_log()
+            .record_delete(cell_key, pgno, txn.token())
+            .expect("second logical delete should fit budget");
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "transaction-local reads must replay repeated deletes as absent"
+        );
+
+        mgr.commit(&mut txn).expect("combined logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let committed_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "committed reads must preserve repeated delete idempotence"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_replays_same_txn_interleaved_rows()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4260;
+        let row_b = 4261;
+        let row_c = 4262;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_original = vec![b'a'; 154];
+        let b_original = vec![b'b'; 155];
+        let a_first = vec![b'c'; 156];
+        let a_final = vec![b'd'; 157];
+        let b_reinserted = vec![b'e'; 158];
+        let c_inserted = vec![b'f'; 159];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_b,
+                pgno,
+                leaf_table_cell(row_b, &b_original),
+                bootstrap.token(),
+            )
+            .expect("row b insert should fit budget");
+        mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_first), txn.token())
+            .expect("row a first update should fit budget");
+        mgr.cell_log()
+            .record_delete(key_b, pgno, txn.token())
+            .expect("row b delete should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_c,
+                pgno,
+                leaf_table_cell(row_c, &c_inserted),
+                txn.token(),
+            )
+            .expect("row c insert should fit budget");
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_final), txn.token())
+            .expect("row a final update should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_b,
+                pgno,
+                leaf_table_cell(row_b, &b_reinserted),
+                txn.token(),
+            )
+            .expect("row b reinsert should fit budget");
+        mgr.cell_log()
+            .record_delete(key_c, pgno, txn.token())
+            .expect("row c delete should fit budget");
+
+        let expected = vec![(row_a, a_final.clone()), (row_b, b_reinserted.clone())];
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&page)?,
+            expected,
+            "transaction-local reads must replay interleaved per-row deltas independently"
+        );
+
+        mgr.commit(&mut txn).expect("combined logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let committed_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page)?,
+            vec![(row_a, a_final), (row_b, b_reinserted)],
+            "committed reads must preserve interleaved per-row ordering"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_replays_same_txn_multi_page_isolation()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let page_a = PageNumber::new(2).expect("valid page");
+        let page_b = PageNumber::new(3).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4263;
+        let row_b = 4264;
+        let row_c = 4265;
+        let row_d = 4266;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let key_d = CellKey::table_row(btree, row_d);
+        let a_original = vec![b'g'; 160];
+        let b_original = vec![b'h'; 161];
+        let a_updated = vec![b'i'; 162];
+        let c_inserted = vec![b'k'; 163];
+        let d_inserted = vec![b'l'; 164];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, page_a, empty_leaf_table_page())
+            .expect("seed page a");
+        mgr.write_page(&mut seed, page_b, empty_leaf_table_page())
+            .expect("seed page b");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                page_a,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_b,
+                page_b,
+                leaf_table_cell(row_b, &b_original),
+                bootstrap.token(),
+            )
+            .expect("row b insert should fit budget");
+        mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_update(
+                key_a,
+                page_a,
+                leaf_table_cell(row_a, &a_updated),
+                txn.token(),
+            )
+            .expect("row a update should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_c,
+                page_a,
+                leaf_table_cell(row_c, &c_inserted),
+                txn.token(),
+            )
+            .expect("row c insert should fit budget");
+        mgr.cell_log()
+            .record_delete(key_b, page_b, txn.token())
+            .expect("row b delete should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_d,
+                page_b,
+                leaf_table_cell(row_d, &d_inserted),
+                txn.token(),
+            )
+            .expect("row d insert should fit budget");
+
+        let expected_a = vec![(row_a, a_updated.clone()), (row_c, c_inserted.clone())];
+        let expected_b = vec![(row_d, d_inserted.clone())];
+
+        let txn_page_a = mgr
+            .read_page_with_cell_deltas(&mut txn, page_a, PageSize::DEFAULT.get())?
+            .expect("page a should be visible");
+        assert_eq!(
+            materialized_table_payloads(&txn_page_a)?,
+            expected_a,
+            "transaction-local page-a read must ignore page-b deltas"
+        );
+
+        let txn_page_b = mgr
+            .read_page_with_cell_deltas(&mut txn, page_b, PageSize::DEFAULT.get())?
+            .expect("page b should be visible");
+        assert_eq!(
+            materialized_table_payloads(&txn_page_b)?,
+            expected_b,
+            "transaction-local page-b read must ignore page-a deltas"
+        );
+
+        mgr.commit(&mut txn).expect("combined logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let committed_page_a = mgr
+            .read_page_with_cell_deltas(&mut reader, page_a, PageSize::DEFAULT.get())?
+            .expect("committed page a should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page_a)?,
+            vec![(row_a, a_updated), (row_c, c_inserted)],
+            "committed page-a read must preserve page-local delta isolation"
+        );
+
+        let committed_page_b = mgr
+            .read_page_with_cell_deltas(&mut reader, page_b, PageSize::DEFAULT.get())?
+            .expect("committed page b should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page_b)?,
+            vec![(row_d, d_inserted)],
+            "committed page-b read must preserve page-local delta isolation"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_skips_replay_for_staged_full_page()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let committed_row = 4267;
+        let local_row = 4268;
+        let committed_key = CellKey::table_row(btree, committed_row);
+        let local_key = CellKey::table_row(btree, local_row);
+        let committed_payload = vec![b'm'; 165];
+        let local_payload = vec![b'n'; 166];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut logical = mgr.begin(BeginKind::Concurrent).expect("logical begin");
+        mgr.cell_log()
+            .record_insert(
+                committed_key,
+                pgno,
+                leaf_table_cell(committed_row, &committed_payload),
+                logical.token(),
+            )
+            .expect("committed logical insert should fit budget");
+        mgr.commit(&mut logical).expect("logical insert commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        let staged_page = test_data(0x9a);
+        mgr.write_page(&mut txn, pgno, staged_page.clone())
+            .expect("stage full-page write");
+        mgr.cell_log()
+            .record_insert(
+                local_key,
+                pgno,
+                leaf_table_cell(local_row, &local_payload),
+                txn.token(),
+            )
+            .expect("local logical insert should fit budget");
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("staged page should be visible");
+        assert_eq!(
+            page, staged_page,
+            "a staged full-page write-set image must bypass committed and local cell-delta replay"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_replays_same_txn_delete_then_insert()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4254;
+        let original_payload = vec![b'q'; 141];
+        let replacement_payload = vec![b'r'; 142];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &original_payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_delete(cell_key, pgno, txn.token())
+            .expect("logical delete should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &replacement_payload),
+                txn.token(),
+            )
+            .expect("logical reinsert should fit budget");
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&page)?,
+            vec![(rowid, replacement_payload.clone())],
+            "transaction-local reads must replay delete-then-insert as replacement"
+        );
+
+        mgr.commit(&mut txn).expect("combined logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let committed_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page)?,
+            vec![(rowid, replacement_payload)],
+            "committed reads must preserve the delete-then-insert ordering"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_replays_same_txn_delete_then_update()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4255;
+        let original_payload = vec![b'm'; 143];
+        let replacement_payload = vec![b'n'; 144];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &original_payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_delete(cell_key, pgno, txn.token())
+            .expect("logical delete should fit budget");
+        mgr.cell_log()
+            .record_update(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &replacement_payload),
+                txn.token(),
+            )
+            .expect("logical update should fit budget");
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&page)?,
+            vec![(rowid, replacement_payload.clone())],
+            "transaction-local reads must replay delete-then-update as replacement"
+        );
+
+        mgr.commit(&mut txn).expect("combined logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let committed_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page)?,
+            vec![(rowid, replacement_payload)],
+            "committed reads must preserve the delete-then-update ordering"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_hides_other_uncommitted_delta() -> fsqlite_error::Result<()>
+    {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4247;
+        let payload = vec![b'u'; 129];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                writer.token(),
+            )
+            .expect("logical insert should fit budget");
+
+        let writer_page = mgr
+            .read_page_with_cell_deltas(&mut writer, pgno, PageSize::DEFAULT.get())?
+            .expect("writer should see the base page");
+        assert_eq!(
+            materialized_table_payloads(&writer_page)?,
+            vec![(rowid, payload)],
+            "writer must see its own uncommitted logical insert"
+        );
+
+        let mut other_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("other reader begin");
+        let other_page = mgr
+            .read_page_with_cell_deltas(&mut other_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("other reader should see the base page");
+        assert_eq!(
+            materialized_table_payloads(&other_page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "other transactions must not see uncommitted logical inserts"
+        );
+
+        mgr.abort(&mut writer);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_hides_other_uncommitted_update() -> fsqlite_error::Result<()>
+    {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4248;
+        let original_payload = vec![b'o'; 127];
+        let updated_payload = vec![b'n'; 133];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &original_payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        mgr.cell_log()
+            .record_update(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &updated_payload),
+                writer.token(),
+            )
+            .expect("logical update should fit budget");
+
+        let writer_page = mgr
+            .read_page_with_cell_deltas(&mut writer, pgno, PageSize::DEFAULT.get())?
+            .expect("writer should see the base page");
+        assert_eq!(
+            materialized_table_payloads(&writer_page)?,
+            vec![(rowid, updated_payload)],
+            "writer must see its own uncommitted logical update"
+        );
+
+        let mut other_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("other reader begin");
+        let other_page = mgr
+            .read_page_with_cell_deltas(&mut other_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("other reader should see the base page");
+        assert_eq!(
+            materialized_table_payloads(&other_page)?,
+            vec![(rowid, original_payload)],
+            "other transactions must not see uncommitted logical updates"
+        );
+
+        mgr.abort(&mut writer);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_hides_other_uncommitted_delete() -> fsqlite_error::Result<()>
+    {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4250;
+        let payload = vec![b'k'; 135];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut deleter = mgr.begin(BeginKind::Concurrent).expect("deleter begin");
+        mgr.cell_log()
+            .record_delete(cell_key, pgno, deleter.token())
+            .expect("logical delete should fit budget");
+
+        let deleter_page = mgr
+            .read_page_with_cell_deltas(&mut deleter, pgno, PageSize::DEFAULT.get())?
+            .expect("deleter should see the base page");
+        assert_eq!(
+            materialized_table_payloads(&deleter_page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "deleter must see its own uncommitted logical delete"
+        );
+
+        let mut other_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("other reader begin");
+        let other_page = mgr
+            .read_page_with_cell_deltas(&mut other_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("other reader should see the base page");
+        assert_eq!(
+            materialized_table_payloads(&other_page)?,
+            vec![(rowid, payload)],
+            "other transactions must not see uncommitted logical deletes"
+        );
+
+        mgr.abort(&mut deleter);
 
         Ok(())
     }

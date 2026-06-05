@@ -63,11 +63,12 @@
 //! size, combiner-thread-id) and at INFO on contention hot-spots (batch size
 //! above `LARGE_BATCH_LOG_THRESHOLD`).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::time::Duration;
 
 use fsqlite_types::{PageNumber, PageNumberBuildHasher, TxnId};
 use parking_lot::Mutex;
-use std::collections::HashMap;
 
 use crate::cache_aligned::CacheAligned;
 
@@ -87,12 +88,55 @@ pub const MAX_FC_SLOTS: usize = 64;
 /// combiner is absorbing.
 const LARGE_BATCH_LOG_THRESHOLD: u32 = 8;
 
-/// Maximum spin iterations before yielding while waiting for a result.
+/// Base spin budget before parking while waiting for a combiner result.
 ///
-/// 1024 `spin_loop` hints is ~1 µs on modern x86 — short enough to amortize
-/// context-switch cost but long enough to avoid burning CPU while the
-/// combiner drains a large batch.
-const SPIN_BEFORE_YIELD: u32 = 1024;
+/// The schedule mirrors the rest of the B4 bounded-handoff paths: stay on CPU
+/// briefly for the common sub-microsecond handoff, then park every fourth wait
+/// window so the combiner can wake the slot owner directly after publishing.
+const FC_HANDOFF_BASE_SPINS: u32 = 64;
+const FC_HANDOFF_MAX_SPINS: u32 = 2_048;
+const FC_HANDOFF_PARK_EVERY: u32 = 4;
+const FC_HANDOFF_MAX_PARK: Duration = Duration::from_micros(50);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FcHandoffWait {
+    attempt: u32,
+    spin_loops: u32,
+    park_timeout: Duration,
+}
+
+const fn fc_handoff_spin_loops(attempt: u32) -> u32 {
+    let growth = attempt.saturating_sub(1);
+    let shift = if growth > 5 { 5 } else { growth };
+    let spins = FC_HANDOFF_BASE_SPINS << shift;
+    if spins > FC_HANDOFF_MAX_SPINS {
+        FC_HANDOFF_MAX_SPINS
+    } else {
+        spins
+    }
+}
+
+const fn fc_handoff_should_park(attempt: u32) -> bool {
+    attempt >= FC_HANDOFF_PARK_EVERY && attempt % FC_HANDOFF_PARK_EVERY == 0
+}
+
+const fn fc_handoff_wait(attempt: u32) -> FcHandoffWait {
+    FcHandoffWait {
+        attempt,
+        spin_loops: fc_handoff_spin_loops(attempt),
+        park_timeout: if fc_handoff_should_park(attempt) {
+            FC_HANDOFF_MAX_PARK
+        } else {
+            Duration::ZERO
+        },
+    }
+}
+
+fn perform_fc_handoff_spin(wait: FcHandoffWait) {
+    for _ in 0..wait.spin_loops {
+        std::hint::spin_loop();
+    }
+}
 
 /// Sentinel slot owner = vacant.
 const OWNER_VACANT: u64 = 0;
@@ -162,6 +206,9 @@ struct FcSlot {
     state: AtomicU8,
     /// Request & outcome; guarded by the owner via `state` transitions.
     inner: Mutex<FcSlotInner>,
+    /// Optional parked publisher thread. The combiner takes and unparks this
+    /// after publishing `SLOT_READY`, giving slow handoffs a targeted wakeup.
+    parked_thread: Mutex<Option<std::thread::Thread>>,
 }
 
 impl FcSlot {
@@ -170,7 +217,44 @@ impl FcSlot {
             owner: AtomicU64::new(OWNER_VACANT),
             state: AtomicU8::new(SLOT_IDLE),
             inner: Mutex::new(FcSlotInner::new()),
+            parked_thread: Mutex::new(None),
         }
+    }
+}
+
+fn register_slot_waiter(slot: &FcSlot) {
+    *slot.parked_thread.lock() = Some(std::thread::current());
+}
+
+fn clear_slot_waiter(slot: &FcSlot) {
+    let _ = slot.parked_thread.lock().take();
+}
+
+fn unpark_slot_waiter(slot: &FcSlot) {
+    let waiter = slot.parked_thread.lock().take();
+    if let Some(waiter) = waiter {
+        waiter.unpark();
+    }
+}
+
+fn park_current_thread_for_slot(slot: &FcSlot, timeout: Duration) {
+    if timeout.is_zero() {
+        return;
+    }
+
+    register_slot_waiter(slot);
+    if slot.state.load(Ordering::Acquire) == SLOT_READY {
+        clear_slot_waiter(slot);
+        return;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::park_timeout(timeout);
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = timeout;
+        clear_slot_waiter(slot);
     }
 }
 
@@ -372,8 +456,9 @@ impl FcPageLockShard {
             drop(guard);
         }
 
-        // Spin-wait for our result, falling back to yields.
-        let mut spins: u32 = 0;
+        // Spin-wait briefly for our result, then park on this slot so the
+        // combiner can wake only the publisher it just serviced.
+        let mut wait_attempt: u32 = 0;
         loop {
             let st = slot.state.load(Ordering::Acquire);
             if st == SLOT_READY {
@@ -382,17 +467,16 @@ impl FcPageLockShard {
                     inner.request = None;
                     inner.outcome.take()
                 };
+                clear_slot_waiter(slot);
                 // Release the slot back to the pool.
                 slot.state.store(SLOT_IDLE, Ordering::Release);
                 slot.owner.store(OWNER_VACANT, Ordering::Release);
                 return outcome.expect("combiner set SLOT_READY without outcome");
             }
 
-            spins += 1;
-            if spins < SPIN_BEFORE_YIELD {
-                std::hint::spin_loop();
-                continue;
-            }
+            wait_attempt = wait_attempt.saturating_add(1);
+            let wait = fc_handoff_wait(wait_attempt);
+            perform_fc_handoff_spin(wait);
 
             // Re-attempt to become combiner (in case the prior combiner
             // exited before servicing us).
@@ -400,9 +484,8 @@ impl FcPageLockShard {
                 self.drain_locked();
                 drop(guard);
             } else {
-                std::thread::yield_now();
+                park_current_thread_for_slot(slot, wait.park_timeout);
             }
-            spins = 0;
         }
     }
 
@@ -414,6 +497,7 @@ impl FcPageLockShard {
         let tid = thread_id_hash();
         let start = (tid as usize) % MAX_FC_SLOTS;
 
+        let mut wait_attempt: u32 = 0;
         loop {
             for offset in 0..MAX_FC_SLOTS {
                 let idx = (start + offset) % MAX_FC_SLOTS;
@@ -426,9 +510,15 @@ impl FcPageLockShard {
                     return idx;
                 }
             }
-            // All slots busy — yield and retry. This is rare; it would
+            // All slots busy — bounded spin and then a tiny park. This is rare; it would
             // require > `MAX_FC_SLOTS` concurrent publishers all racing.
-            std::thread::yield_now();
+            wait_attempt = wait_attempt.saturating_add(1);
+            let wait = fc_handoff_wait(wait_attempt);
+            perform_fc_handoff_spin(wait);
+            #[cfg(not(target_arch = "wasm32"))]
+            if !wait.park_timeout.is_zero() {
+                std::thread::park_timeout(wait.park_timeout);
+            }
         }
     }
 
@@ -459,6 +549,7 @@ impl FcPageLockShard {
                         inner.outcome = Some(outcome);
                     }
                     slot.state.store(SLOT_READY, Ordering::Release);
+                    unpark_slot_waiter(slot);
                     batch += 1;
                 }
                 SLOT_CANCELLED => {
@@ -471,6 +562,7 @@ impl FcPageLockShard {
                         inner.request = None;
                         inner.outcome = None;
                     }
+                    unpark_slot_waiter(slot);
                     slot.state.store(SLOT_IDLE, Ordering::Release);
                     slot.owner.store(OWNER_VACANT, Ordering::Release);
                 }
@@ -573,6 +665,60 @@ mod tests {
 
     fn txn(n: u64) -> TxnId {
         TxnId::new(n).expect("non-zero txn id")
+    }
+
+    #[test]
+    fn handoff_spin_loops_grow_then_cap() {
+        assert_eq!(fc_handoff_spin_loops(1), FC_HANDOFF_BASE_SPINS);
+        assert_eq!(fc_handoff_spin_loops(2), FC_HANDOFF_BASE_SPINS * 2);
+        assert_eq!(fc_handoff_spin_loops(3), FC_HANDOFF_BASE_SPINS * 4);
+        assert_eq!(fc_handoff_spin_loops(6), FC_HANDOFF_MAX_SPINS);
+        assert_eq!(fc_handoff_spin_loops(32), FC_HANDOFF_MAX_SPINS);
+    }
+
+    #[test]
+    fn handoff_parks_only_on_bounded_cadence() {
+        for attempt in 1..FC_HANDOFF_PARK_EVERY {
+            assert!(
+                !fc_handoff_should_park(attempt),
+                "attempt {attempt} should stay on CPU"
+            );
+        }
+        assert!(fc_handoff_should_park(FC_HANDOFF_PARK_EVERY));
+        assert!(!fc_handoff_should_park(FC_HANDOFF_PARK_EVERY + 1));
+        assert!(fc_handoff_should_park(FC_HANDOFF_PARK_EVERY * 2));
+
+        let wait = fc_handoff_wait(FC_HANDOFF_PARK_EVERY);
+        assert_eq!(wait.spin_loops, FC_HANDOFF_BASE_SPINS << 3);
+        assert_eq!(wait.park_timeout, FC_HANDOFF_MAX_PARK);
+    }
+
+    #[test]
+    fn published_slot_unparks_registered_waiter() {
+        let slot = Arc::new(FcSlot::new());
+        slot.state.store(SLOT_PUBLISHED, Ordering::Release);
+
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+        let waiter_slot = Arc::clone(&slot);
+        let waiter = thread::spawn(move || {
+            register_slot_waiter(&waiter_slot);
+            registered_tx.send(()).unwrap();
+            std::thread::park_timeout(Duration::from_secs(1));
+            waiter_slot.state.load(Ordering::Acquire)
+        });
+
+        registered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter should register before publish");
+
+        slot.state.store(SLOT_READY, Ordering::Release);
+        unpark_slot_waiter(&slot);
+
+        assert_eq!(waiter.join().unwrap(), SLOT_READY);
+        assert!(
+            slot.parked_thread.lock().is_none(),
+            "unparking a ready slot must clear the parked waiter handle"
+        );
     }
 
     #[test]

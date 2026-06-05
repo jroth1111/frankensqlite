@@ -75,17 +75,51 @@ pub mod xor_delta;
 /// debate ad hoc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MvccMetadataPublicationClass {
-    /// Cross-process `(commit_seq, schema_epoch, ecs_epoch)` publication in
-    /// `shm.rs`.
-    SharedSnapshotTriple,
+    /// Per-page committed visibility sequence in `core_types.rs::CommitIndex`.
+    CommitIndex,
+    /// First-touch page ownership directory in `core_types.rs::InProcessPageLockTable`.
+    PageOwnershipDirectory,
+    /// Globally ordered commit-sequence allocator.
+    CommitSequenceCounter,
+    /// Durable commit-record history consumed by recovery and diagnostics.
+    CommitLog,
     /// Active SSI session set plus committed reader/writer lookup indexes in
     /// `begin_concurrent.rs`.
     ActiveTxnRegistry,
+    /// Committed SSI reader/writer conflict ledgers.
+    CommittedConflictLedger,
+    /// Cross-process `(commit_seq, schema_epoch, ecs_epoch)` publication in
+    /// `shm.rs`.
+    SharedSnapshotTriple,
+    /// Schema invalidation epoch when it is read outside the shared triple.
+    SchemaEpoch,
     /// Committed page-version chains and their reader guard discipline.
     CommittedVersionStore,
     /// GC horizon and reader-pin floor used to decide when retired metadata may
     /// be reclaimed.
     ReclamationHorizon,
+    /// SSI abort-policy and conflict evidence telemetry.
+    SsiDecisionTelemetry,
+    /// Proof-carrying witness reservation and committed-publication archive.
+    WitnessPublicationArchive,
+}
+
+impl MvccMetadataPublicationClass {
+    /// All MVCC-owned metadata classes that need an E3.2 primitive decision.
+    pub const ALL: [Self; 12] = [
+        Self::CommitIndex,
+        Self::PageOwnershipDirectory,
+        Self::CommitSequenceCounter,
+        Self::CommitLog,
+        Self::ActiveTxnRegistry,
+        Self::CommittedConflictLedger,
+        Self::SharedSnapshotTriple,
+        Self::SchemaEpoch,
+        Self::CommittedVersionStore,
+        Self::ReclamationHorizon,
+        Self::SsiDecisionTelemetry,
+        Self::WitnessPublicationArchive,
+    ];
 }
 
 /// Design-time publication contract for one MVCC metadata class.
@@ -99,6 +133,12 @@ pub struct MvccMetadataPublicationContract {
     pub current_primitive: &'static str,
     /// Primitive selected by the E3 design contract.
     pub selected_primitive: &'static str,
+    /// Why the selected primitive fits FrankenSQLite's MVCC model.
+    pub fit_rationale: &'static str,
+    /// Required candidate-family map for E3.2.
+    pub primitive_family_map: &'static str,
+    /// Explicitly rejected options so downstream beads do not reopen them.
+    pub rejected_options: &'static str,
     /// Read-side consistency and retry rule.
     pub retry_contract: &'static str,
     /// Reclamation / lifetime rule for superseded metadata.
@@ -106,12 +146,59 @@ pub struct MvccMetadataPublicationContract {
 }
 
 /// Concrete MVCC metadata-publication mapping for Track E3.
-pub const MVCC_METADATA_PUBLICATION_CONTRACTS: [MvccMetadataPublicationContract; 4] = [
+pub const MVCC_METADATA_PUBLICATION_CONTRACTS: [MvccMetadataPublicationContract; 12] = [
+    MvccMetadataPublicationContract {
+        class: MvccMetadataPublicationClass::CommitIndex,
+        touchpoint: "core_types.rs::CommitIndex",
+        current_primitive: "direct-indexed AtomicU64 hot array plus sharded cold-page fallback",
+        selected_primitive: "keep direct per-page atomics for hot pages; keep sharded fallback as the cold-page shape",
+        fit_rationale: "page visibility is a one-word monotone publish; readers can safely observe a stale-old value under their snapshot and do not need a cross-page image",
+        primitive_family_map: "RCU: compatible only for a future cold-page hash; seqlock: rejected for cross-page arrays; BRAVO: rejected because this is not a reader lock; Left-Right: compatible only for cold fallback, not hot array; RLU: rejected as whole-map copy indirection; sharded: selected for cold/large-page fallback",
+        rejected_options: "whole-array seqlock, BRAVO/RwLock, whole-map RLU copy, whole-map Left-Right on the hot array",
+        retry_contract: "readers issue an acquire load for one page and compare against their snapshot; no blocking retry path is permitted",
+        reclamation_contract: "none for hot entries; cold fallback entries are overwritten or retained by shard ownership",
+    },
+    MvccMetadataPublicationContract {
+        class: MvccMetadataPublicationClass::PageOwnershipDirectory,
+        touchpoint: "core_types.rs::InProcessPageLockTable",
+        current_primitive: "flat atomic CAS table plus sharded overflow maps and bounded waiter queues",
+        selected_primitive: "sharded exact-ownership CAS directory with bounded handoff waiters",
+        fit_rationale: "first-touch ownership is linearizable state, not an eventually consistent metadata view; a writer must know whether it owns the page now",
+        primitive_family_map: "RCU: rejected because stale ownership loses updates; seqlock: rejected because readers cannot retry a lock claim as a snapshot read; BRAVO: rejected because lock claims are write-heavy; Left-Right: rejected because duplicate ownership maps can disagree; RLU: rejected because transactional object copies are too heavy for CAS claims; sharded: selected around the exact atomic directory",
+        rejected_options: "RCU ownership maps, seqlock directories, BRAVO/RwLock wrapping, Left-Right duplicated ownership, RLU copied lock objects",
+        retry_contract: "claim retries are bounded CAS/park attempts, not optimistic snapshot retries",
+        reclamation_contract: "lock slots are cleared in place; waiter records are scoped to bounded handoff queues",
+    },
+    MvccMetadataPublicationContract {
+        class: MvccMetadataPublicationClass::CommitSequenceCounter,
+        touchpoint: "invariants.rs::TxnManager plus commit_combiner.rs::CommitSequenceCombiner",
+        current_primitive: "AtomicU64 commit clock routed through flat combining",
+        selected_primitive: "flat-combined atomic fetch_add with optional future reservation blocks",
+        fit_rationale: "commit order is one irreducible global scalar; the optimization axis is reducing cache-line traffic, not changing snapshot semantics",
+        primitive_family_map: "RCU: rejected because readers do not bind objects; seqlock: rejected because the value is allocated, not sampled as a snapshot; BRAVO: rejected because there is no read lock; Left-Right: rejected because duplicated counters break total order; RLU: rejected because object transactions are irrelevant; sharded: compatible only as preallocated ranges with global reconciliation",
+        rejected_options: "seqlock counter reads, Left-Right duplicate counters, BRAVO locks, RLU counter objects, unconstrained per-shard commit order",
+        retry_contract: "writers either receive a unique sequence from the combiner or fall back to the atomic allocator; readers consume published commit indexes instead",
+        reclamation_contract: "none; the counter is a monotone scalar",
+    },
+    MvccMetadataPublicationContract {
+        class: MvccMetadataPublicationClass::CommitLog,
+        touchpoint: "core_types.rs::CommitLog",
+        current_primitive: "append-only commit records under current transaction-manager ownership",
+        selected_primitive: "append-only immutable segments with atomic tail publication when the log leaves the manager lock",
+        fit_rationale: "readers consume prefix-stable history and writers never need to mutate already published commit records",
+        primitive_family_map: "RCU: compatible for immutable segment tail swaps; seqlock: rejected for large variable records; BRAVO: rejected because the log is append-mostly, not lock-read-mostly; Left-Right: rejected for whole-log duplication; RLU: rejected for whole-log copy transactions; sharded: compatible by database or epoch segment",
+        rejected_options: "whole-log seqlock, whole-log Left-Right, BRAVO/RwLock around append history, RLU whole-log copies",
+        retry_contract: "readers bind a published tail/prefix and may resample if they need newer history",
+        reclamation_contract: "old immutable segments retire only after recovery, diagnostics, and time-travel readers release their references",
+    },
     MvccMetadataPublicationContract {
         class: MvccMetadataPublicationClass::SharedSnapshotTriple,
         touchpoint: "shm.rs::SharedMemoryLayout::{publish_snapshot,load_consistent_snapshot}",
         current_primitive: "explicit seqlock triple over commit_seq/schema_epoch/ecs_epoch",
         selected_primitive: "keep seqlock triple",
+        fit_rationale: "the payload is exactly three words that must be mutually coherent and whose readers can cheaply retry while a writer publishes",
+        primitive_family_map: "RCU: rejected as allocation/reclamation overhead for three words; seqlock: selected; BRAVO: rejected because there is no reader lock to bias; Left-Right: rejected as duplicated tiny payload; RLU: rejected as transactional-copy overkill; sharded: rejected because the triple is singular cross-process state",
+        rejected_options: "independent atomics, RCU object swap, BRAVO/RwLock, Left-Right pair/triple copies, RLU copied triples, sharded triples",
         retry_contract: "readers retry while snapshot_seq is odd or changes; no read-side write lock is allowed",
         reclamation_contract: "none; the triple is overwritten in place",
     },
@@ -120,14 +207,42 @@ pub const MVCC_METADATA_PUBLICATION_CONTRACTS: [MvccMetadataPublicationContract;
         touchpoint: "begin_concurrent.rs::ConcurrentRegistry active set plus committed reader/writer indexes",
         current_primitive: "global Mutex<HashMap> plus per-handle Mutex leaves",
         selected_primitive: "RCU/QSBR-published registry snapshot with per-handle mutable leaves retained separately",
+        fit_rationale: "SSI validation wants one immutable image of the active set while writers continue session lifecycle work outside the reader scan",
+        primitive_family_map: "RCU: selected for the bounded active-session image; seqlock: rejected because long SSI scans can livelock under churn; BRAVO: rejected because registry lifecycle operations are writes; Left-Right: compatible but heavier than the existing RCU/QSBR snapshot prototype; RLU: rejected as unsafe-heavy object-copy discipline for session handles; sharded: compatible for writer-side lifecycle after the immutable read image exists",
+        rejected_options: "long-held global Mutex during SSI scan, whole-registry seqlock, BRAVO/RwLock, unsafe-heavy RLU handle copies, full Left-Right registry duplication as the first cut",
         retry_contract: "SSI readers bind to one immutable registry image per validation pass instead of holding the writer lock",
         reclamation_contract: "retired registry snapshots wait for a QSBR grace period before recycle",
+    },
+    MvccMetadataPublicationContract {
+        class: MvccMetadataPublicationClass::CommittedConflictLedger,
+        touchpoint: "begin_concurrent.rs::ConcurrentRegistry committed reader/writer lookup indexes",
+        current_primitive: "committed conflict maps updated under the registry Mutex",
+        selected_primitive: "append-only sharded conflict ledgers with immutable segment headers and epoch retirement",
+        fit_rationale: "committed conflict evidence is lookup-heavy historical metadata; published records are immutable and naturally partition by page or cell key",
+        primitive_family_map: "RCU: compatible for published segment heads; seqlock: rejected for variable-size ledgers; BRAVO: rejected because ledger writes occur on commit; Left-Right: rejected for whole-ledger duplication; RLU: rejected as copied indexes would inflate commit cost; sharded: selected by page/cell key family",
+        rejected_options: "whole-registry conflict map Mutex as the long-term shape, seqlock vectors, BRAVO/RwLock maps, whole-ledger Left-Right, RLU copied indexes",
+        retry_contract: "readers bind a stable segment prefix for validation and may rebind for fresher diagnostic history",
+        reclamation_contract: "segments retire after no active snapshot or evidence reader can reference their epoch",
+    },
+    MvccMetadataPublicationContract {
+        class: MvccMetadataPublicationClass::SchemaEpoch,
+        touchpoint: "lifecycle.rs::schema_epoch plus shm.rs::load_schema_epoch",
+        current_primitive: "monotone atomic epoch when standalone; seqlock triple when coupled to durable snapshot state",
+        selected_primitive: "keep scalar atomic invalidation epoch; bind through SharedSnapshotTriple when schema must be coherent with commit_seq",
+        fit_rationale: "most readers only need stale-schema detection, while durable multi-field readers already have the SHM seqlock triple",
+        primitive_family_map: "RCU: rejected for standalone epoch but compatible for future schema-object caches; seqlock: selected only when bundled in the shared triple; BRAVO: rejected as a lock for a scalar token; Left-Right: rejected because schema objects are connection-local here; RLU: rejected as copied schema transactions are out of scope; sharded: rejected because the epoch is global invalidation state",
+        rejected_options: "standalone schema-object RCU cache, BRAVO/RwLock token, Left-Right schema duplicate, RLU schema copies, sharded schema epochs",
+        retry_contract: "prepared statements compare epochs/cookies and reprepare on mismatch; no global lock is taken",
+        reclamation_contract: "none for the scalar; schema objects remain owned by connection-local caches",
     },
     MvccMetadataPublicationContract {
         class: MvccMetadataPublicationClass::CommittedVersionStore,
         touchpoint: "invariants.rs::VersionStore plus ebr.rs::VersionGuardRegistry",
         current_primitive: "append-only committed chains guarded by crossbeam epoch pins",
         selected_primitive: "keep append-only EBR publication",
+        fit_rationale: "committed page histories need stable chain traversal plus delayed reclamation, not replacement of entire histories on every commit",
+        primitive_family_map: "RCU: selected in its epoch/EBR form for node lifetime; seqlock: rejected because chain traversal cannot tolerate torn mutable nodes; BRAVO: rejected because there is no read lock to bias; Left-Right: rejected for whole-chain duplication on commit; RLU: rejected as copied chain objects are too expensive and subtle; sharded: selected for chain heads and allocation locality",
+        rejected_options: "seqlock-protected mutable chains, BRAVO/RwLock chains, whole-chain Left-Right copies, RLU copied version nodes, whole-store global Mutex",
         retry_contract: "readers pin the epoch and traverse a committed chain; no seqlock retry path is permitted",
         reclamation_contract: "versions retire only after the min pinned epoch moves past the retire epoch",
     },
@@ -136,8 +251,33 @@ pub const MVCC_METADATA_PUBLICATION_CONTRACTS: [MvccMetadataPublicationContract;
         touchpoint: "core_types.rs::raise_gc_horizon plus ebr.rs::VersionGuardRegistry::min_pinned_epoch",
         current_primitive: "monotone atomics plus active-slot and reader-pin floors",
         selected_primitive: "keep monotone atomic horizon; do not wrap it in RCU or seqlock",
+        fit_rationale: "GC consumers require a safe lower bound; stale-low is correct and cheaper than constructing a coherent synthetic snapshot",
+        primitive_family_map: "RCU: rejected because the horizon object is not reclaimed; seqlock: rejected because stale-low reads are safe; BRAVO: rejected as no lock is needed; Left-Right: rejected as duplicate floors add drain waits; RLU: rejected as copy transactions add no safety; sharded: compatible only for per-slot floor collection before min-reduction",
+        rejected_options: "RCU floor snapshots, seqlock floor bundles, BRAVO/RwLock floor reads, Left-Right floor duplicates, RLU copied floor objects",
         retry_contract: "stale low horizons are safe and may be reread; readers never require a globally locked snapshot",
         reclamation_contract: "the horizon itself is not reclaimed and only gates reclamation of other metadata",
+    },
+    MvccMetadataPublicationContract {
+        class: MvccMetadataPublicationClass::SsiDecisionTelemetry,
+        touchpoint: "ssi_abort_policy.rs evidence ledger plus observability.rs conflict heat telemetry",
+        current_primitive: "bounded async/off-path evidence recording with atomic counters",
+        selected_primitive: "keep bounded async ring and sharded counters off the commit-critical path",
+        fit_rationale: "telemetry informs operators and adaptive policy; losing or reading stale samples must not affect MVCC correctness",
+        primitive_family_map: "RCU: compatible for diagnostic snapshots only; seqlock: rejected on the commit path; BRAVO: rejected because readers are rare; Left-Right: rejected as overbuilt for lossy telemetry; RLU: rejected because copied diagnostics are not worth commit cost; sharded: selected for counters and heat buckets",
+        rejected_options: "synchronous global telemetry Mutex, seqlock evidence log on commit, BRAVO/RwLock telemetry map, Left-Right diagnostic copies, RLU evidence objects",
+        retry_contract: "policy readers may sample and retry diagnostics, but commit/abort decisions never wait for telemetry publication",
+        reclamation_contract: "bounded rings overwrite oldest entries; exported snapshots own copied evidence",
+    },
+    MvccMetadataPublicationContract {
+        class: MvccMetadataPublicationClass::WitnessPublicationArchive,
+        touchpoint: "witness_publication.rs::WitnessPublisher",
+        current_primitive: "private pending reservations plus committed proof records behind publisher ownership",
+        selected_primitive: "two-plane publication: exact pending reservation ownership plus append-only immutable committed chunks",
+        fit_rationale: "the reserve/write/commit protocol already separates mutable private state from reader-visible committed proof history",
+        primitive_family_map: "RCU: compatible for committed chunk heads; seqlock: rejected for archive-wide variable history; BRAVO: rejected because writes are protocol events, not read-lock traffic; Left-Right: rejected for whole-archive duplication; RLU: rejected as copied archives would inflate proof publication; sharded: compatible by database, reservation, or witness-key family",
+        rejected_options: "archive-wide seqlock, BRAVO/RwLock archive, whole-archive Left-Right, RLU archive copies, eventually consistent pending-reservation maps",
+        retry_contract: "pending ownership remains exact; readers consume immutable committed chunks and may rebind for newer proof history",
+        reclamation_contract: "committed chunks retire only after proof readers and recovery consumers release them",
     },
 ];
 
@@ -181,6 +321,52 @@ mod metadata_publication_contract_tests {
             snapshot.retry_contract.contains("retry"),
             "seqlock snapshot readers must have an explicit retry rule"
         );
+    }
+
+    #[test]
+    fn test_mvcc_metadata_publication_contract_covers_all_mvcc_classes() {
+        assert_eq!(
+            MVCC_METADATA_PUBLICATION_CONTRACTS.len(),
+            MvccMetadataPublicationClass::ALL.len(),
+            "every MVCC metadata class must have one publication contract"
+        );
+
+        for class in MvccMetadataPublicationClass::ALL {
+            let matching = MVCC_METADATA_PUBLICATION_CONTRACTS
+                .iter()
+                .filter(|contract| contract.class == class)
+                .count();
+            assert_eq!(
+                matching, 1,
+                "MVCC metadata class {class:?} must have exactly one publication contract"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mvcc_metadata_publication_contract_maps_required_primitive_families() {
+        const REQUIRED_FAMILIES: [&str; 6] =
+            ["RCU", "seqlock", "BRAVO", "Left-Right", "RLU", "sharded"];
+
+        for contract in MVCC_METADATA_PUBLICATION_CONTRACTS {
+            assert!(
+                !contract.fit_rationale.is_empty(),
+                "{:?} must explain why the selected primitive fits",
+                contract.class
+            );
+            assert!(
+                !contract.rejected_options.is_empty(),
+                "{:?} must keep rejected options explicit",
+                contract.class
+            );
+            for family in REQUIRED_FAMILIES {
+                assert!(
+                    contract.primitive_family_map.contains(family),
+                    "{:?} must map candidate family {family}",
+                    contract.class
+                );
+            }
+        }
     }
 }
 
@@ -304,12 +490,17 @@ pub use materialize::{
     MaterializationTrigger, materialize_page, should_materialize_eagerly,
 };
 pub use observability::{
-    CasMetricsSnapshot, CasRetriesHistogram, SharedObserver, SnapshotReadMetricsSnapshot,
-    SsiMetricsSnapshot, VersionsTraversedHistogram, cas_metrics_snapshot, emit_conflict_resolved,
+    CasMetricsSnapshot, CasRetriesHistogram, ConflictHeatContext, ConflictHeatEdge,
+    ConflictHeatObservation, ConflictHeatPageSummary, ConflictHeatSnapshot,
+    ConflictOverlapDirection, ConflictOverlapSummary, SharedObserver, SnapshotReadMetricsSnapshot,
+    SsiMetricsSnapshot, VersionsTraversedHistogram, cas_metrics_snapshot,
+    conflict_heat_telemetry_enabled, conflict_heat_telemetry_snapshot, emit_conflict_resolved,
     emit_fcw_base_drift, emit_page_lock_contention, emit_ssi_abort, mvcc_snapshot_established,
     mvcc_snapshot_metrics_snapshot, mvcc_snapshot_released, record_cas_attempt,
-    record_snapshot_read_versions_traversed, record_ssi_abort, record_ssi_commit,
-    reset_cas_metrics, reset_mvcc_snapshot_metrics, reset_ssi_metrics, ssi_metrics_snapshot,
+    record_conflict_heat_observation, record_snapshot_read_versions_traversed, record_ssi_abort,
+    record_ssi_commit, reset_cas_metrics, reset_conflict_heat_telemetry,
+    reset_mvcc_snapshot_metrics, reset_ssi_metrics, set_conflict_heat_telemetry_enabled,
+    ssi_metrics_snapshot,
 };
 pub use physical_merge::{
     CellOp, CellOpKind, FreeSpaceOp, HeaderOp, MergeError, MergeLadderResult, ParsedCell,

@@ -74,6 +74,16 @@ impl VersionIdx {
 /// Number of page versions per arena chunk.
 const ARENA_CHUNK: usize = 4096;
 
+#[inline]
+fn generation_counter_matches(left: u32, right: u32) -> bool {
+    left.cmp(&right).is_eq()
+}
+
+#[inline]
+fn txn_ids_differ(left: TxnId, right: TxnId) -> bool {
+    left.get().cmp(&right.get()).is_ne()
+}
+
 struct ArenaSlot {
     generation: u32,
     version: Option<PageVersion>,
@@ -159,14 +169,14 @@ impl VersionArena {
     pub fn take(&mut self, idx: VersionIdx) -> PageVersion {
         let slot = &mut self.chunks[idx.chunk as usize][idx.offset as usize];
         assert!(
-            slot.generation == idx.generation,
+            generation_counter_matches(slot.generation, idx.generation),
             "VersionArena::take: generation mismatch for {idx:?} (slot generation {})",
             slot.generation
         );
         let version = slot
             .version
             .take()
-            .unwrap_or_else(|| panic!("VersionArena::take: double-free of {idx:?}"));
+            .expect("VersionArena::take: slot must be occupied");
 
         // Increment generation on free so that any dangling VersionIdx becomes invalid.
         // We skip u32::MAX to prevent collision with CHAIN_HEAD_EMPTY (u64::MAX) when packed.
@@ -210,14 +220,14 @@ impl VersionArena {
     pub fn take_for_retirement(&mut self, idx: VersionIdx) -> PageVersion {
         let slot = &mut self.chunks[idx.chunk as usize][idx.offset as usize];
         assert!(
-            slot.generation == idx.generation,
+            generation_counter_matches(slot.generation, idx.generation),
             "VersionArena::take_for_retirement: generation mismatch for {idx:?} (slot generation {})",
             slot.generation
         );
         let version = slot
             .version
             .take()
-            .unwrap_or_else(|| panic!("VersionArena::take_for_retirement: double-free of {idx:?}"));
+            .expect("VersionArena::take_for_retirement: slot must be occupied");
 
         // Bump generation to invalidate stale pointers, but do NOT add to free_list.
         let mut next_gen = slot.generation.wrapping_add(1);
@@ -282,7 +292,7 @@ impl VersionArena {
             .get(idx.chunk as usize)?
             .get(idx.offset as usize)?;
 
-        if slot.generation != idx.generation {
+        if !generation_counter_matches(slot.generation, idx.generation) {
             return None;
         }
         slot.version.as_ref()
@@ -295,7 +305,7 @@ impl VersionArena {
             .get_mut(idx.chunk as usize)?
             .get_mut(idx.offset as usize)?;
 
-        if slot.generation != idx.generation {
+        if !generation_counter_matches(slot.generation, idx.generation) {
             return None;
         }
         slot.version.as_mut()
@@ -841,7 +851,7 @@ impl InProcessPageLockTable {
             for shard in self.shards.iter() {
                 let mut map = shard.lock();
                 let before = map.len();
-                map.retain(|_, &mut v| v != txn);
+                map.retain(|_, &mut v| txn_ids_differ(v, txn));
                 released_any |= map.len() != before;
             }
         }
@@ -852,7 +862,7 @@ impl InProcessPageLockTable {
                 for shard in draining.shards.iter() {
                     let mut map = shard.lock();
                     let before = map.len();
-                    map.retain(|_, &mut v| v != txn);
+                    map.retain(|_, &mut v| txn_ids_differ(v, txn));
                     released_any |= map.len() != before;
                 }
             }
@@ -1938,9 +1948,8 @@ impl Transaction {
     pub fn clear_page_access_tracking(&mut self) {
         self.read_set_versions.clear();
         self.write_set_versions.clear();
-        if let Some(bloom) = self.read_set_bloom.as_mut() {
-            bloom.clear();
-        }
+        self.read_set_storage_mode = ReadSetStorageMode::Exact;
+        self.read_set_bloom = None;
     }
 
     /// Clear structural pages tracking (C4: bd-l9k8e.4).
@@ -3997,6 +4006,15 @@ mod tests {
         assert!(
             !txn.read_set_maybe_contains(page),
             "cleared bloom tracking must not claim membership for previously recorded pages"
+        );
+        assert_eq!(
+            txn.read_set_storage_mode,
+            ReadSetStorageMode::Exact,
+            "access tracking cleanup must restore exact read-set mode"
+        );
+        assert!(
+            txn.read_set_bloom.is_none(),
+            "access tracking cleanup must release the bloom read-set allocation"
         );
     }
 

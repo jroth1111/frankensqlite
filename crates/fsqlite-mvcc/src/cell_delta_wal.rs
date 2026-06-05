@@ -187,7 +187,7 @@ impl CellDeltaWalFrame {
                 ),
             });
         }
-        if self.op == CellDeltaOp::Delete && !self.cell_data.is_empty() {
+        if matches!(self.op, CellDeltaOp::Delete) && !self.cell_data.is_empty() {
             return Err(FrankenError::WalCorrupt {
                 detail: "delete cell-delta frame cannot carry cell data".to_owned(),
             });
@@ -296,7 +296,7 @@ impl CellDeltaWalFrame {
             );
             return None;
         }
-        if op == CellDeltaOp::Delete && data_len != 0 {
+        if matches!(op, CellDeltaOp::Delete) && data_len != 0 {
             warn!(data_len, "cell_delta_wal_frame_delete_payload");
             return None;
         }
@@ -387,7 +387,9 @@ impl CellDeltaWalFrame {
             return false;
         }
         let data_len = u32::from_be_bytes([buf[41], buf[42], buf[43], buf[44]]);
-        if data_len > CELL_DELTA_MAX_DATA_LEN || (op == CellDeltaOp::Delete && data_len != 0) {
+        if data_len > CELL_DELTA_MAX_DATA_LEN
+            || (matches!(op, CellDeltaOp::Delete) && data_len != 0)
+        {
             return false;
         }
         let Some(expected_total_size) = CELL_DELTA_HEADER_SIZE
@@ -494,7 +496,9 @@ pub fn deserialize_cell_delta_batch(buf: &[u8]) -> Vec<CellDeltaWalFrame> {
         // Read data length to determine frame size
         let data_len =
             u32::from_be_bytes([remaining[41], remaining[42], remaining[43], remaining[44]]);
-        if data_len > CELL_DELTA_MAX_DATA_LEN || (op == CellDeltaOp::Delete && data_len != 0) {
+        if data_len > CELL_DELTA_MAX_DATA_LEN
+            || (matches!(op, CellDeltaOp::Delete) && data_len != 0)
+        {
             break;
         }
 
@@ -567,7 +571,17 @@ impl CellDeltaRecoverySummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fsqlite_types::{BtreeRef, SemanticKeyKind, TableId};
+    use std::collections::BTreeMap;
+
+    use crate::cell_visibility::{CellResolve, CellVisibilityLog};
+    use fsqlite_types::{BtreeRef, SemanticKeyKind, TableId, TxnEpoch, TxnToken};
+    use proptest::{
+        collection::vec as prop_vec,
+        prelude::*,
+        test_runner::{Config as ProptestConfig, TestCaseError},
+    };
+
+    const MVCC_DURABILITY_PROPTEST_CASES: u32 = 64;
 
     fn make_cell_key() -> CellKey {
         CellKey {
@@ -579,6 +593,141 @@ mod tests {
 
     fn serialize(frame: &CellDeltaWalFrame) -> Vec<u8> {
         frame.serialize().expect("test cell-delta frame is valid")
+    }
+
+    fn durable_cell_key_from_digest(key_digest: [u8; 16]) -> CellKey {
+        CellKey {
+            btree: BtreeRef::Table(TableId::new(1)),
+            kind: SemanticKeyKind::TableRow,
+            key_digest,
+        }
+    }
+
+    fn replay_committed_frame(
+        log: &CellVisibilityLog,
+        frame: &CellDeltaWalFrame,
+    ) -> std::result::Result<(), String> {
+        let key = durable_cell_key_from_digest(frame.key_digest);
+        let epoch = u32::try_from(frame.txn_id.get())
+            .map_err(|err| format!("txn epoch conversion failed: {err}"))?;
+        let txn = TxnToken::new(frame.txn_id, TxnEpoch::new(epoch));
+        let delta_idx = match frame.op {
+            CellDeltaOp::Insert => {
+                log.record_insert(key, frame.page_number, frame.cell_data.clone(), txn)
+            }
+            CellDeltaOp::Update => {
+                log.record_update(key, frame.page_number, frame.cell_data.clone(), txn)
+            }
+            CellDeltaOp::Delete => log.record_delete(key, frame.page_number, txn),
+        }
+        .ok_or_else(|| {
+            format!(
+                "replay exceeded visibility-log budget for page {}",
+                frame.page_number.get()
+            )
+        })?;
+        log.commit_delta(delta_idx, frame.commit_seq);
+        Ok(())
+    }
+
+    fn resolve_committed_cells(
+        log: &CellVisibilityLog,
+        cells: &BTreeMap<(u32, [u8; 16]), (PageNumber, CellKey)>,
+        snapshot: CommitSeq,
+    ) -> BTreeMap<(u32, [u8; 16]), CellResolve> {
+        cells
+            .iter()
+            .map(|(identity, (page, key))| (*identity, log.resolve_state(*page, key, snapshot)))
+            .collect()
+    }
+
+    // Metamorphic relation MR4: durability under crash/replay.
+    // Fault sensitivity 5, independence 5, execution cost 2, score 12.5.
+    // Transform a committed MVCC cell-delta history by serializing it to WAL
+    // bytes, dropping the live visibility log, and replaying into a fresh log.
+    // The visible committed state must be identical after recovery.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(MVCC_DURABILITY_PROPTEST_CASES))]
+
+        #[test]
+        fn metamorphic_durability_replays_committed_cell_deltas_after_crash(
+            raw_writes in prop_vec(
+                (1_u16..=64, 0_u8..=2, prop_vec(any::<u8>(), 0..=32)),
+                1..=32,
+            ),
+        ) {
+            let live_log = CellVisibilityLog::new(1 << 20);
+            let mut frames = Vec::with_capacity(raw_writes.len());
+            let mut cells = BTreeMap::new();
+
+            for (idx, (rowid, op_selector, raw_payload)) in raw_writes.iter().enumerate() {
+                let page = PageNumber::new(1 + u32::from(*rowid % 16))
+                    .ok_or_else(|| TestCaseError::fail("generated page number was invalid"))?;
+                let key = CellKey::table_row(
+                    BtreeRef::Table(TableId::new(1)),
+                    i64::from(*rowid),
+                );
+                let op = match op_selector {
+                    0 => CellDeltaOp::Insert,
+                    1 => CellDeltaOp::Update,
+                    _ => CellDeltaOp::Delete,
+                };
+                let cell_data = if matches!(op, CellDeltaOp::Delete) {
+                    Vec::new()
+                } else {
+                    raw_payload.clone()
+                };
+                let commit_seq = CommitSeq::new(idx as u64 + 1);
+                let txn_id = TxnId::new(idx as u64 + 1)
+                    .ok_or_else(|| TestCaseError::fail("generated txn id was invalid"))?;
+                let txn_epoch = u32::try_from(idx + 1)
+                    .map_err(|err| TestCaseError::fail(format!("txn epoch conversion failed: {err}")))?;
+                let txn = TxnToken::new(txn_id, TxnEpoch::new(txn_epoch));
+
+                let delta_idx = match op {
+                    CellDeltaOp::Insert => {
+                        live_log.record_insert(key, page, cell_data.clone(), txn)
+                    }
+                    CellDeltaOp::Update => {
+                        live_log.record_update(key, page, cell_data.clone(), txn)
+                    }
+                    CellDeltaOp::Delete => live_log.record_delete(key, page, txn),
+                }
+                .ok_or_else(|| {
+                    TestCaseError::fail(format!(
+                        "live visibility log budget exceeded for rowid {rowid}"
+                    ))
+                })?;
+                live_log.commit_delta(delta_idx, commit_seq);
+
+                frames.push(CellDeltaWalFrame::new(
+                    page,
+                    &key,
+                    op,
+                    commit_seq,
+                    txn_id,
+                    cell_data,
+                ));
+                cells.insert((page.get(), key.key_digest), (page, key));
+            }
+
+            let snapshot = CommitSeq::new(raw_writes.len() as u64 + 1);
+            let expected = resolve_committed_cells(&live_log, &cells, snapshot);
+            let wal_bytes = serialize_cell_delta_batch(&frames)
+                .map_err(|err| TestCaseError::fail(format!("serialize WAL batch failed: {err}")))?;
+
+            let recovered_frames = deserialize_cell_delta_batch(&wal_bytes);
+            prop_assert_eq!(&recovered_frames, &frames);
+
+            let recovered_log = CellVisibilityLog::new(1 << 20);
+            for frame in &recovered_frames {
+                replay_committed_frame(&recovered_log, frame)
+                    .map_err(TestCaseError::fail)?;
+            }
+            let recovered = resolve_committed_cells(&recovered_log, &cells, snapshot);
+
+            prop_assert_eq!(recovered, expected);
+        }
     }
 
     // -----------------------------------------------------------------------

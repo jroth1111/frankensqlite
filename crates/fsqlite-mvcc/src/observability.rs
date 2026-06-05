@@ -8,8 +8,10 @@
 //! **Invariant:** All functions in this module are non-blocking. They must
 //! never acquire page locks or block writers.
 
-use fsqlite_types::sync_primitives::Instant;
+use fsqlite_types::sync_primitives::{Instant, Mutex};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use fsqlite_observability::{ConflictEvent, ConflictObserver, SsiAbortCategory};
@@ -421,6 +423,332 @@ pub fn reset_ssi_metrics() {
     FSQLITE_SSI_ABORTS_PIVOT.store(0, Ordering::Relaxed);
     FSQLITE_SSI_ABORTS_COMMITTED_PIVOT.store(0, Ordering::Relaxed);
     FSQLITE_SSI_ABORTS_MARKED_FOR_ABORT.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// Conflict heat telemetry (bd-1dp9.6.7.13.1)
+// ---------------------------------------------------------------------------
+
+const CONFLICT_HEAT_SCHEMA_VERSION: &str = "fsqlite.mvcc.conflict_heat.v1";
+const CONFLICT_HEAT_TOP_PAGE_LIMIT: usize = 16;
+const CONFLICT_HEAT_OVERLAP_EDGE_LIMIT: usize = 64;
+
+static CONFLICT_HEAT_TELEMETRY_ENABLED: AtomicBool = AtomicBool::new(false);
+static CONFLICT_HEAT_STATE: LazyLock<Mutex<ConflictHeatState>> =
+    LazyLock::new(|| Mutex::new(ConflictHeatState::default()));
+
+/// Direction of an observed SSI overlap edge relative to the committing
+/// transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub enum ConflictOverlapDirection {
+    /// Another transaction read a witness this transaction writes.
+    Incoming,
+    /// This transaction read a witness another transaction writes.
+    Outgoing,
+}
+
+impl ConflictOverlapDirection {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Incoming => "incoming",
+            Self::Outgoing => "outgoing",
+        }
+    }
+}
+
+/// One edge in the conflict-topology overlap graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictHeatEdge {
+    pub from: TxnToken,
+    pub to: TxnToken,
+    pub overlap_page: Option<PageNumber>,
+    pub direction: ConflictOverlapDirection,
+    pub source_is_active: bool,
+}
+
+/// Operator-facing context attached to conflict heat observations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictHeatContext<'a> {
+    pub trace_id: &'a str,
+    pub run_id: &'a str,
+    pub scenario_id: &'a str,
+    pub btree_id: u32,
+    pub table_or_index_role: &'a str,
+    pub split_pressure: u32,
+    pub allocation_class: &'a str,
+    pub elapsed_ns: u64,
+    pub first_failure_diag: &'a str,
+}
+
+impl Default for ConflictHeatContext<'_> {
+    fn default() -> Self {
+        Self {
+            trace_id: "mvcc-conflict-heat",
+            run_id: "local",
+            scenario_id: "unknown",
+            btree_id: 0,
+            table_or_index_role: "unknown",
+            split_pressure: 0,
+            allocation_class: "unknown",
+            elapsed_ns: 0,
+            first_failure_diag: "none",
+        }
+    }
+}
+
+/// Single conflict heat observation produced by MVCC validation.
+#[derive(Debug, Clone, Copy)]
+pub struct ConflictHeatObservation<'a> {
+    pub context: ConflictHeatContext<'a>,
+    pub commit_seq: CommitSeq,
+    pub writer_overlap_estimate: u32,
+    pub conflict_heat: u64,
+    pub overlap_edges: &'a [ConflictHeatEdge],
+    pub fallback_pages: &'a [PageNumber],
+}
+
+/// Snapshot row for one hot conflict page.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ConflictHeatPageSummary {
+    pub page_no: u32,
+    pub conflict_heat: u64,
+    pub writer_overlap_estimate: u32,
+}
+
+/// Snapshot row for one conflict overlap edge.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ConflictOverlapSummary {
+    pub from_txn_id: u64,
+    pub from_txn_epoch: u64,
+    pub to_txn_id: u64,
+    pub to_txn_epoch: u64,
+    pub direction: &'static str,
+    pub overlap_count: u64,
+    pub conflict_heat: u64,
+    pub last_page_no: Option<u32>,
+    pub source_is_active: bool,
+}
+
+/// Deterministic conflict heat snapshot for PRAGMAs, verification scripts, and
+/// later placement/deflection policy beads.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ConflictHeatSnapshot {
+    pub schema_version: &'static str,
+    pub observations_total: u64,
+    pub max_writer_overlap_estimate: u32,
+    pub max_conflict_heat: u64,
+    pub top_pages: Vec<ConflictHeatPageSummary>,
+    pub overlap_edges: Vec<ConflictOverlapSummary>,
+    pub first_failure_diag: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ConflictOverlapKey {
+    from_txn_id: u64,
+    from_txn_epoch: u64,
+    to_txn_id: u64,
+    to_txn_epoch: u64,
+    direction: ConflictOverlapDirection,
+}
+
+impl ConflictOverlapKey {
+    fn new(edge: &ConflictHeatEdge) -> Self {
+        Self {
+            from_txn_id: edge.from.id.get(),
+            from_txn_epoch: u64::from(edge.from.epoch.get()),
+            to_txn_id: edge.to.id.get(),
+            to_txn_epoch: u64::from(edge.to.epoch.get()),
+            direction: edge.direction,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ConflictHeatPageState {
+    heat: u64,
+    max_writer_overlap_estimate: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ConflictOverlapState {
+    overlap_count: u64,
+    heat: u64,
+    last_page: Option<PageNumber>,
+    source_is_active: bool,
+}
+
+#[derive(Debug, Default)]
+struct ConflictHeatState {
+    observations_total: u64,
+    max_writer_overlap_estimate: u32,
+    max_conflict_heat: u64,
+    pages: BTreeMap<PageNumber, ConflictHeatPageState>,
+    overlap_edges: BTreeMap<ConflictOverlapKey, ConflictOverlapState>,
+    first_failure_diag: Option<String>,
+}
+
+/// Enable or disable conflict heat telemetry.
+///
+/// Defaults to disabled. When disabled, record sites pay one relaxed bool load
+/// and return before taking locks or allocating.
+pub fn set_conflict_heat_telemetry_enabled(enabled: bool) {
+    CONFLICT_HEAT_TELEMETRY_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Current conflict heat telemetry flag.
+#[must_use]
+pub fn conflict_heat_telemetry_enabled() -> bool {
+    CONFLICT_HEAT_TELEMETRY_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Reset conflict heat telemetry state.
+pub fn reset_conflict_heat_telemetry() {
+    *CONFLICT_HEAT_STATE.lock() = ConflictHeatState::default();
+}
+
+/// Record one conflict heat observation.
+pub fn record_conflict_heat_observation(observation: &ConflictHeatObservation<'_>) {
+    if !CONFLICT_HEAT_TELEMETRY_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    record_conflict_heat_observation_slow(observation);
+}
+
+#[cold]
+#[inline(never)]
+fn record_conflict_heat_observation_slow(observation: &ConflictHeatObservation<'_>) {
+    let mut state = CONFLICT_HEAT_STATE.lock();
+    state.observations_total = state.observations_total.saturating_add(1);
+    state.max_writer_overlap_estimate = state
+        .max_writer_overlap_estimate
+        .max(observation.writer_overlap_estimate);
+    state.max_conflict_heat = state.max_conflict_heat.max(observation.conflict_heat);
+    if observation.context.first_failure_diag != "none" && state.first_failure_diag.is_none() {
+        state.first_failure_diag = Some(observation.context.first_failure_diag.to_owned());
+    }
+
+    let per_edge_heat = 1_u64;
+    let mut emitted_page_event = false;
+    for edge in observation.overlap_edges {
+        if let Some(page) = edge.overlap_page {
+            emitted_page_event = true;
+            record_conflict_heat_page(&mut state, page, 1, observation.writer_overlap_estimate);
+            emit_conflict_heat_page_event(observation, page, 1);
+        }
+
+        let key = ConflictOverlapKey::new(edge);
+        let entry = state.overlap_edges.entry(key).or_default();
+        entry.overlap_count = entry.overlap_count.saturating_add(1);
+        entry.heat = entry.heat.saturating_add(per_edge_heat);
+        entry.last_page = edge.overlap_page;
+        entry.source_is_active = edge.source_is_active;
+    }
+
+    if !emitted_page_event {
+        for &page in observation.fallback_pages {
+            record_conflict_heat_page(
+                &mut state,
+                page,
+                observation.conflict_heat.max(1),
+                observation.writer_overlap_estimate,
+            );
+            emit_conflict_heat_page_event(observation, page, observation.conflict_heat.max(1));
+        }
+    }
+}
+
+fn record_conflict_heat_page(
+    state: &mut ConflictHeatState,
+    page: PageNumber,
+    heat: u64,
+    writer_overlap_estimate: u32,
+) {
+    let page_state = state.pages.entry(page).or_default();
+    page_state.heat = page_state.heat.saturating_add(heat);
+    page_state.max_writer_overlap_estimate = page_state
+        .max_writer_overlap_estimate
+        .max(writer_overlap_estimate);
+}
+
+fn emit_conflict_heat_page_event(
+    observation: &ConflictHeatObservation<'_>,
+    page: PageNumber,
+    page_heat: u64,
+) {
+    tracing::info!(
+        target: "fsqlite.mvcc.conflict_heat",
+        trace_id = observation.context.trace_id,
+        run_id = observation.context.run_id,
+        scenario_id = observation.context.scenario_id,
+        btree_id = observation.context.btree_id,
+        table_or_index_role = observation.context.table_or_index_role,
+        page_no = page.get(),
+        commit_seq = observation.commit_seq.get(),
+        writer_overlap_estimate = observation.writer_overlap_estimate,
+        conflict_heat = page_heat,
+        split_pressure = observation.context.split_pressure,
+        allocation_class = observation.context.allocation_class,
+        elapsed_ns = observation.context.elapsed_ns,
+        first_failure_diag = observation.context.first_failure_diag,
+        "mvcc conflict heat observation"
+    );
+}
+
+/// Take a deterministic conflict heat telemetry snapshot.
+#[must_use]
+pub fn conflict_heat_telemetry_snapshot() -> ConflictHeatSnapshot {
+    let state = CONFLICT_HEAT_STATE.lock();
+    let mut top_pages = state
+        .pages
+        .iter()
+        .map(|(&page, page_state)| ConflictHeatPageSummary {
+            page_no: page.get(),
+            conflict_heat: page_state.heat,
+            writer_overlap_estimate: page_state.max_writer_overlap_estimate,
+        })
+        .collect::<Vec<_>>();
+    top_pages.sort_by(|left, right| {
+        right
+            .conflict_heat
+            .cmp(&left.conflict_heat)
+            .then_with(|| left.page_no.cmp(&right.page_no))
+    });
+    top_pages.truncate(CONFLICT_HEAT_TOP_PAGE_LIMIT);
+
+    let mut overlap_edges = state
+        .overlap_edges
+        .iter()
+        .map(|(key, edge_state)| ConflictOverlapSummary {
+            from_txn_id: key.from_txn_id,
+            from_txn_epoch: key.from_txn_epoch,
+            to_txn_id: key.to_txn_id,
+            to_txn_epoch: key.to_txn_epoch,
+            direction: key.direction.as_str(),
+            overlap_count: edge_state.overlap_count,
+            conflict_heat: edge_state.heat,
+            last_page_no: edge_state.last_page.map(PageNumber::get),
+            source_is_active: edge_state.source_is_active,
+        })
+        .collect::<Vec<_>>();
+    overlap_edges.sort_by(|left, right| {
+        right
+            .conflict_heat
+            .cmp(&left.conflict_heat)
+            .then_with(|| left.from_txn_id.cmp(&right.from_txn_id))
+            .then_with(|| left.to_txn_id.cmp(&right.to_txn_id))
+            .then_with(|| left.direction.cmp(right.direction))
+    });
+    overlap_edges.truncate(CONFLICT_HEAT_OVERLAP_EDGE_LIMIT);
+
+    ConflictHeatSnapshot {
+        schema_version: CONFLICT_HEAT_SCHEMA_VERSION,
+        observations_total: state.observations_total,
+        max_writer_overlap_estimate: state.max_writer_overlap_estimate,
+        max_conflict_heat: state.max_conflict_heat,
+        top_pages,
+        overlap_edges,
+        first_failure_diag: state.first_failure_diag.clone(),
+    }
 }
 
 // ---------------------------------------------------------------------------

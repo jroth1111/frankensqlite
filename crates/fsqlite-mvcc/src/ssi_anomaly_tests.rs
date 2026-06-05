@@ -17,7 +17,8 @@ use fsqlite_types::{
 };
 
 use crate::begin_concurrent::{
-    ConcurrentRegistry, concurrent_abort, concurrent_commit_with_ssi, concurrent_write_page,
+    ConcurrentRegistry, FcwResult, concurrent_abort, concurrent_commit_with_ssi,
+    concurrent_write_page,
 };
 use crate::core_types::{CommitIndex, InProcessPageLockTable, VersionArena};
 use crate::ebr::{GLOBAL_EBR_METRICS, StaleReaderConfig, VersionGuard, VersionGuardRegistry};
@@ -46,6 +47,22 @@ fn test_page(n: u32) -> PageNumber {
 
 fn test_data() -> PageData {
     PageData::zeroed(PageSize::DEFAULT)
+}
+
+fn balance_data(balance: i64) -> PageData {
+    let mut data = PageData::zeroed(PageSize::DEFAULT);
+    for (slot, byte) in data.as_bytes_mut().iter_mut().zip(balance.to_le_bytes()) {
+        *slot = byte;
+    }
+    data
+}
+
+fn key_range(btree_root: PageNumber, lo: &[u8], hi: &[u8]) -> WitnessKey {
+    WitnessKey::KeyRange {
+        btree_root,
+        lo: lo.to_vec(),
+        hi: hi.to_vec(),
+    }
 }
 
 fn page_key(pgno: u32) -> WitnessKey {
@@ -206,6 +223,113 @@ fn ssi_anomaly_write_skew_detected() {
     );
 }
 
+/// No-mock balance invariant write-skew: two txns both read A and B, then
+/// each publishes a withdrawal to the other account page. SSI must abort one
+/// real concurrent handle instead of letting both local checks publish.
+#[test]
+fn ssi_write_skew_balance_constraint_aborts_one_without_mock_edges() {
+    let lock_table = InProcessPageLockTable::new();
+    let commit_index = CommitIndex::new();
+    let mut registry = ConcurrentRegistry::new();
+
+    let balance_a = test_page(701);
+    let balance_b = test_page(702);
+    let initial_a = 50_i64;
+    let initial_b = 50_i64;
+    let withdrawal = 90_i64;
+    let withdrawn_a = initial_a - withdrawal;
+    let withdrawn_b = initial_b - withdrawal;
+
+    // Each transaction's local constraint check passes under the common snapshot.
+    assert!(withdrawn_a + initial_b >= 0);
+    assert!(initial_a + withdrawn_b >= 0);
+
+    let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+    let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+    {
+        let mut h1 = registry.get_mut(s1).unwrap();
+        h1.record_read(balance_a);
+        h1.record_read(balance_b);
+        concurrent_write_page(
+            &mut h1,
+            &lock_table,
+            s1,
+            balance_a,
+            balance_data(withdrawn_a),
+        )
+        .unwrap();
+    }
+    {
+        let mut h2 = registry.get_mut(s2).unwrap();
+        h2.record_read(balance_a);
+        h2.record_read(balance_b);
+        concurrent_write_page(
+            &mut h2,
+            &lock_table,
+            s2,
+            balance_b,
+            balance_data(withdrawn_b),
+        )
+        .unwrap();
+    }
+
+    let result1 = concurrent_commit_with_ssi(
+        &mut registry,
+        &commit_index,
+        &lock_table,
+        s1,
+        CommitSeq::new(11),
+    );
+    let result2 = concurrent_commit_with_ssi(
+        &mut registry,
+        &commit_index,
+        &lock_table,
+        s2,
+        CommitSeq::new(12),
+    );
+
+    let outcomes = [&result1, &result2];
+    let committed = outcomes.iter().filter(|result| result.is_ok()).count();
+    let ssi_aborted = outcomes
+        .iter()
+        .filter(|result| {
+            matches!(
+                result,
+                Err((
+                    MvccError::BusySnapshot,
+                    FcwResult::Abort {
+                        reason: SsiAbortReason::Pivot,
+                    },
+                ))
+            )
+        })
+        .count();
+
+    assert_eq!(
+        committed, 1,
+        "bead_id=bd-9by72 write-skew invariant: SSI must let exactly one txn commit"
+    );
+    assert_eq!(
+        ssi_aborted, 1,
+        "bead_id=bd-9by72 write-skew invariant: exactly one txn must abort as an SSI pivot"
+    );
+
+    let a_committed = commit_index.latest(balance_a).is_some();
+    let b_committed = commit_index.latest(balance_b).is_some();
+    assert_ne!(
+        a_committed, b_committed,
+        "bead_id=bd-9by72 write-skew invariant: only one withdrawal page may publish"
+    );
+
+    let final_a = if a_committed { withdrawn_a } else { initial_a };
+    let final_b = if b_committed { withdrawn_b } else { initial_b };
+    assert!(
+        final_a + final_b >= 0,
+        "bead_id=bd-9by72 write-skew invariant: serializable outcome must preserve balance sum"
+    );
+}
+
 /// Phantom-like anomaly: T1 scans a range (reads pages 300..305), T2 inserts
 /// into that range (writes page 303). SSI should detect the rw-antidependency.
 #[test]
@@ -294,6 +418,86 @@ fn ssi_anomaly_phantom_via_registry() {
     assert!(
         result1.is_ok(),
         "bead_id={BEAD_ID} phantom-registry: T1 commits (only outgoing, not a pivot)"
+    );
+}
+
+/// Predicate-read phantom cycle through the real concurrent registry path.
+///
+/// T_scan reads a key range and writes an aggregate page. T_insert reads that
+/// aggregate page and writes a point key inside the range. The scan transaction
+/// has both incoming and outgoing rw-antidependencies, so SSI must abort it as
+/// the pivot before both sides can publish an impossible aggregate.
+#[test]
+fn ssi_predicate_phantom_cycle_aborts_scan_without_mock_edges() {
+    let lock_table = InProcessPageLockTable::new();
+    let commit_index = CommitIndex::new();
+    let mut registry = ConcurrentRegistry::new();
+
+    let index_root = test_page(801);
+    let insert_leaf = test_page(802);
+    let aggregate_page = test_page(803);
+    let scanned_range = key_range(index_root, b"acct:0100", b"acct:0199");
+    let inserted_key = b"acct:0150";
+
+    let scan = registry.begin_concurrent(test_snapshot(10)).unwrap();
+    let insert = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+    {
+        let mut h_scan = registry.get_mut(scan).unwrap();
+        h_scan.record_read_witness(scanned_range);
+        concurrent_write_page(&mut h_scan, &lock_table, scan, aggregate_page, test_data()).unwrap();
+    }
+    {
+        let mut h_insert = registry.get_mut(insert).unwrap();
+        h_insert.record_read(aggregate_page);
+        let (cell_witness, page_witness) =
+            WitnessKey::for_point_write(index_root, inserted_key, insert_leaf);
+        h_insert.record_write_witness(cell_witness);
+        h_insert.record_write_witness(page_witness);
+        concurrent_write_page(&mut h_insert, &lock_table, insert, insert_leaf, test_data())
+            .unwrap();
+    }
+
+    let scan_result = concurrent_commit_with_ssi(
+        &mut registry,
+        &commit_index,
+        &lock_table,
+        scan,
+        CommitSeq::new(11),
+    );
+    assert!(
+        matches!(
+            scan_result,
+            Err((
+                MvccError::BusySnapshot,
+                FcwResult::Abort {
+                    reason: SsiAbortReason::Pivot,
+                },
+            ))
+        ),
+        "bead_id=bd-zoh27 predicate phantom: scan pivot must abort"
+    );
+
+    let insert_result = concurrent_commit_with_ssi(
+        &mut registry,
+        &commit_index,
+        &lock_table,
+        insert,
+        CommitSeq::new(12),
+    );
+    assert!(
+        insert_result.is_ok(),
+        "bead_id=bd-zoh27 predicate phantom: insert must commit after scan abort"
+    );
+    assert_eq!(
+        commit_index.latest(insert_leaf),
+        Some(CommitSeq::new(12)),
+        "bead_id=bd-zoh27 predicate phantom: insert leaf commit must publish"
+    );
+    assert_eq!(
+        commit_index.latest(aggregate_page),
+        None,
+        "bead_id=bd-zoh27 predicate phantom: aborted aggregate must not publish"
     );
 }
 

@@ -1370,9 +1370,28 @@ impl VersionStore {
                 }
             }
 
-            let current_epoch = self.current_epoch();
-            self.retire_queue
-                .retire_batch(result.pruned_indices.iter().copied(), current_epoch);
+            let retire_epoch = self.current_epoch();
+            let mut arena = self.arena.write();
+            let pass = retire_and_reclaim(
+                self.guard_registry(),
+                &self.retire_queue,
+                &mut arena,
+                result.pruned_indices.iter().copied(),
+                retire_epoch,
+            );
+            drop(arena);
+
+            tracing::debug!(
+                target: "fsqlite_mvcc::gc",
+                page = page.get(),
+                retired_slots = result.pruned_indices.len(),
+                retire_epoch,
+                recycle_epoch = pass.observed_epoch,
+                recycled_slots = pass.recycled_slots,
+                pending_recycle_count = self.pending_recycle_count(),
+                min_pinned_epoch = pass.min_pinned_epoch,
+                "eager prune processed retired arena slots through EBR recycling"
+            );
         }
 
         usize::try_from(result.freed).unwrap_or(usize::MAX)
@@ -2491,7 +2510,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ebr_batch_free_after_epoch_advance() {
+    fn test_ebr_eager_prune_recycles_without_pinned_readers() {
         let store = VersionStore::new(PageSize::DEFAULT);
         let pgno_a = PageNumber::new(16).unwrap();
         let pgno_b = PageNumber::new(17).unwrap();
@@ -2521,13 +2540,9 @@ mod tests {
         assert_eq!(store.chain_length(pgno_b), 2);
         assert_eq!(
             store.pending_recycle_count(),
-            2,
-            "eager prune must queue retired slots for later EBR batch recycling"
+            0,
+            "eager prune should complete EBR recycling immediately when no reader is pinned"
         );
-
-        assert_eq!(store.try_recycle_retired_slots(store.current_epoch()), 0);
-        assert_eq!(store.advance_epoch(), 2);
-        assert_eq!(store.pending_recycle_count(), 0);
         assert_eq!(store.arena_free_count(), 2);
     }
 
@@ -2540,11 +2555,12 @@ mod tests {
         store.publish(make_version(18, 2, None));
         store.publish(make_version(18, 3, None));
 
+        let guard = VersionGuard::pin(Arc::clone(store.guard_registry()));
+
         let freed = store.prune_page_chain_eager(pgno, CommitSeq::new(2));
         assert_eq!(freed, 1, "horizon=2 should prune only the oldest version");
         assert_eq!(store.pending_recycle_count(), 1);
 
-        let guard = VersionGuard::pin(Arc::clone(store.guard_registry()));
         assert_eq!(store.try_recycle_retired_slots(store.current_epoch()), 0);
         assert_eq!(store.advance_epoch(), 0);
         assert_eq!(store.advance_epoch(), 0);

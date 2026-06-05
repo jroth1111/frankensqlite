@@ -39,6 +39,10 @@ use parking_lot::{Mutex, MutexGuard};
 
 use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionMode, TransactionState};
 use crate::lifecycle::MvccError;
+use crate::observability::{
+    ConflictHeatContext, ConflictHeatEdge, ConflictHeatObservation, ConflictOverlapDirection,
+    conflict_heat_telemetry_enabled, record_conflict_heat_observation,
+};
 use crate::rcu::{ActiveTxnSnapshotEntry, QsbrHandle, RcuActiveTxnSnapshotTable};
 use crate::ssi_validation::{
     ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,
@@ -1704,6 +1708,13 @@ pub fn validate_first_committer_wins(
         );
         FcwResult::Clean
     } else {
+        if fsqlite_btree::conflict_topology_policy_enabled() {
+            let _updated = fsqlite_btree::record_conflict_topology_heat_batch(
+                conflicting_pages.iter().copied(),
+                1,
+                2,
+            );
+        }
         tracing::warn!(
             conflicting_page_count = conflicting_pages.len(),
             max_conflicting_seq = max_conflicting_seq.get(),
@@ -1723,6 +1734,34 @@ fn release_tracked_page_locks(
     txn_id: TxnId,
 ) {
     lock_table.release_set(handle.held_lock_pages_iter(), txn_id);
+}
+
+fn finalize_prepared_session_state(
+    registry: &ConcurrentRegistry,
+    session_id: u64,
+    has_in_rw: bool,
+    has_out_rw: bool,
+    finalize_path: &'static str,
+) {
+    if let Some(mut handle) = registry.get_mut(session_id) {
+        if handle.is_active() {
+            handle.has_in_rw.set(has_in_rw);
+            handle.has_out_rw.set(has_out_rw);
+            handle.mark_committed();
+        } else {
+            tracing::warn!(
+                session_id,
+                finalize_path,
+                "finalize_prepared_concurrent_commit_with_ssi: session inactive during finalize; applying commit-index/lock-table side effects"
+            );
+        }
+    } else {
+        tracing::warn!(
+            session_id,
+            finalize_path,
+            "finalize_prepared_concurrent_commit_with_ssi: session missing during finalize; applying commit-index/lock-table side effects"
+        );
+    }
 }
 
 fn merge_unique_incoming_edges(
@@ -2490,6 +2529,101 @@ fn evaluate_prepare_t3_dro(
     ))
 }
 
+fn record_prepare_conflict_heat(
+    txn: TxnToken,
+    planned_commit_seq: CommitSeq,
+    incoming_edges: &[DiscoveredEdge],
+    outgoing_edges: &[DiscoveredEdge],
+    write_set_pages: &[PageNumber],
+) {
+    let telemetry_enabled = conflict_heat_telemetry_enabled();
+    let topology_policy_enabled = fsqlite_btree::conflict_topology_policy_enabled();
+    if !telemetry_enabled && !topology_policy_enabled {
+        return;
+    }
+    let edge_count = incoming_edges.len().saturating_add(outgoing_edges.len());
+    if edge_count == 0 {
+        return;
+    }
+
+    let mut edges = Vec::with_capacity(edge_count);
+    let mut peer_tokens = Vec::with_capacity(edge_count);
+    for edge in incoming_edges {
+        edges.push(ConflictHeatEdge {
+            from: edge.from,
+            to: edge.to,
+            overlap_page: witness_key_page(&edge.overlap_key),
+            direction: ConflictOverlapDirection::Incoming,
+            source_is_active: edge.source_is_active,
+        });
+        peer_tokens.push((
+            edge.from.id.get(),
+            edge.from.epoch.get(),
+            edge.source_is_active,
+        ));
+    }
+    for edge in outgoing_edges {
+        edges.push(ConflictHeatEdge {
+            from: edge.from,
+            to: edge.to,
+            overlap_page: witness_key_page(&edge.overlap_key),
+            direction: ConflictOverlapDirection::Outgoing,
+            source_is_active: edge.source_is_active,
+        });
+        peer_tokens.push((edge.to.id.get(), edge.to.epoch.get(), edge.source_is_active));
+    }
+    peer_tokens.sort_unstable();
+    peer_tokens.dedup();
+
+    let writer_overlap_estimate = u32::try_from(peer_tokens.len()).unwrap_or(u32::MAX);
+    let conflict_heat = u64::try_from(edge_count).unwrap_or(u64::MAX);
+    if topology_policy_enabled {
+        let updated = fsqlite_btree::record_conflict_topology_heat_batch(
+            edges.iter().filter_map(|edge| edge.overlap_page),
+            1,
+            writer_overlap_estimate,
+        );
+        if updated == 0 {
+            let _updated = fsqlite_btree::record_conflict_topology_heat_batch(
+                write_set_pages.iter().copied(),
+                conflict_heat.max(1),
+                writer_overlap_estimate,
+            );
+        }
+    }
+    let observation = ConflictHeatObservation {
+        context: ConflictHeatContext {
+            trace_id: "mvcc-ssi-prepare",
+            run_id: "local",
+            scenario_id: "prepare_concurrent_commit_with_ssi",
+            btree_id: 0,
+            table_or_index_role: "unknown",
+            split_pressure: 0,
+            allocation_class: "unknown",
+            elapsed_ns: 0,
+            first_failure_diag: "none",
+        },
+        commit_seq: planned_commit_seq,
+        writer_overlap_estimate,
+        conflict_heat,
+        overlap_edges: &edges,
+        fallback_pages: write_set_pages,
+    };
+    tracing::debug!(
+        target: "fsqlite.mvcc.conflict_heat",
+        txn_id = txn.id.get(),
+        txn_epoch = txn.epoch.get(),
+        commit_seq = planned_commit_seq.get(),
+        writer_overlap_estimate,
+        conflict_heat,
+        edge_count,
+        "mvcc conflict heat prepare observation"
+    );
+    if telemetry_enabled {
+        record_conflict_heat_observation(&observation);
+    }
+}
+
 /// Commit a concurrent transaction.
 ///
 /// Validates with first-committer-wins, then SSI (Serializable Snapshot
@@ -2763,6 +2897,13 @@ pub fn prepare_concurrent_commit_with_ssi(
             &active_reader_candidates,
             &committed_reader_candidates,
         );
+        record_prepare_conflict_heat(
+            txn,
+            planned_commit_seq,
+            &incoming_edges,
+            &[],
+            &write_set_pages,
+        );
         let dro_t3_decision = evaluate_prepare_t3_dro(
             txn,
             &incoming_edges,
@@ -2882,6 +3023,13 @@ pub fn prepare_concurrent_commit_with_ssi(
         &sorted_read_keys,
         &active_writer_candidates,
         &committed_writer_candidates,
+    );
+    record_prepare_conflict_heat(
+        txn,
+        planned_commit_seq,
+        &incoming_edges,
+        &outgoing_edges,
+        &write_set_pages,
     );
 
     let has_in_rw = !incoming_edges.is_empty();
@@ -3081,34 +3229,9 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
     if prepared.used_uncontended_prepare_fast_path()
         && registry.can_use_uncontended_finalize_fast_path(prepared.session_id, prepared.begin_seq)
     {
-        let mut mark_committed = false;
-        if let Some(handle) = registry.get_mut(prepared.session_id) {
-            if handle.is_active() {
-                handle.has_in_rw.set(false);
-                handle.has_out_rw.set(false);
-                mark_committed = true;
-            } else {
-                tracing::warn!(
-                    session_id = prepared.session_id,
-                    "finalize_prepared_concurrent_commit_with_ssi: uncontended fast-path session inactive during finalize; applying commit-index/lock-table side effects"
-                );
-            }
-        } else {
-            tracing::warn!(
-                session_id = prepared.session_id,
-                "finalize_prepared_concurrent_commit_with_ssi: uncontended fast-path session missing during finalize; applying commit-index/lock-table side effects"
-            );
-        }
-
         commit_index.batch_update(&prepared.write_set_pages, committed_seq);
         lock_table.release_set(prepared.held_lock_pages.iter().copied(), txn_id);
-        if mark_committed {
-            if let Some(mut handle) = registry.get_mut(prepared.session_id) {
-                if handle.is_active() {
-                    handle.mark_committed();
-                }
-            }
-        }
+        finalize_prepared_session_state(registry, prepared.session_id, false, false, "uncontended");
         registry.prune_committed_conflict_history();
         return;
     }
@@ -3397,34 +3520,15 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         }
     }
 
-    let mut mark_committed = false;
-    if let Some(handle) = registry.get_mut(prepared.session_id) {
-        if handle.is_active() {
-            handle.has_in_rw.set(has_in_rw);
-            handle.has_out_rw.set(has_out_rw);
-            mark_committed = true;
-        } else {
-            tracing::warn!(
-                session_id = prepared.session_id,
-                "finalize_prepared_concurrent_commit_with_ssi: session inactive during finalize; applying commit-index/lock-table side effects"
-            );
-        }
-    } else {
-        tracing::warn!(
-            session_id = prepared.session_id,
-            "finalize_prepared_concurrent_commit_with_ssi: session missing during finalize; applying commit-index/lock-table side effects"
-        );
-    }
-
     commit_index.batch_update(&prepared.write_set_pages, committed_seq);
     lock_table.release_set(prepared.held_lock_pages.iter().copied(), txn_id);
-    if mark_committed {
-        if let Some(mut handle) = registry.get_mut(prepared.session_id) {
-            if handle.is_active() {
-                handle.mark_committed();
-            }
-        }
-    }
+    finalize_prepared_session_state(
+        registry,
+        prepared.session_id,
+        has_in_rw,
+        has_out_rw,
+        "edgeful",
+    );
 
     if !read_keys.is_empty() {
         registry.committed_readers.push(CommittedReaderInfo {
@@ -3603,16 +3707,28 @@ pub const fn is_concurrent_mode(mode: TransactionMode) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+    };
 
     use fsqlite_types::{
         CommitSeq, PageData, PageNumber, PageSize, SchemaEpoch, Snapshot, TxnEpoch, TxnId,
         TxnToken, WitnessKey,
     };
+    use proptest::{
+        collection::vec as prop_vec,
+        prelude::*,
+        test_runner::{Config as ProptestConfig, TestCaseError},
+    };
 
-    use crate::core_types::{CommitIndex, InProcessPageLockTable};
+    use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionState};
     use crate::lifecycle::MvccError;
-    use crate::ssi_validation::ActiveTxnView;
+    use crate::observability::{
+        conflict_heat_telemetry_snapshot, reset_conflict_heat_telemetry,
+        set_conflict_heat_telemetry_enabled,
+    };
+    use crate::ssi_validation::{ActiveTxnView, SsiAbortReason};
 
     use super::{
         ActiveEdgeDiscoveryIndex, CommittedReaderInfo, CommittedWriterInfo, ConcurrentHandle,
@@ -3649,6 +3765,386 @@ mod tests {
             TxnId::new(id).expect("test transaction id"),
             TxnEpoch::new(id as u32 + 1),
         )
+    }
+
+    const MVCC_METAMORPHIC_PROPTEST_CASES: u32 = 64;
+
+    fn tagged_test_data(tag: u8) -> PageData {
+        let mut data = test_data();
+        data.as_bytes_mut()[0] = tag;
+        data
+    }
+
+    fn unique_test_pages(raw_pages: &[u32]) -> Vec<PageNumber> {
+        let mut seen = BTreeSet::new();
+        raw_pages
+            .iter()
+            .filter_map(|raw| PageNumber::new(*raw))
+            .filter(|page| seen.insert(*page))
+            .collect()
+    }
+
+    fn run_disjoint_commit_schedule(
+        pages: &[PageNumber],
+        commit_order: &[usize],
+    ) -> Result<BTreeMap<PageNumber, u8>, String> {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let mut sessions = Vec::with_capacity(pages.len());
+
+        for _ in pages {
+            sessions.push(
+                registry
+                    .begin_concurrent(test_snapshot(10))
+                    .map_err(|err| format!("begin_concurrent failed: {err:?}"))?,
+            );
+        }
+
+        for (idx, (session_id, page)) in sessions.iter().zip(pages).enumerate() {
+            let mut handle = registry
+                .get_mut(*session_id)
+                .ok_or_else(|| format!("missing session handle {session_id}"))?;
+            let tag = u8::try_from(idx + 1).expect("proptest limits writers to <= 8");
+            concurrent_write_page(
+                &mut handle,
+                &lock_table,
+                *session_id,
+                *page,
+                tagged_test_data(tag),
+            )
+            .map_err(|err| {
+                format!(
+                    "write page {} in session {session_id} failed: {err:?}",
+                    page.get()
+                )
+            })?;
+        }
+
+        for (order_idx, writer_idx) in commit_order.iter().copied().enumerate() {
+            let session_id = sessions
+                .get(writer_idx)
+                .copied()
+                .ok_or_else(|| format!("commit order references writer {writer_idx}"))?;
+            let mut handle = registry
+                .get_mut(session_id)
+                .ok_or_else(|| format!("missing session handle {session_id}"))?;
+            let commit_seq = CommitSeq::new(11 + order_idx as u64);
+            concurrent_commit(
+                &mut handle,
+                &commit_index,
+                &lock_table,
+                session_id,
+                commit_seq,
+            )
+            .map_err(|(err, fcw)| {
+                format!("commit writer {writer_idx} session {session_id} failed: {err:?} {fcw:?}")
+            })?;
+        }
+
+        if lock_table.lock_count() != 0 {
+            return Err(format!(
+                "expected all page locks released, found {}",
+                lock_table.lock_count()
+            ));
+        }
+
+        let mut final_state = BTreeMap::new();
+        for (idx, (session_id, page)) in sessions.iter().zip(pages).enumerate() {
+            let tag = u8::try_from(idx + 1).expect("proptest limits writers to <= 8");
+            if commit_index.latest(*page).is_none() {
+                return Err(format!("page {} missing committed sequence", page.get()));
+            }
+            final_state.insert(*page, tag);
+            let removed = registry.remove_and_recycle(*session_id);
+            if !removed {
+                return Err(format!("session {session_id} was not removed"));
+            }
+        }
+
+        Ok(final_state)
+    }
+
+    fn reader_snapshot_view(
+        handle: &ConcurrentHandle,
+        commit_index: &CommitIndex,
+        pages: &[PageNumber],
+    ) -> BTreeMap<PageNumber, (Option<u64>, bool, Option<u8>)> {
+        let snapshot_high = handle.snapshot().high;
+        let mut view = BTreeMap::new();
+        for page in pages {
+            let committed = commit_index
+                .latest(*page)
+                .filter(|seq| *seq <= snapshot_high)
+                .map(CommitSeq::get);
+            let (is_freed, has_staged_write) = concurrent_page_read_status(handle, *page);
+            let local_tag = has_staged_write
+                .then(|| concurrent_read_page(handle, *page).map(|data| data.as_bytes()[0]))
+                .flatten();
+            view.insert(*page, (committed, is_freed, local_tag));
+        }
+        view
+    }
+
+    fn union_pages(left: &[PageNumber], right: &[PageNumber]) -> Vec<PageNumber> {
+        let mut pages = BTreeSet::new();
+        pages.extend(left.iter().copied());
+        pages.extend(right.iter().copied());
+        pages.into_iter().collect()
+    }
+
+    fn write_set_with_extras(overlap: &[PageNumber], extras: &[PageNumber]) -> Vec<PageNumber> {
+        union_pages(overlap, extras)
+    }
+
+    fn stage_tagged_pages(
+        handle: &mut ConcurrentHandle,
+        lock_table: &InProcessPageLockTable,
+        session_id: u64,
+        pages: &[PageNumber],
+    ) -> Result<(), String> {
+        for (idx, page) in pages.iter().enumerate() {
+            let tag = u8::try_from(idx + 1)
+                .map_err(|err| format!("tag conversion for page {} failed: {err}", page.get()))?;
+            concurrent_write_page(handle, lock_table, session_id, *page, tagged_test_data(tag))
+                .map_err(|err| {
+                    format!(
+                        "write page {} in session {session_id} failed: {err:?}",
+                        page.get()
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn run_conflict_direction(
+        first_pages: &[PageNumber],
+        second_pages: &[PageNumber],
+    ) -> Result<BTreeSet<PageNumber>, String> {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let first_session = registry
+            .begin_concurrent(test_snapshot(10))
+            .map_err(|err| format!("begin first failed: {err:?}"))?;
+        let second_session = registry
+            .begin_concurrent(test_snapshot(10))
+            .map_err(|err| format!("begin second failed: {err:?}"))?;
+
+        {
+            let mut first = registry
+                .get_mut(first_session)
+                .ok_or_else(|| "missing first handle".to_string())?;
+            stage_tagged_pages(&mut first, &lock_table, first_session, first_pages)?;
+            concurrent_commit(
+                &mut first,
+                &commit_index,
+                &lock_table,
+                first_session,
+                CommitSeq::new(11),
+            )
+            .map_err(|(err, fcw)| format!("first commit failed: {err:?} {fcw:?}"))?;
+        }
+
+        let conflict_pages = {
+            let mut second = registry
+                .get_mut(second_session)
+                .ok_or_else(|| "missing second handle".to_string())?;
+            stage_tagged_pages(&mut second, &lock_table, second_session, second_pages)?;
+            match concurrent_commit(
+                &mut second,
+                &commit_index,
+                &lock_table,
+                second_session,
+                CommitSeq::new(12),
+            ) {
+                Err((
+                    MvccError::BusySnapshot,
+                    FcwResult::Conflict {
+                        conflicting_pages, ..
+                    },
+                )) => conflicting_pages.into_iter().collect::<BTreeSet<_>>(),
+                Err((err, fcw)) => {
+                    return Err(format!(
+                        "second commit failed without FCW conflict: {err:?} {fcw:?}"
+                    ));
+                }
+                Ok(seq) => {
+                    return Err(format!("second commit unexpectedly succeeded at {seq}"));
+                }
+            }
+        };
+
+        if lock_table.lock_count() != 0 {
+            return Err(format!(
+                "expected conflict path to release locks, found {}",
+                lock_table.lock_count()
+            ));
+        }
+        if !registry.remove_and_recycle(first_session) {
+            return Err(format!("first session {first_session} was not removed"));
+        }
+        if !registry.remove_and_recycle(second_session) {
+            return Err(format!("second session {second_session} was not removed"));
+        }
+
+        Ok(conflict_pages)
+    }
+
+    // Metamorphic strength matrix:
+    // - MR1 commit-order independence: fault sensitivity 5, independence 4,
+    //   execution cost 1. It detects false global writer serialization or
+    //   order-dependent FCW failures for disjoint page writes.
+    // - MR2 snapshot isolation: fault sensitivity 5, independence 5,
+    //   execution cost 1. It detects leaked uncommitted writer state in a
+    //   reader's already-established snapshot view.
+    // - MR3 conflict symmetry: fault sensitivity 4, independence 4,
+    //   execution cost 1. It detects asymmetric FCW overlap accounting when
+    //   the same two write sets are committed in opposite directions.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(MVCC_METAMORPHIC_PROPTEST_CASES))]
+
+        #[test]
+        fn metamorphic_commit_order_independence_for_disjoint_writers(
+            raw_pages in prop_vec(1_u32..=2048, 1..=8),
+        ) {
+            let pages = unique_test_pages(&raw_pages);
+            prop_assert!(!pages.is_empty());
+
+            let forward_order = (0..pages.len()).collect::<Vec<_>>();
+            let mut reverse_order = forward_order.clone();
+            reverse_order.reverse();
+
+            let forward_state = run_disjoint_commit_schedule(&pages, &forward_order)
+                .map_err(TestCaseError::fail)?;
+            let reverse_state = run_disjoint_commit_schedule(&pages, &reverse_order)
+                .map_err(TestCaseError::fail)?;
+
+            prop_assert_eq!(forward_state, reverse_state);
+        }
+
+        #[test]
+        fn metamorphic_snapshot_isolation_hides_uncommitted_writes(
+            raw_base_pages in prop_vec(1_u32..=2048, 1..=8),
+            raw_writer_pages in prop_vec(1_u32..=2048, 1..=8),
+        ) {
+            let base_pages = unique_test_pages(&raw_base_pages);
+            let writer_pages = unique_test_pages(&raw_writer_pages);
+            prop_assert!(!base_pages.is_empty());
+            prop_assert!(!writer_pages.is_empty());
+
+            let lock_table = InProcessPageLockTable::new();
+            let commit_index = CommitIndex::new();
+            for (idx, page) in base_pages.iter().enumerate() {
+                commit_index.update(*page, CommitSeq::new(2 + idx as u64));
+            }
+
+            let all_pages = union_pages(&base_pages, &writer_pages);
+            let mut registry = ConcurrentRegistry::new();
+            let reader_session = registry
+                .begin_concurrent(test_snapshot(10))
+                .map_err(|err| TestCaseError::fail(format!("begin reader failed: {err:?}")))?;
+            let writer_session = registry
+                .begin_concurrent(test_snapshot(10))
+                .map_err(|err| TestCaseError::fail(format!("begin writer failed: {err:?}")))?;
+
+            let before = {
+                let reader = registry
+                    .get(reader_session)
+                    .ok_or_else(|| TestCaseError::fail("missing reader handle"))?;
+                reader_snapshot_view(&reader, &commit_index, &all_pages)
+            };
+
+            {
+                let mut writer = registry
+                    .get_mut(writer_session)
+                    .ok_or_else(|| TestCaseError::fail("missing writer handle"))?;
+                for (idx, page) in writer_pages.iter().enumerate() {
+                    let tag = u8::try_from(idx + 1).expect("proptest limits writers to <= 8");
+                    concurrent_write_page(
+                        &mut writer,
+                        &lock_table,
+                        writer_session,
+                        *page,
+                        tagged_test_data(tag),
+                    )
+                    .map_err(|err| {
+                        TestCaseError::fail(format!(
+                            "uncommitted writer page {} failed: {err:?}",
+                            page.get()
+                        ))
+                    })?;
+                    let writer_tag = concurrent_read_page(&writer, *page)
+                        .map(|data| data.as_bytes()[0]);
+                    prop_assert_eq!(writer_tag, Some(tag));
+                }
+            }
+
+            let after = {
+                let reader = registry
+                    .get(reader_session)
+                    .ok_or_else(|| TestCaseError::fail("missing reader handle"))?;
+                reader_snapshot_view(&reader, &commit_index, &all_pages)
+            };
+            prop_assert_eq!(before, after);
+
+            {
+                let mut writer = registry
+                    .get_mut(writer_session)
+                    .ok_or_else(|| TestCaseError::fail("missing writer handle"))?;
+                concurrent_abort(&mut writer, &lock_table, writer_session);
+            }
+            prop_assert_eq!(lock_table.lock_count(), 0);
+            prop_assert!(registry.remove_and_recycle(reader_session));
+            prop_assert!(registry.remove_and_recycle(writer_session));
+        }
+
+        #[test]
+        fn metamorphic_conflict_symmetry_reports_same_overlap(
+            raw_overlap_pages in prop_vec(1_u32..=256, 1..=8),
+            raw_left_extra_pages in prop_vec(1001_u32..=2048, 0..=4),
+            raw_right_extra_pages in prop_vec(3001_u32..=4096, 0..=4),
+        ) {
+            let overlap_pages = unique_test_pages(&raw_overlap_pages);
+            prop_assert!(!overlap_pages.is_empty());
+            let left_extra_pages = unique_test_pages(&raw_left_extra_pages);
+            let right_extra_pages = unique_test_pages(&raw_right_extra_pages);
+            let left_pages = write_set_with_extras(&overlap_pages, &left_extra_pages);
+            let right_pages = write_set_with_extras(&overlap_pages, &right_extra_pages);
+            let expected_overlap = overlap_pages.iter().copied().collect::<BTreeSet<_>>();
+
+            let left_then_right = run_conflict_direction(&left_pages, &right_pages)
+                .map_err(TestCaseError::fail)?;
+            let right_then_left = run_conflict_direction(&right_pages, &left_pages)
+                .map_err(TestCaseError::fail)?;
+
+            prop_assert_eq!(&left_then_right, &expected_overlap);
+            prop_assert_eq!(&right_then_left, &expected_overlap);
+            prop_assert_eq!(left_then_right, right_then_left);
+        }
+    }
+
+    struct ConflictHeatTelemetryGuard;
+
+    impl Drop for ConflictHeatTelemetryGuard {
+        fn drop(&mut self) {
+            set_conflict_heat_telemetry_enabled(false);
+            reset_conflict_heat_telemetry();
+            fsqlite_btree::reset_conflict_topology_policy_state();
+            fsqlite_btree::set_conflict_topology_policy_mode(
+                fsqlite_btree::ConflictTopologyPolicyMode::Enforced,
+            );
+        }
+    }
+
+    fn enable_conflict_heat_telemetry_for_test() -> ConflictHeatTelemetryGuard {
+        reset_conflict_heat_telemetry();
+        fsqlite_btree::reset_conflict_topology_policy_state();
+        fsqlite_btree::set_conflict_topology_policy_mode(
+            fsqlite_btree::ConflictTopologyPolicyMode::Enforced,
+        );
+        set_conflict_heat_telemetry_enabled(true);
+        ConflictHeatTelemetryGuard
     }
 
     // -----------------------------------------------------------------------
@@ -3750,6 +4246,69 @@ mod tests {
             assert_eq!(err, MvccError::BusySnapshot);
             assert!(matches!(fcw, FcwResult::Conflict { .. }));
         }
+    }
+
+    #[test]
+    fn test_same_page_stale_writer_hits_fcw_after_lock_busy_retry() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let page = test_page(77);
+
+        let s1 = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("session 1");
+        let s2 = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("session 2");
+
+        {
+            let mut h1 = registry.get_mut(s1).expect("handle 1");
+            concurrent_write_page(&mut h1, &lock_table, s1, page, tagged_test_data(1))
+                .expect("s1 write page");
+        }
+
+        {
+            let mut h2 = registry.get_mut(s2).expect("handle 2");
+            let result = concurrent_write_page(&mut h2, &lock_table, s2, page, tagged_test_data(2));
+            assert_eq!(result, Err(MvccError::Busy));
+        }
+
+        let seq1 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        )
+        .expect("s1 commits first");
+        assert_eq!(seq1, CommitSeq::new(11));
+        assert_eq!(commit_index.latest(page), Some(CommitSeq::new(11)));
+
+        {
+            let mut h2 = registry.get_mut(s2).expect("handle 2");
+            concurrent_write_page(&mut h2, &lock_table, s2, page, tagged_test_data(2))
+                .expect("s2 write page after s1 releases lock");
+        }
+
+        let result = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s2,
+            CommitSeq::new(12),
+        );
+        let (err, fcw) = result.expect_err("stale same-page writer must abort");
+        assert_eq!(err, MvccError::BusySnapshot);
+        assert_eq!(
+            fcw,
+            FcwResult::Conflict {
+                conflicting_pages: vec![page],
+                conflicting_commit_seq: CommitSeq::new(11),
+            }
+        );
+        assert_eq!(commit_index.latest(page), Some(CommitSeq::new(11)));
+        assert_eq!(lock_table.lock_count(), 0);
     }
 
     // -----------------------------------------------------------------------
@@ -4816,6 +5375,11 @@ mod tests {
         );
 
         let committed = registry.get(session_id).expect("committed handle");
+        assert_eq!(
+            committed.state(),
+            TransactionState::Committed,
+            "uncontended finalize should mark the prepared session committed"
+        );
         assert!(
             !committed.has_in_rw() && !committed.has_out_rw(),
             "uncontended finalize should not manufacture SSI edges"
@@ -5011,6 +5575,11 @@ mod tests {
         let committed = registry
             .get(s1)
             .expect("prepared txn handle should remain present until explicit removal");
+        assert_eq!(
+            committed.state(),
+            TransactionState::Committed,
+            "edgeful finalize should mark the prepared session committed"
+        );
         assert!(
             committed.has_out_rw(),
             "finalize must discover committed writers that were not present during prepare"
@@ -5065,6 +5634,11 @@ mod tests {
         let committed = registry
             .get(s1)
             .expect("prepared txn handle should remain present until explicit removal");
+        assert_eq!(
+            committed.state(),
+            TransactionState::Committed,
+            "edgeful finalize should mark the prepared session committed"
+        );
         assert!(
             committed.has_in_rw(),
             "finalize must discover committed readers that were not present during prepare"
@@ -5502,6 +6076,81 @@ mod tests {
         assert_eq!(decision.active_readers, 1);
         assert_eq!(decision.active_writers, 1);
         assert!(decision.threshold >= 0.0);
+    }
+
+    #[test]
+    fn test_conflict_heat_adversarial_overlap_workload_records_page_heat_graph() {
+        let _guard = enable_conflict_heat_telemetry_for_test();
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let s3 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        {
+            let mut h1 = registry.get_mut(s1).unwrap();
+            h1.record_read(test_page(10));
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(20), test_data()).unwrap();
+        }
+        {
+            let mut h2 = registry.get_mut(s2).unwrap();
+            h2.record_read(test_page(20));
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(10), test_data()).unwrap();
+        }
+        {
+            let mut h3 = registry.get_mut(s3).unwrap();
+            h3.record_read(test_page(20));
+            concurrent_write_page(&mut h3, &lock_table, s3, test_page(30), test_data()).unwrap();
+        }
+
+        let result = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        );
+
+        assert!(matches!(
+            result,
+            Err((
+                MvccError::BusySnapshot,
+                FcwResult::Abort {
+                    reason: SsiAbortReason::Pivot
+                }
+            ))
+        ));
+
+        let snapshot = conflict_heat_telemetry_snapshot();
+        assert_eq!(snapshot.schema_version, "fsqlite.mvcc.conflict_heat.v1");
+        assert_eq!(snapshot.observations_total, 1);
+        assert_eq!(snapshot.max_writer_overlap_estimate, 2);
+        assert_eq!(snapshot.max_conflict_heat, 3);
+        assert_eq!(snapshot.overlap_edges.len(), 3);
+
+        let hot_page = snapshot
+            .top_pages
+            .iter()
+            .find(|page| page.page_no == 20)
+            .expect("page 20 should be the incoming overlap hotspot");
+        assert_eq!(hot_page.conflict_heat, 2);
+        assert_eq!(hot_page.writer_overlap_estimate, 2);
+
+        let outgoing_page = snapshot
+            .top_pages
+            .iter()
+            .find(|page| page.page_no == 10)
+            .expect("page 10 should record the outgoing overlap");
+        assert_eq!(outgoing_page.conflict_heat, 1);
+
+        let split_advice =
+            fsqlite_btree::conflict_topology_split_advice(test_page(20), "right_edge", 6_500);
+        assert!(split_advice.topology_hot);
+        assert!(split_advice.applied);
+        assert_eq!(split_advice.effective_target_left_basis_points, 8_000);
+        assert_eq!(split_advice.split_reason(), "mvcc_conflict_heat_hot_page");
     }
 
     #[test]

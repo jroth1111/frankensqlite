@@ -275,6 +275,108 @@ pub const COMBINER_CONTRACTS: [CombinerContract; 2] = [
     },
 ];
 
+/// Candidate primitive considered for the bd-db300.5.2.3 residual serialized
+/// entry region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidualFastPathCandidate {
+    /// Hardware transaction around the combiner body, with lock fallback.
+    HardwareTransaction,
+    /// Per-socket or per-cohort reservation blocks reconciled into a total
+    /// commit order.
+    CohortReservation,
+    /// The existing lock-backed combiner path.
+    LockFallback,
+}
+
+impl ResidualFastPathCandidate {
+    /// Stable symbolic identifier for the evaluation table.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HardwareTransaction => "hardware_transaction",
+            Self::CohortReservation => "cohort_reservation",
+            Self::LockFallback => "lock_fallback",
+        }
+    }
+}
+
+/// Decision made by bd-db300.5.2.3 for one residual fast-path candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidualFastPathDecision {
+    /// Keep the design hook, but do not enable without real abort telemetry and
+    /// tail-latency evidence.
+    DeferUntilAbortTelemetry,
+    /// Do not use this primitive until an ordering proof removes the risk.
+    RejectUntilOrderingProof,
+    /// Keep this path as the mandatory always-correct execution route.
+    RetainMandatoryFallback,
+}
+
+impl ResidualFastPathDecision {
+    /// Stable symbolic identifier for diagnostics and docs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeferUntilAbortTelemetry => "defer_until_abort_telemetry",
+            Self::RejectUntilOrderingProof => "reject_until_ordering_proof",
+            Self::RetainMandatoryFallback => "retain_mandatory_fallback",
+        }
+    }
+}
+
+/// Evaluation record for the residual E2.3 fast-path candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidualFastPathEvaluation {
+    pub candidate: ResidualFastPathCandidate,
+    pub decision: ResidualFastPathDecision,
+    pub serialized_region: &'static str,
+    pub abort_evidence: &'static str,
+    pub fallback_evidence: &'static str,
+    pub tail_evidence: &'static str,
+    pub mandatory_fallback: bool,
+    pub entrypoint: &'static str,
+    pub design_doc: &'static str,
+}
+
+/// bd-db300.5.2.3 evaluation matrix. This is deliberately descriptive rather
+/// than operative: it records the recommendation while preserving the existing
+/// lock path as the only active behavior.
+pub const DB300_E2_3_RESIDUAL_FAST_PATH_EVALUATION: [ResidualFastPathEvaluation; 3] = [
+    ResidualFastPathEvaluation {
+        candidate: ResidualFastPathCandidate::HardwareTransaction,
+        decision: ResidualFastPathDecision::DeferUntilAbortTelemetry,
+        serialized_region: "CommitSequenceCombiner::combine_locked plus flat combiner batch body",
+        abort_evidence: "probe_current_platform_stub reports unavailable; no runtime abort stream is enabled",
+        fallback_evidence: "FallbackReason::ProbeMarkedUnavailable routes to the existing combiner lock",
+        tail_evidence: "must compare wait_ns_max and benchmark p95/p99 before any attempt state can become available",
+        mandatory_fallback: true,
+        entrypoint: "commit_combiner.rs::CommitCombineHandle::alloc",
+        design_doc: "crates/fsqlite-mvcc/HTM_GUARD_DESIGN.md#14-bd-db300523-evaluation",
+    },
+    ResidualFastPathEvaluation {
+        candidate: ResidualFastPathCandidate::CohortReservation,
+        decision: ResidualFastPathDecision::RejectUntilOrderingProof,
+        serialized_region: "global commit-sequence allocation and active-registry publication",
+        abort_evidence: "not applicable: cohort reservations do not provide abort telemetry",
+        fallback_evidence: "existing single total-order combiner remains the fallback and authority",
+        tail_evidence: "only reconsider if commit-combine wait tail dominates after fused entry and publication work",
+        mandatory_fallback: true,
+        entrypoint: "commit_combiner.rs::CommitSequenceCombiner::alloc_one_shot",
+        design_doc: "crates/fsqlite-mvcc/HTM_GUARD_DESIGN.md#14-bd-db300523-evaluation",
+    },
+    ResidualFastPathEvaluation {
+        candidate: ResidualFastPathCandidate::LockFallback,
+        decision: ResidualFastPathDecision::RetainMandatoryFallback,
+        serialized_region: "existing combiner_lock-protected batch publication",
+        abort_evidence: "not applicable: no speculative region",
+        fallback_evidence: "mandatory fallback path for every unavailable, disabled, aborted, or rejected fast path",
+        tail_evidence: "current metrics expose wait_ns_total and wait_ns_max for scoped tail checks",
+        mandatory_fallback: true,
+        entrypoint: "flat_combining.rs::FlatCombiner::combine_locked",
+        design_doc: "crates/fsqlite-mvcc/HTM_GUARD_DESIGN.md#14-bd-db300523-evaluation",
+    },
+];
+
 /// Lookup helper for the static combiner contracts.
 #[must_use]
 pub const fn contract_for(site: CombinerSite) -> CombinerContract {
@@ -287,8 +389,10 @@ pub const fn contract_for(site: CombinerSite) -> CombinerContract {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttemptDisposition, COMBINER_CONTRACTS, CombinerSite, DEFAULT_RETRY_POLICY, FallbackReason,
-        FastPathState, ProbeReason, contract_for, probe_current_platform_stub,
+        AttemptDisposition, COMBINER_CONTRACTS, CombinerSite,
+        DB300_E2_3_RESIDUAL_FAST_PATH_EVALUATION, DEFAULT_RETRY_POLICY, FallbackReason,
+        FastPathState, ProbeReason, ResidualFastPathCandidate, ResidualFastPathDecision,
+        contract_for, probe_current_platform_stub,
     };
 
     #[test]
@@ -350,5 +454,57 @@ mod tests {
             FastPathState::Disabled.disposition(),
             AttemptDisposition::FallBackToLock(FallbackReason::DynamicDisableActive)
         );
+    }
+
+    #[test]
+    fn test_e2_3_evaluation_keeps_fallback_mandatory() {
+        for evaluation in DB300_E2_3_RESIDUAL_FAST_PATH_EVALUATION {
+            assert!(evaluation.mandatory_fallback);
+            assert!(
+                evaluation.fallback_evidence.contains("fallback")
+                    || evaluation.fallback_evidence.contains("Fallback")
+                    || evaluation.fallback_evidence.contains("authority")
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2_3_htm_is_deferred_until_abort_telemetry_exists() {
+        let htm = DB300_E2_3_RESIDUAL_FAST_PATH_EVALUATION
+            .iter()
+            .find(|evaluation| {
+                evaluation.candidate == ResidualFastPathCandidate::HardwareTransaction
+            })
+            .copied();
+
+        assert_eq!(
+            htm.map(|evaluation| evaluation.decision),
+            Some(ResidualFastPathDecision::DeferUntilAbortTelemetry)
+        );
+        assert_eq!(
+            probe_current_platform_stub().state,
+            FastPathState::Unavailable
+        );
+        assert_eq!(
+            FastPathState::Unavailable.disposition(),
+            AttemptDisposition::FallBackToLock(FallbackReason::ProbeMarkedUnavailable)
+        );
+    }
+
+    #[test]
+    fn test_e2_3_cohort_path_is_rejected_until_ordering_proof_exists() {
+        let cohort = DB300_E2_3_RESIDUAL_FAST_PATH_EVALUATION
+            .iter()
+            .find(|evaluation| evaluation.candidate == ResidualFastPathCandidate::CohortReservation)
+            .copied();
+
+        assert_eq!(
+            cohort.map(|evaluation| evaluation.decision),
+            Some(ResidualFastPathDecision::RejectUntilOrderingProof)
+        );
+        assert!(cohort.is_some_and(|evaluation| {
+            evaluation.serialized_region.contains("commit-sequence")
+                && evaluation.fallback_evidence.contains("total-order")
+        }));
     }
 }

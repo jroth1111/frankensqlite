@@ -426,3 +426,45 @@ Implementation: read the existing global atomics + guard state. No new storage.
 - Phase 4 (calibration): EWMA parameters need tuning against real workloads.
   Wrong alpha/threshold → disable too eagerly (no benefit) or too slowly
   (brief perf dip). Safe fallback in both cases.
+
+---
+
+## 14. bd-db300.5.2.3 Evaluation
+
+E2.3 asks whether the residual serialized region after the fused prepared-DML
+entry work is small enough to justify an optional HTM or cohort fast path. The
+answer for this slice is deliberately conservative: keep the HTM design hook,
+reject cohort reservation for now, and retain the current lock-backed combiner
+as the mandatory authority.
+
+This is an evaluation, not an enablement change. No runtime state may transition
+to `AVAILABLE` until there is a real platform probe, abort-rate telemetry, and
+tail-latency evidence from the target workload. The current stub probe returns
+`UNAVAILABLE`, so every call site must route to the existing lock path.
+
+| Candidate | Decision | Abort evidence | Fallback evidence | Tail evidence required |
+|-----------|----------|----------------|-------------------|------------------------|
+| HTM around `combine_locked()` | Defer | No real abort stream exists; `probe_current_platform_stub()` reports unavailable. | `FallbackReason::ProbeMarkedUnavailable` keeps the existing combiner lock authoritative. | Compare `wait_ns_max` plus workload p95/p99 before permitting `AVAILABLE`. |
+| Cohort reservation blocks | Reject until ordering proof | Not applicable; reservations do not abort and therefore cannot self-disable. | Existing single total-order combiner remains the fallback and publication authority. | Reconsider only if commit-combine wait tail dominates after E2.2 and E3 publication work. |
+| Lock fallback | Retain | Not applicable; no speculative region. | Mandatory path for unavailable, disabled, aborted, or rejected fast paths. | Existing metrics expose wait totals/maxima for scoped tail checks. |
+
+Why cohort reservation is not selected here: commit sequence allocation is not
+just an ID counter. `CommitSequenceCombiner::combine_locked()` can batch-register
+newly allocated commit sequences into the active registry before signaling
+waiters. A per-cohort reservation scheme would need a reconciliation proof that
+preserves total commit order and does not create an allocated-but-unregistered
+gap. That proof is larger than E2.3 and would be riskier than the residual
+serialized region this bead is trying to optimize.
+
+Why HTM remains a design hook: the hot body is bounded and small enough to be a
+candidate, but correctness depends on the exact fallback discipline in this
+document. Any future HTM implementation must satisfy all of these conditions:
+
+1. The lock path remains compiled, tested, and reachable on every platform.
+2. Abort counters are updated outside the hardware transaction boundary.
+3. Dynamic disable routes sustained abort storms back to the lock path.
+4. Benchmark evidence reports p50, p95, and p99, not only throughput.
+5. `concurrent_mode_default` and all concurrent-writer defaults remain enabled.
+
+The machine-readable record for this decision lives in
+`DB300_E2_3_RESIDUAL_FAST_PATH_EVALUATION` in `src/htm_fast_path.rs`.

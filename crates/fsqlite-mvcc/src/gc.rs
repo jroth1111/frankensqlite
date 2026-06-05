@@ -485,6 +485,8 @@ mod tests {
     use std::sync::Arc;
 
     const BEAD_ZCDN: &str = "bd-zcdn";
+    const BEAD_E77H7_1: &str = "bd-e77h7.1";
+    const BEAD_JIHF9: &str = "bd-jihf9";
 
     /// Helper: build a `PageVersion` with the given commit_seq and prev pointer.
     fn make_version(pgno: PageNumber, seq: u64, prev: Option<VersionIdx>) -> PageVersion {
@@ -946,6 +948,100 @@ mod tests {
     }
 
     #[test]
+    fn test_gc_tick_idempotent_under_duplicate_todo_pressure() {
+        // bead_id=bd-e77h7.1: repeated pruning at the same horizon must be a no-op
+        // after the first pass, even when callers enqueue duplicate touched pages.
+        let mut arena = VersionArena::new();
+        let chain_heads = ChainHeadTable::new();
+        let mut todo = GcTodo::new();
+        let pages: Vec<_> = (1_u32..=8)
+            .map(|raw| PageNumber::new(raw).expect("test page number should be valid"))
+            .collect();
+
+        for &pgno in &pages {
+            build_chain_in_table(&mut arena, &chain_heads, pgno, 12);
+        }
+
+        let duplicate_pressure = [8_u32, 1, 8, 3, 5, 3, 2, 7, 6, 4, 1];
+        for raw in duplicate_pressure {
+            todo.enqueue(PageNumber::new(raw).expect("test page number should be valid"));
+        }
+        assert_eq!(
+            todo.len(),
+            pages.len(),
+            "bead_id={BEAD_E77H7_1}: todo queue should suppress duplicate page enqueues"
+        );
+
+        let horizon = CommitSeq::new(7);
+        let first = gc_tick(&mut todo, horizon, &mut arena, &chain_heads);
+        assert_eq!(
+            first.pages_pruned, 8,
+            "bead_id={BEAD_E77H7_1}: first pass should process each distinct page once"
+        );
+        assert_eq!(
+            first.versions_freed, 48,
+            "bead_id={BEAD_E77H7_1}: first pass should prune seq 1..6 from each page"
+        );
+        assert_eq!(first.queue_remaining, 0);
+        assert!(!first.pages_budget_exhausted);
+        assert!(!first.versions_budget_exhausted);
+
+        let pruned_pages: HashSet<u32> = first
+            .pruned_keys
+            .iter()
+            .map(|(pgno, _)| pgno.get())
+            .collect();
+        assert_eq!(
+            pruned_pages.len(),
+            pages.len(),
+            "bead_id={BEAD_E77H7_1}: pruned key diagnostics should cover every touched page"
+        );
+
+        let expected_retained = vec![12, 11, 10, 9, 8, 7];
+        for &pgno in &pages {
+            assert_eq!(
+                collect_chain_commit_seqs(pgno, &arena, &chain_heads),
+                expected_retained,
+                "bead_id={BEAD_E77H7_1}: retained suffix should stay linked for page {}",
+                pgno.get()
+            );
+        }
+
+        for raw in duplicate_pressure.into_iter().rev() {
+            todo.enqueue(PageNumber::new(raw).expect("test page number should be valid"));
+        }
+        assert_eq!(
+            todo.len(),
+            pages.len(),
+            "bead_id={BEAD_E77H7_1}: second todo fill should still deduplicate pages"
+        );
+
+        let second = gc_tick(&mut todo, horizon, &mut arena, &chain_heads);
+        assert_eq!(
+            second.pages_pruned, 8,
+            "bead_id={BEAD_E77H7_1}: second pass should visit the distinct touched pages"
+        );
+        assert_eq!(
+            second.versions_freed, 0,
+            "bead_id={BEAD_E77H7_1}: second pass at same horizon must not double-retire versions"
+        );
+        assert!(
+            second.pruned_keys.is_empty(),
+            "bead_id={BEAD_E77H7_1}: idempotent pass should publish no stale eviction keys"
+        );
+        assert_eq!(second.queue_remaining, 0);
+
+        for &pgno in &pages {
+            assert_eq!(
+                collect_chain_commit_seqs(pgno, &arena, &chain_heads),
+                expected_retained,
+                "bead_id={BEAD_E77H7_1}: idempotent pass must not mutate retained suffix for page {}",
+                pgno.get()
+            );
+        }
+    }
+
+    #[test]
     fn test_gc_tick_respects_pages_budget() {
         // bead_id=bd-zcdn: GC scheduling avoids starvation — budget enforcement.
         let mut arena = VersionArena::new();
@@ -1012,6 +1108,96 @@ mod tests {
             result.versions_budget_exhausted,
             "bead_id={BEAD_ZCDN} versions budget should be exhausted"
         );
+    }
+
+    #[test]
+    fn test_gc_tick_versions_budget_preserves_remaining_queue() {
+        // bead_id=bd-jihf9: a tick that exhausts the version budget must leave
+        // unprocessed pages queued so the next bounded pass can drain them.
+        let mut arena = VersionArena::new();
+        let chain_heads = ChainHeadTable::new();
+        let mut todo = GcTodo::new();
+
+        for i in 1..=8 {
+            let pgno = PageNumber::new(i).unwrap();
+            build_chain_in_table(&mut arena, &chain_heads, pgno, 1025);
+            todo.enqueue(pgno);
+        }
+
+        let horizon = CommitSeq::new(1024);
+        let first = gc_tick(&mut todo, horizon, &mut arena, &chain_heads);
+
+        let versions_per_page_freed = 1023_u32;
+        let first_pages_pruned = 5_u32;
+        assert_eq!(
+            first.pages_pruned, first_pages_pruned,
+            "bead_id={BEAD_JIHF9}: first pass should stop once version budget saturates"
+        );
+        assert_eq!(
+            first.versions_freed,
+            first_pages_pruned * versions_per_page_freed,
+            "bead_id={BEAD_JIHF9}: first pass should prune full processed pages"
+        );
+        assert_eq!(
+            first.queue_remaining, 3,
+            "bead_id={BEAD_JIHF9}: unprocessed pages must remain queued"
+        );
+        assert!(first.versions_budget_exhausted);
+        assert!(!first.pages_budget_exhausted);
+
+        let first_pages: HashSet<u32> = first
+            .pruned_keys
+            .iter()
+            .map(|(pgno, _)| pgno.get())
+            .collect();
+        assert_eq!(
+            first_pages,
+            HashSet::from([1, 2, 3, 4, 5]),
+            "bead_id={BEAD_JIHF9}: first pass should prune the FIFO prefix"
+        );
+
+        assert_eq!(
+            collect_chain_commit_seqs(PageNumber::new(6).unwrap(), &arena, &chain_heads).len(),
+            1025,
+            "bead_id={BEAD_JIHF9}: queued suffix page must remain untouched after first pass"
+        );
+
+        let second = gc_tick(&mut todo, horizon, &mut arena, &chain_heads);
+
+        assert_eq!(
+            second.pages_pruned, 3,
+            "bead_id={BEAD_JIHF9}: second pass should drain the queued suffix"
+        );
+        assert_eq!(
+            second.versions_freed,
+            3 * versions_per_page_freed,
+            "bead_id={BEAD_JIHF9}: second pass should prune every remaining page"
+        );
+        assert_eq!(second.queue_remaining, 0);
+        assert!(!second.versions_budget_exhausted);
+        assert!(!second.pages_budget_exhausted);
+
+        let second_pages: HashSet<u32> = second
+            .pruned_keys
+            .iter()
+            .map(|(pgno, _)| pgno.get())
+            .collect();
+        assert_eq!(
+            second_pages,
+            HashSet::from([6, 7, 8]),
+            "bead_id={BEAD_JIHF9}: second pass should resume at the preserved FIFO suffix"
+        );
+
+        let expected_retained = vec![1025, 1024];
+        for raw_pgno in 1..=8 {
+            let pgno = PageNumber::new(raw_pgno).unwrap();
+            assert_eq!(
+                collect_chain_commit_seqs(pgno, &arena, &chain_heads),
+                expected_retained,
+                "bead_id={BEAD_JIHF9}: page {} should retain only horizon-visible suffix",
+                pgno.get()
+            );
+        }
     }
 
     #[test]
