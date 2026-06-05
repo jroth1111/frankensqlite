@@ -30,6 +30,61 @@ This crate sits at the top of the fsqlite workspace dependency graph for testing
 - `bloodstream` / `impact_graph` / `closure_wave` - Dependency and impact analysis
 - `benchmark_corpus` / `perf_loop` - Performance benchmarking infrastructure
 
+## Reusable Primitives for Swarm / E2E Consumers
+
+Downstream crates (`fsqlite-e2e`, future `tests/swarm/`) should import these
+primitives rather than reinventing them.
+
+### Fixture & Corpus Management
+
+| Module | Key Types | Use For |
+|--------|-----------|---------|
+| `fixture_discovery` | `DiscoveryConfig`, `Candidate` | Locating SQLite files with safe bounded traversal |
+| `fixture_root_contract` | `FixtureRootContract` | Enforcing fixture/SLT root cardinality contracts |
+| `unit_fixtures` | `FixtureSeed`, `FixtureCatalog` | Deterministic seed derivation (`xxh3_64` with domain tags) |
+| `oracle` | `TestFixture`, `FixtureResult` | Reference oracle fixture and result types |
+| `corpus_ingest` | `CorpusEntry`, `CorpusManifest`, `Family` | Corpus taxonomy (8 families) and content-hash IDs |
+
+### Structured Logging & Schema Validation
+
+| Module | Key Types | Use For |
+|--------|-----------|---------|
+| `e2e_log_schema` | `LogEventSchema`, `LogPhase`, `LogEventType` | Unified event schema (v1.0.0) with forward compatibility |
+| `log_schema_validator` | `validate_event_stream()`, `redact_event()` | Batch JSONL validation and deterministic redaction |
+| `log` | `HarnessEvent`, `ReproBundle`, `BundleMeta` | Lifecycle events and reproducibility bundles |
+| `e2e_logging_init` | `RunContext`, `E2eLoggingConfig` | Per-run correlation context and output format presets |
+
+### Cross-Process & Crash Testing
+
+| Module | Key Types | Use For |
+|--------|-----------|---------|
+| `cross_process_crash_harness` | `ProcessRole`, `CrashPoint`, `StructuredCrashEvent` | 4-role × 5-crash-point deterministic crash matrix |
+| `eprocess` | `MvccInvariant` (INV-1..INV-7) | E-process calibration for MVCC invariant monitoring |
+| `e2e_orchestrator` | `ExecutionManifest`, `ManifestEntry`, `RetryPolicy` | Script scheduling with phase ordering and retry |
+
+### Concurrent Writer Verification
+
+| Module | Key Types | Use For |
+|--------|-----------|---------|
+| `concurrent_writer_parity` | `ConcurrentInvariantArea`, `ConcurrentWriterParityReport` | 10-area parity assessment (5 critical) |
+| `soak_profiles` | `ContentionMix`, `SoakProfile`, `SoakWorkloadSpec` | Long-run workload profiles with reader/writer mix |
+
+### Seed Management
+
+| Module | Key Types | Use For |
+|--------|-----------|---------|
+| `seed_taxonomy` | `SeedTaxonomy` | 4-purpose seed derivation (schedule, entropy, fault, fuzz) |
+| `unit_fixtures` | `FixtureSeed` | Domain-tagged seed derivation with child seeds |
+
+### Complementary Types in fsqlite-e2e (not duplicated here)
+
+These types live in `fsqlite-e2e` and serve different purposes:
+
+- `OperationMix` — DML operation weights (insert/update/delete/select), vs `ContentionMix` which is thread-role distribution
+- `FixtureMetadataV1` / `FixtureSafetyV1` — PRAGMA-extracted metadata and CI safety classification
+- `TraceContext` / `OpEvent` — per-operation structured tracing (bd-zywqc.1), vs `LogEventSchema` which is test-lifecycle events
+- `FRANKEN_SEED` / `derive_worker_seed` — same base seed as `CORPUS_SEED_BASE`, different derivation API
+
 ## Dependencies (runtime)
 
 - `fsqlite`, `fsqlite-error`, `fsqlite-types`, `fsqlite-vfs`

@@ -1,11 +1,14 @@
 //! Track G certification-policy integration tests (bd-2yqp6.7).
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use fsqlite_harness::adversarial_search::CampaignResult;
 use fsqlite_harness::certification_policy::{
     CERTIFICATION_MAX_EVIDENCE_AGE_HOURS, CERTIFICATION_MIN_VERIFICATION_PCT,
-    CERTIFICATION_POLICY_ID, REQUIRED_CERTIFICATION_LANES, canonical_certification_policy,
+    CERTIFICATION_POLICY_ID, CERTIFICATION_POLICY_SCHEMA_VERSION, CertificationRatchetBaseline,
+    CertificationRatchetCandidate, REQUIRED_CERTIFICATION_LANES, canonical_certification_policy,
+    evaluate_certification_ratchets,
 };
 use fsqlite_harness::ci_gate_matrix::{ArtifactEntry, ArtifactKind, ArtifactManifest};
 use fsqlite_harness::confidence_gates::{GateDecision, build_evidence_ledger, evaluate_full};
@@ -175,6 +178,102 @@ fn canonical_policy_matches_track_g_requirements() {
             lane.as_str(),
         );
     }
+}
+
+#[test]
+fn canonical_policy_exposes_explicit_blocking_gate_and_ratchet_dimensions() {
+    let policy = canonical_certification_policy();
+
+    let gate_ids: BTreeSet<_> = policy
+        .gates
+        .iter()
+        .map(|gate| gate.gate_id.as_str())
+        .collect();
+    for required_gate in [
+        "declared_surface_parity",
+        "verification_contract",
+        "release_evidence_completeness",
+        "critical_path_evidence",
+    ] {
+        assert!(
+            gate_ids.contains(required_gate),
+            "bead_id={BEAD_ID} case=missing_gate gate={required_gate}",
+        );
+    }
+
+    for lane in REQUIRED_CERTIFICATION_LANES {
+        let gate_id = format!("required_suite_pass::{}", lane.as_str());
+        assert!(
+            gate_ids.contains(gate_id.as_str()),
+            "bead_id={BEAD_ID} case=missing_required_suite_gate gate={gate_id}",
+        );
+    }
+
+    assert!(
+        policy.gates.iter().all(|gate| gate.blocking),
+        "bead_id={BEAD_ID} case=non_blocking_gate_present",
+    );
+
+    let ratchet_ids: BTreeSet<_> = policy
+        .ratchets
+        .iter()
+        .map(|ratchet| ratchet.ratchet_id.as_str())
+        .collect();
+    let expected_ratchets = BTreeSet::from([
+        "global_lower_bound",
+        "category_lower_bounds",
+        "required_suite_pass_rate",
+        "traceability_link_coverage",
+        "artifact_hash_integrity",
+    ]);
+    assert_eq!(
+        ratchet_ids, expected_ratchets,
+        "bead_id={BEAD_ID} case=ratchet_dimension_drift",
+    );
+    assert!(
+        policy.ratchets.iter().all(|ratchet| ratchet.blocking),
+        "bead_id={BEAD_ID} case=non_blocking_ratchet_present",
+    );
+}
+
+#[test]
+fn certification_ratchet_blocks_required_suite_pass_rate_backslide() {
+    let baseline = CertificationRatchetBaseline {
+        schema_version: CERTIFICATION_POLICY_SCHEMA_VERSION,
+        policy_id: CERTIFICATION_POLICY_ID.to_owned(),
+        global_lower_bound: 1.0,
+        category_lower_bounds: BTreeMap::from([
+            ("Core SQL".to_owned(), 1.0),
+            ("Transactions".to_owned(), 1.0),
+        ]),
+        required_suite_pass_rate_pct: 100.0,
+        traceability_link_coverage_pct: 100.0,
+    };
+    let candidate = CertificationRatchetCandidate {
+        global_lower_bound: 1.0,
+        category_lower_bounds: BTreeMap::from([
+            ("Core SQL".to_owned(), 1.0),
+            ("Transactions".to_owned(), 1.0),
+        ]),
+        required_suite_pass_rate_pct: 83.333_333,
+        traceability_link_coverage_pct: 100.0,
+    };
+
+    let evaluation = evaluate_certification_ratchets(&baseline, &candidate);
+    assert!(
+        !evaluation.passed,
+        "bead_id={BEAD_ID} case=synthetic_suite_backslide_must_block evaluation={evaluation:?}",
+    );
+    assert_eq!(
+        evaluation.regressed_ratchets,
+        vec!["required_suite_pass_rate".to_owned()],
+        "bead_id={BEAD_ID} case=expected_single_suite_regression evaluation={evaluation:?}",
+    );
+    assert!(
+        evaluation.summary.contains("required_suite_pass_rate"),
+        "bead_id={BEAD_ID} case=regression_summary_must_name_backslide summary={}",
+        evaluation.summary,
+    );
 }
 
 #[test]

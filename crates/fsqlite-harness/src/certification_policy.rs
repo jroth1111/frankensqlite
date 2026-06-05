@@ -5,6 +5,8 @@
 //! is intentionally strict: release certification requires complete declared
 //! surface verification, zero missing required evidence, and monotone ratchets.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::ci_gate_matrix::CiLane;
@@ -83,6 +85,47 @@ pub struct CertificationRatchetSpec {
     pub pass_condition: String,
 }
 
+/// Persisted Track G baseline used to block certification backslides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertificationRatchetBaseline {
+    /// Schema version for the baseline artifact.
+    pub schema_version: u32,
+    /// Owning certification policy identifier.
+    pub policy_id: String,
+    /// Approved global parity lower bound.
+    pub global_lower_bound: f64,
+    /// Approved per-category lower bounds.
+    pub category_lower_bounds: BTreeMap<String, f64>,
+    /// Approved required-suite pass rate percentage.
+    pub required_suite_pass_rate_pct: f64,
+    /// Approved feature->test->run->artifact traceability coverage percentage.
+    pub traceability_link_coverage_pct: f64,
+}
+
+/// Current certification metrics evaluated against an approved baseline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertificationRatchetCandidate {
+    /// Current global parity lower bound.
+    pub global_lower_bound: f64,
+    /// Current per-category lower bounds.
+    pub category_lower_bounds: BTreeMap<String, f64>,
+    /// Current required-suite pass rate percentage.
+    pub required_suite_pass_rate_pct: f64,
+    /// Current feature->test->run->artifact traceability coverage percentage.
+    pub traceability_link_coverage_pct: f64,
+}
+
+/// Outcome of Track G certification ratchet evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertificationRatchetEvaluation {
+    /// Whether all blocking ratchets passed.
+    pub passed: bool,
+    /// Ratchet IDs that regressed below the approved baseline.
+    pub regressed_ratchets: Vec<String>,
+    /// Human-readable summary for CI and artifact logs.
+    pub summary: String,
+}
+
 /// Canonical Track G certification policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertificationPolicy {
@@ -138,6 +181,56 @@ pub fn certification_gate_config() -> GateConfig {
 #[must_use]
 pub fn certification_ratchet_policy() -> RatchetPolicy {
     RatchetPolicy::strict()
+}
+
+/// Evaluate current certification metrics against an approved Track G baseline.
+#[must_use]
+pub fn evaluate_certification_ratchets(
+    baseline: &CertificationRatchetBaseline,
+    candidate: &CertificationRatchetCandidate,
+) -> CertificationRatchetEvaluation {
+    let mut regressed_ratchets = Vec::new();
+
+    if candidate.global_lower_bound < baseline.global_lower_bound {
+        regressed_ratchets.push("global_lower_bound".to_owned());
+    }
+
+    if baseline
+        .category_lower_bounds
+        .iter()
+        .any(|(category, approved)| {
+            candidate
+                .category_lower_bounds
+                .get(category)
+                .is_none_or(|current| current < approved)
+        })
+    {
+        regressed_ratchets.push("category_lower_bounds".to_owned());
+    }
+
+    if candidate.required_suite_pass_rate_pct < baseline.required_suite_pass_rate_pct {
+        regressed_ratchets.push("required_suite_pass_rate".to_owned());
+    }
+
+    if candidate.traceability_link_coverage_pct < baseline.traceability_link_coverage_pct {
+        regressed_ratchets.push("traceability_link_coverage".to_owned());
+    }
+
+    let passed = regressed_ratchets.is_empty();
+    let summary = if passed {
+        "certification baseline preserved".to_owned()
+    } else {
+        format!(
+            "certification baseline regressed: {}",
+            regressed_ratchets.join(", ")
+        )
+    };
+
+    CertificationRatchetEvaluation {
+        passed,
+        regressed_ratchets,
+        summary,
+    }
 }
 
 /// Build the canonical Track G certification policy.

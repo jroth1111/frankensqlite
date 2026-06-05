@@ -35,6 +35,7 @@ pub mod extension_parity_matrix;
 pub mod failure_bundle;
 pub mod fault_profiles;
 pub mod fault_vfs;
+pub mod feature_coverage_dashboard;
 pub mod fixture_discovery;
 pub mod fixture_root_contract;
 pub mod forensics_navigator;
