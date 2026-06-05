@@ -16,6 +16,7 @@ fsqlite-parser = { path = "../crates/fsqlite-parser" }
 fsqlite-types = { path = "../crates/fsqlite-types" }
 fsqlite-ast = { path = "../crates/fsqlite-ast" }
 fsqlite-error = { path = "../crates/fsqlite-error" }
+fsqlite-mvcc = { path = "../crates/fsqlite-mvcc" }
 
 [[bin]]
 name = "fuzz_sql_parser"
@@ -35,4 +36,9 @@ doc = false
 [[bin]]
 name = "fuzz_expr_parser"
 path = "fuzz_targets/fuzz_expr_parser.rs"
+doc = false
+
+[[bin]]
+name = "xor_merge_guard"
+path = "fuzz_targets/xor_merge_guard.rs"
 doc = false
