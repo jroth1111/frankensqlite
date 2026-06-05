@@ -1,0 +1,5 @@
+# Intentionally empty.
+#
+# Do not force `RUST_TEST_THREADS` here: explicit serial runs still expose
+# order-dependent failures, so a repo-wide cargo default would mask symptoms
+# without fixing the shared-state leaks.

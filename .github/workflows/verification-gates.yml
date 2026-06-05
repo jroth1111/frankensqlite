@@ -12,21 +12,27 @@ on:
       - "conformance/backlog_quality_gate_baseline.json"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "corpus_manifest.toml"
+      - "docs/contracts/corpus_manifest.toml"
       - "crates/fsqlite-core/**"
       - "crates/fsqlite-planner/**"
       - "crates/fsqlite-harness/src/backlog_quality_gate.rs"
       - "crates/fsqlite-harness/src/bin/backlog_quality_gate_runner.rs"
       - "crates/fsqlite-harness/src/bin/differential_manifest_runner.rs"
       - "crates/fsqlite-harness/src/bin/durability_matrix_manifest.rs"
+      - "crates/fsqlite-harness/src/bin/feature_coverage_dashboard.rs"
       - "crates/fsqlite-harness/src/bin/oracle_preflight_doctor_runner.rs"
       - "crates/fsqlite-harness/src/bin/perf_baseline_pack_runner.rs"
       - "crates/fsqlite-harness/src/bin/validation_manifest_runner.rs"
       - "crates/fsqlite-harness/src/durability_matrix.rs"
       - "crates/fsqlite-harness/src/differential_runner.rs"
+      - "crates/fsqlite-harness/src/feature_coverage_dashboard.rs"
+      - "crates/fsqlite-harness/src/lib.rs"
       - "crates/fsqlite-harness/src/oracle_preflight_doctor.rs"
       - "crates/fsqlite-harness/src/perf_loop.rs"
       - "crates/fsqlite-harness/src/performance_regression_detector.rs"
       - "crates/fsqlite-harness/src/validation_manifest.rs"
+      - "crates/fsqlite-harness/tests/bd_2yqp6_3_3_feature_coverage_dashboard.rs"
       - "crates/fsqlite-harness/tests/bd_2yqp6_2_5_oracle_preflight_doctor.rs"
       - "crates/fsqlite-harness/tests/bd_mblr_7_4_durability_matrix.rs"
       - "crates/fsqlite-e2e/src/benchmark.rs"
@@ -37,6 +43,7 @@ on:
       - "crates/fsqlite-vdbe/**"
       - "scripts/hot-profile.sh"
       - "scripts/verify_backlog_quality_gate.sh"
+      - "scripts/verify_bd_2yqp6_3_3_feature_coverage_dashboard.sh"
       - "scripts/verify_bd_2yqp6_2_5_oracle_preflight_doctor.sh"
       - "scripts/verify_ci_artifact_gates.sh"
       - "scripts/verify_differential_ci_lane.sh"
@@ -258,6 +265,57 @@ jobs:
         with:
           name: durability-matrix-artifacts
           path: artifacts/durability-matrix/
+          retention-days: 21
+
+  feature-coverage-dashboard-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Run feature coverage dashboard gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ./scripts/verify_bd_2yqp6_3_3_feature_coverage_dashboard.sh
+
+      - name: Publish feature coverage dashboard summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_path="artifacts/bd-2yqp6.3.3/bd-2yqp6.3.3-3520/feature_coverage_dashboard.json"
+          if [[ -f "${report_path}" ]]; then
+            echo "### Feature Coverage Dashboard Gate" >> "${GITHUB_STEP_SUMMARY}"
+            jq -r '
+              "- release_gate: \(.release_gate.outcome)",
+              "- required_feature_count: \(.required_feature_count)",
+              "- missing_feature_count: \(.release_gate.missing_feature_count)",
+              "- partial_feature_count: \(.release_gate.partial_feature_count)",
+              "- trace_id: `\(.trace_id)`",
+              "- run_id: `\(.run_id)`",
+              "- source_manifest_path: `\(.source_manifest_path)`",
+              "- coverage_signature_sha256: `\(.coverage_signature_sha256)`"
+            ' "${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Feature coverage dashboard report missing at ${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload feature coverage dashboard artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-coverage-dashboard-artifacts
+          path: artifacts/bd-2yqp6.3.3/
           retention-days: 21
 
   param-binding-regression-guard:
@@ -680,6 +738,15 @@ jobs:
           cargo run -p fsqlite-e2e --bin e2e-runner -- \
             --output artifacts/e2e-correctness --json run-correctness \
             2>&1 | tee artifacts/e2e_correctness.json
+
+      - name: Cross-engine integrity check (bd-aiica)
+        if: always()
+        run: |
+          echo "=== Cross-engine integrity check ==="
+          ./scripts/ci_integrity_check.sh target/test-artifacts/concurrent || true
+          if [ -f /tmp/fsqlite-integrity-results/summary.md ]; then
+            cat /tmp/fsqlite-integrity-results/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          fi
 
       - name: Run Phase 1-3 verification gates
         run: |

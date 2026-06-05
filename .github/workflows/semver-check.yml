@@ -1,0 +1,100 @@
+# bd-zywqc.4: Public API stability gate via cargo-semver-checks.
+#
+# Runs cargo semver-checks against main for every PR that touches Rust code.
+# Enforced crates (externally-visible API surface):
+#   fsqlite, fsqlite-core, fsqlite-vfs, fsqlite-vdbe, fsqlite-c-api,
+#   fsqlite-mvcc, fsqlite-wal, fsqlite-pager
+#
+# Exempt crates (internal-only):
+#   fsqlite-harness, fsqlite-observability, fsqlite-e2e, fsqlite-ext-*,
+#   fsqlite-btree (internal data structures), fsqlite-types (re-exported
+#   through fsqlite-core), fsqlite-error, fsqlite-parser
+#
+# Override: include "[breaking]" in the PR title AND add a file at
+# docs/rfc/BREAKING-<slug>.md justifying the break. The job warns but
+# does not fail.
+
+name: semver-check
+
+on:
+  pull_request:
+    paths:
+      - "crates/**/*.rs"
+      - "crates/**/Cargo.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  semver-check:
+    name: API compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks
+
+      - name: Determine if breaking override is set
+        id: breaking
+        run: |
+          TITLE="${{ github.event.pull_request.title }}"
+          if echo "$TITLE" | grep -qi '\[breaking\]'; then
+            echo "override=true" >> "$GITHUB_OUTPUT"
+            if ls docs/rfc/BREAKING-*.md 1>/dev/null 2>&1; then
+              echo "rfc_present=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "rfc_present=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "override=false" >> "$GITHUB_OUTPUT"
+            echo "rfc_present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run semver-checks on enforced crates
+        id: check
+        continue-on-error: ${{ steps.breaking.outputs.override == 'true' }}
+        run: |
+          ENFORCED_CRATES=(
+            fsqlite
+            fsqlite-core
+            fsqlite-vfs
+            fsqlite-vdbe
+            fsqlite-mvcc
+            fsqlite-wal
+            fsqlite-pager
+          )
+          FAILED=0
+          for crate in "${ENFORCED_CRATES[@]}"; do
+            echo "::group::Checking $crate"
+            if ! cargo semver-checks check-release \
+                --package "$crate" \
+                --baseline-rev origin/main 2>&1; then
+              echo "::warning::semver break detected in $crate"
+              FAILED=1
+            fi
+            echo "::endgroup::"
+          done
+          echo "failed=$FAILED" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce result
+        if: steps.check.outputs.failed == '1'
+        run: |
+          if [ "${{ steps.breaking.outputs.override }}" = "true" ]; then
+            echo "::warning::Breaking changes detected but [breaking] override is active."
+            if [ "${{ steps.breaking.outputs.rfc_present }}" = "false" ]; then
+              echo "::error::Missing docs/rfc/BREAKING-*.md RFC document for breaking change."
+              exit 1
+            fi
+            echo "RFC document found. Passing with warning."
+          else
+            echo "::error::Breaking API changes detected. Add [breaking] to PR title and a docs/rfc/BREAKING-<slug>.md file, or fix the API break."
+            exit 1
+          fi

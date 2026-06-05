@@ -1,0 +1,328 @@
+name: Concurrent Tests — Platform Matrix
+
+# bd-zywqc.3: Run concurrency test suite on Linux x86_64, Linux ARM64,
+# macOS arm64, and Windows x86_64 to catch platform-specific failures
+# in fsync semantics, process_alive impl, and shm layout.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/concurrent-platform-matrix.yml"
+      - "crates/fsqlite-e2e/**"
+      - "crates/fsqlite-mvcc/**"
+      - "crates/fsqlite-wal/**"
+      - "crates/fsqlite-pager/**"
+      - "crates/fsqlite-vfs/**"
+      - "crates/fsqlite-core/**"
+      - "crates/fsqlite/**"
+      - "crates/fsqlite-harness/**"
+      - "scripts/ci_integrity_check.sh"
+
+env:
+  RUST_BACKTRACE: "1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  platform-concurrency:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+            runner: ubuntu-latest
+            platform_tag: linux-x86_64
+            shell: bash
+            fs_note: "ext4 (default)"
+            install_sqlite: "sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3"
+            dep_root: /tmp/dp
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            platform_tag: linux-arm64
+            shell: bash
+            fs_note: "ext4 (default)"
+            install_sqlite: "sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3"
+            dep_root: /tmp/dp
+          - os: macos-15
+            arch: arm64
+            runner: macos-15
+            platform_tag: macos-arm64
+            shell: bash
+            fs_note: "APFS"
+            install_sqlite: "true"
+            dep_root: /tmp/dp
+          - os: windows-latest
+            arch: x86_64
+            runner: windows-latest
+            platform_tag: windows-x86_64
+            shell: pwsh
+            fs_note: "NTFS"
+            install_sqlite: "choco install sqlite --yes --no-progress"
+            dep_root: D:\dp
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    name: "${{ matrix.platform_tag }} (${{ matrix.fs_note }})"
+
+    env:
+      PLATFORM_TAG: ${{ matrix.platform_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ matrix.platform_tag }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.platform_tag }}-cargo-
+
+      - name: Install sqlite3 CLI
+        shell: bash
+        run: ${{ matrix.install_sqlite }}
+        if: matrix.os != 'macos-15'
+
+      - name: Verify sqlite3 available
+        shell: bash
+        run: sqlite3 --version
+
+      - name: Bootstrap path dependencies (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $depsRoot = "${{ matrix.dep_root }}"
+          New-Item -ItemType Directory -Path $depsRoot -Force | Out-Null
+
+          if (-not (Test-Path "$depsRoot\asupersync\Cargo.toml")) {
+            git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git "$depsRoot\asupersync"
+          }
+          if (-not (Test-Path "$depsRoot\frankentui\Cargo.toml")) {
+            git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git "$depsRoot\frankentui"
+          }
+
+      - name: Bootstrap path dependencies (Unix)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          DEP_ROOT="${{ matrix.dep_root }}"
+          mkdir -p "$DEP_ROOT"
+
+          if [ ! -f "$DEP_ROOT/asupersync/Cargo.toml" ]; then
+            git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git "$DEP_ROOT/asupersync"
+          fi
+          if [ ! -f "$DEP_ROOT/frankentui/Cargo.toml" ]; then
+            git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git "$DEP_ROOT/frankentui"
+          fi
+
+      - name: Create artifacts directory
+        shell: bash
+        run: mkdir -p artifacts/concurrent-${{ matrix.platform_tag }}
+
+      - name: Build concurrency test crates
+        shell: bash
+        run: |
+          cargo test -p fsqlite-e2e --no-run 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/build.log
+
+      - name: Run concurrent writer tests
+        shell: bash
+        run: |
+          set +e
+          cargo test -p fsqlite-e2e \
+            --test correctness_concurrent_writes \
+            --test mvcc_concurrent_writers \
+            -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/concurrent_writers.log
+          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/concurrent_writers.exit
+
+      - name: Run concurrent mode defaults
+        shell: bash
+        run: |
+          set +e
+          cargo test -p fsqlite-e2e \
+            --test bd_2yqp6_6_5_concurrent_mode_defaults \
+            -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/concurrent_defaults.log
+          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/concurrent_defaults.exit
+
+      - name: Run SSI serialization anomaly tests
+        shell: bash
+        run: |
+          set +e
+          cargo test -p fsqlite-e2e \
+            --test bd_2yqp6_6_1_ssi_serialization_anomaly_differential \
+            -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/ssi_anomaly.log
+          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/ssi_anomaly.exit
+
+      - name: Run busy retry error semantics
+        shell: bash
+        run: |
+          set +e
+          cargo test -p fsqlite-e2e \
+            --test bd_2yqp6_6_2_busy_retry_error_semantics_matrix \
+            -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/busy_retry.log
+          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/busy_retry.exit
+
+      - name: Run crash recovery corruption matrix
+        shell: bash
+        run: |
+          set +e
+          cargo test -p fsqlite-e2e \
+            --test bd_2yqp6_6_3_crash_recovery_corruption_matrix \
+            -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/crash_recovery.log
+          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/crash_recovery.exit
+
+      - name: Run integrity check tests
+        shell: bash
+        run: |
+          set +e
+          cargo test -p fsqlite-e2e \
+            --test bd_aiica_integrity_check \
+            -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/integrity_check.log
+          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/integrity_check.exit
+
+      - name: Run Connection !Send/!Sync audit
+        shell: bash
+        run: |
+          set +e
+          cargo test -p fsqlite-e2e \
+            --test bd_3v5ci_connection_not_sync \
+            -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/connection_sync.log
+          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/connection_sync.exit
+
+      - name: Run swarm harness smoke test
+        shell: bash
+        run: |
+          set +e
+          cargo test -p fsqlite-e2e \
+            --test bd_073kf_swarm_harness \
+            -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/swarm_harness.log
+          echo "exit_code=$?" >> artifacts/concurrent-${{ matrix.platform_tag }}/swarm_harness.exit
+
+      - name: Cross-engine integrity check on artifacts (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if [ -d target/test-artifacts/concurrent ]; then
+            bash scripts/ci_integrity_check.sh target/test-artifacts/concurrent || true
+            if [ -f /tmp/fsqlite-integrity-results/summary.md ]; then
+              cp /tmp/fsqlite-integrity-results/summary.md \
+                artifacts/concurrent-${{ matrix.platform_tag }}/integrity_summary.md
+            fi
+          else
+            echo "No test artifacts to verify" > artifacts/concurrent-${{ matrix.platform_tag }}/integrity_summary.md
+          fi
+
+      - name: Generate platform verify report
+        if: always()
+        shell: bash
+        run: |
+          REPORT="artifacts/concurrent-${{ matrix.platform_tag }}/verify_report.md"
+          {
+            echo "# Platform Verify Report: ${{ matrix.platform_tag }}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| OS | ${{ matrix.os }} |"
+            echo "| Arch | ${{ matrix.arch }} |"
+            echo "| FS | ${{ matrix.fs_note }} |"
+            echo "| Runner | ${{ matrix.runner }} |"
+            echo "| Rust | $(rustc --version 2>/dev/null || echo unknown) |"
+            echo "| sqlite3 | $(sqlite3 --version 2>/dev/null || echo unknown) |"
+            echo ""
+            echo "## Test Results"
+            echo ""
+            echo "| Suite | Exit Code |"
+            echo "|-------|-----------|"
+            for f in artifacts/concurrent-${{ matrix.platform_tag }}/*.exit; do
+              if [ -f "$f" ]; then
+                suite=$(basename "$f" .exit)
+                code=$(cat "$f" | grep -o '[0-9]*$' || echo "?")
+                status="PASS"
+                [ "$code" != "0" ] && status="**FAIL**"
+                echo "| $suite | $code ($status) |"
+              fi
+            done
+          } > "$REPORT"
+
+          echo "--- Verify Report (${{ matrix.platform_tag }}) ---"
+          cat "$REPORT"
+
+      - name: Append to job summary
+        if: always()
+        shell: bash
+        run: |
+          REPORT="artifacts/concurrent-${{ matrix.platform_tag }}/verify_report.md"
+          if [ -f "$REPORT" ]; then
+            cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload platform artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: concurrent-${{ matrix.platform_tag }}
+          path: artifacts/concurrent-${{ matrix.platform_tag }}/
+          retention-days: 21
+
+  platform-summary:
+    needs: platform-concurrency
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: concurrent-*
+          path: all-artifacts/
+
+      - name: Generate cross-platform summary
+        shell: bash
+        run: |
+          {
+            echo "# Cross-Platform Concurrency Test Summary"
+            echo ""
+            echo "| Platform | Suites Passed | Suites Failed | Status |"
+            echo "|----------|:------------:|:------------:|--------|"
+            for dir in all-artifacts/concurrent-*/; do
+              if [ -d "$dir" ]; then
+                platform=$(basename "$dir" | sed 's/concurrent-//')
+                passed=0
+                failed=0
+                for f in "$dir"*.exit; do
+                  if [ -f "$f" ]; then
+                    code=$(cat "$f" | grep -o '[0-9]*$' || echo 1)
+                    if [ "$code" = "0" ]; then
+                      passed=$((passed + 1))
+                    else
+                      failed=$((failed + 1))
+                    fi
+                  fi
+                done
+                if [ "$failed" -gt 0 ]; then
+                  echo "| $platform | $passed | $failed | :x: |"
+                else
+                  echo "| $platform | $passed | $failed | :white_check_mark: |"
+                fi
+              fi
+            done
+          } | tee cross_platform_summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload cross-platform summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-platform-summary
+          path: cross_platform_summary.md
+          retention-days: 21

@@ -303,6 +303,11 @@ tmp_rch_probe/
 # Remote compilation helper local cache
 .rch/
 .rch-target/
+# Suffixed rch target shards (correctness lane, retained-dml lane, per-job
+# job-id + nanos shards) — created by concurrent `rch` cargo invocations.
+.rch-target-*/
+.rch-correctness-target/
+.rch-retained-dml-target/
 
 # Session extension binary test artifacts
 __CHANGESET__
@@ -347,3 +352,5 @@ heaptrack.*.zst
 /progress.md
 /progress_bd-*.md
 /bd-*.md
+# br doctor per-run artifacts
+.doctor/
