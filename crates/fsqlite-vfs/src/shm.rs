@@ -1054,4 +1054,53 @@ mod tests {
         assert_eq!(SHM_READ_MARK_OFFSET, 100);
         assert_eq!(SHM_SEGMENT_SIZE, 32 * 1024);
     }
+
+    #[test]
+    fn test_shm_region_try_resize_heap_preserves_data() {
+        let mut region = ShmRegion::new(8);
+        region.write_u32_le(0, 0xDEAD).unwrap();
+        region.write_u32_le(4, 0xBEEF).unwrap();
+
+        region.try_resize_heap(16).unwrap();
+        assert_eq!(region.len(), 16);
+        assert_eq!(region.read_u32_le(0).unwrap(), 0xDEAD);
+        assert_eq!(region.read_u32_le(4).unwrap(), 0xBEEF);
+        assert_eq!(region.read_u32_le(8).unwrap(), 0, "grown region zero-filled");
+
+        region.try_resize_heap(4).unwrap();
+        assert_eq!(region.len(), 4);
+        assert_eq!(region.read_u32_le(0).unwrap(), 0xDEAD);
+    }
+
+    #[test]
+    fn test_shm_region_heap_len_and_capacity() {
+        let region = ShmRegion::new(32);
+        let (len, cap) = region.heap_len_and_capacity().expect("heap-backed");
+        assert_eq!(len, 32);
+        assert!(cap >= 32);
+    }
+
+    #[test]
+    fn test_shm_region_is_mmap_backed_false_for_heap() {
+        let region = ShmRegion::new(16);
+        assert!(!region.is_mmap_backed());
+    }
+
+    #[test]
+    fn test_shm_region_atomic_fetch_add_u64_le() {
+        let region = ShmRegion::new(16);
+        region.write_u64_le(0, 100).unwrap();
+
+        let prev = region
+            .atomic_fetch_add_u64_le(0, 42, Ordering::SeqCst)
+            .unwrap();
+        assert_eq!(prev, 100);
+        assert_eq!(region.read_u64_le(0).unwrap(), 142);
+
+        let prev2 = region
+            .atomic_fetch_add_u64_le(0, u64::MAX, Ordering::SeqCst)
+            .unwrap();
+        assert_eq!(prev2, 142);
+        assert_eq!(region.read_u64_le(0).unwrap(), 141, "wrapping add");
+    }
 }

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::os::windows::fs::FileExt;
+use std::os::windows::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -29,6 +29,9 @@ use crate::traits::{Vfs, VfsFile};
 
 /// SQLite I/O capability bit indicating files cannot be deleted while open.
 const SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN: u32 = 0x0000_0800;
+const WINDOWS_FILE_SHARE_READ: u32 = 0x0000_0001;
+const WINDOWS_FILE_SHARE_WRITE: u32 = 0x0000_0002;
+const WINDOWS_SHARE_READ_WRITE: u32 = WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE;
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
@@ -36,6 +39,12 @@ fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
 
 fn lock_poisoned(name: &str) -> FrankenError {
     FrankenError::internal(format!("{name} lock poisoned"))
+}
+
+fn windows_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.share_mode(WINDOWS_SHARE_READ_WRITE);
+    options
 }
 
 fn resolve_path(path: &Path) -> Result<PathBuf> {
@@ -70,8 +79,31 @@ fn sqlite_pending_lock_path(path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+// The three advisory-lock sidecars `WindowsOsLockFiles::open` writes next to
+// every DB it touches. Returned as an array so callers can iterate uniformly.
+fn windows_lock_sidecar_paths(path: &Path) -> [PathBuf; 3] {
+    [
+        sqlite_shared_lock_path(path),
+        sqlite_reserved_lock_path(path),
+        sqlite_pending_lock_path(path),
+    ]
+}
+
+// Best-effort removal of the three advisory-lock sidecars alongside `path`.
+// Errors are intentionally swallowed: sidecars are advisory and may be missing,
+// in use by a racing handle, or already cleaned up. Without this, every
+// transient DB file (e.g. VACUUM INTO backups) leaks three zero-byte files,
+// and a downstream caller that re-enumerates the dir can mistake an orphan
+// sidecar for a backup root and chain a fresh set on top.
+fn try_remove_windows_lock_sidecars(path: &Path) {
+    for sidecar in windows_lock_sidecar_paths(path) {
+        let _ = fs::remove_file(sidecar);
+    }
+}
+
 fn ensure_shm_file_len(path: &Path, min_len: u64) -> Result<()> {
-    let file = OpenOptions::new()
+    let mut options = windows_open_options();
+    let file = options
         .read(true)
         .write(true)
         .create(true)
@@ -82,6 +114,29 @@ fn ensure_shm_file_len(path: &Path, min_len: u64) -> Result<()> {
         file.set_len(min_len)?;
     }
     Ok(())
+}
+
+fn open_windows_lock_sidecar(path: &Path) -> Result<(File, bool)> {
+    loop {
+        let mut create_options = windows_open_options();
+        match create_options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(file) => return Ok((file, true)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let mut open_options = windows_open_options();
+                match open_options.read(true).write(true).open(path) {
+                    Ok(file) => return Ok((file, false)),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(FrankenError::Io(err)),
+                }
+            }
+            Err(err) => return Err(FrankenError::Io(err)),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -105,6 +160,18 @@ impl WindowsVfs {
             "windows vfs initialized"
         );
         Self::default()
+    }
+
+    fn next_temp_path(&self) -> Result<PathBuf> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| lock_poisoned("windows vfs inner"))?;
+        let id = inner.next_temp_id.max(next_temp_id());
+        inner.next_temp_id = id
+            .checked_add(1)
+            .ok_or_else(|| FrankenError::internal("temp file id overflow"))?;
+        Ok(env::temp_dir().join(format!("fsqlite-windows-{id}.tmp")))
     }
 }
 
@@ -142,6 +209,14 @@ impl WindowsShmTable {
         Self {
             map: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn get(&self, path: &Path) -> Result<Option<Arc<Mutex<WindowsShmState>>>> {
+        let map = self
+            .map
+            .lock()
+            .map_err(|_| lock_poisoned("windows shm table"))?;
+        Ok(map.get(path).map(Arc::clone))
     }
 
     fn get_or_create(&self, path: &Path) -> Result<Arc<Mutex<WindowsShmState>>> {
@@ -225,19 +300,38 @@ struct WindowsOsLockFiles {
 
 impl WindowsOsLockFiles {
     fn open(path: &Path) -> Result<Self> {
-        let open_sidecar = |sidecar: &Path| -> Result<File> {
-            Ok(OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(sidecar)?)
+        let shared_path = sqlite_shared_lock_path(path);
+        let reserved_path = sqlite_reserved_lock_path(path);
+        let pending_path = sqlite_pending_lock_path(path);
+        let (shared_file, shared_created) = open_windows_lock_sidecar(&shared_path)?;
+        let (reserved_file, reserved_created) = match open_windows_lock_sidecar(&reserved_path) {
+            Ok(opened) => opened,
+            Err(err) => {
+                drop(shared_file);
+                if shared_created {
+                    let _ = fs::remove_file(&shared_path);
+                }
+                return Err(err);
+            }
         };
-
+        let (pending_file, _) = match open_windows_lock_sidecar(&pending_path) {
+            Ok(opened) => opened,
+            Err(err) => {
+                drop(reserved_file);
+                drop(shared_file);
+                if reserved_created {
+                    let _ = fs::remove_file(&reserved_path);
+                }
+                if shared_created {
+                    let _ = fs::remove_file(&shared_path);
+                }
+                return Err(err);
+            }
+        };
         Ok(Self {
-            shared_file: open_sidecar(&sqlite_shared_lock_path(path))?,
-            reserved_file: open_sidecar(&sqlite_reserved_lock_path(path))?,
-            pending_file: open_sidecar(&sqlite_pending_lock_path(path))?,
+            shared_file,
+            reserved_file,
+            pending_file,
             held_levels: [false; 4],
         })
     }
@@ -410,18 +504,11 @@ impl Vfs for WindowsVfs {
     ) -> Result<(Self::File, VfsOpenFlags)> {
         checkpoint_or_abort(cx)?;
 
-        let resolved = if let Some(path) = path {
+        let is_temp = path.is_none();
+        let mut resolved = if let Some(path) = path {
             resolve_path(path)?
         } else {
-            let mut inner = self
-                .inner
-                .lock()
-                .map_err(|_| lock_poisoned("windows vfs inner"))?;
-            let id = inner.next_temp_id.max(next_temp_id());
-            inner.next_temp_id = id
-                .checked_add(1)
-                .ok_or_else(|| FrankenError::internal("temp file id overflow"))?;
-            env::temp_dir().join(format!("fsqlite-windows-{id}.tmp"))
+            self.next_temp_path()?
         };
 
         let is_create = path.is_none() || flags.contains(VfsOpenFlags::CREATE);
@@ -432,43 +519,77 @@ impl Vfs for WindowsVfs {
             return Err(FrankenError::CannotOpen { path: resolved });
         }
 
-        let mut options = OpenOptions::new();
-        options.read(true);
-        if is_rw {
-            options.write(true);
-        }
-        if is_exclusive_create {
-            options.create_new(true);
-        } else if is_create {
-            options.create(true);
-        }
-
-        let file = options.open(&resolved).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                FrankenError::CannotOpen {
-                    path: resolved.clone(),
-                }
-            } else {
-                FrankenError::Io(err)
+        let mut created_db_file = false;
+        let file = loop {
+            let mut options = windows_open_options();
+            options.read(true);
+            if is_rw {
+                options.write(true);
             }
-        })?;
+            if is_create {
+                options.create_new(true);
+            }
+
+            match options.open(&resolved) {
+                Ok(file) => {
+                    created_db_file = is_create;
+                    break file;
+                }
+                Err(err) if is_temp && err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    resolved = self.next_temp_path()?;
+                }
+                Err(err)
+                    if is_create
+                        && !is_temp
+                        && !is_exclusive_create
+                        && err.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    let mut open_options = windows_open_options();
+                    open_options.read(true);
+                    if is_rw {
+                        open_options.write(true);
+                    }
+                    match open_options.open(&resolved) {
+                        Ok(file) => break file,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(FrankenError::Io(err)),
+                    }
+                }
+                Err(err) => {
+                    return Err(if err.kind() == std::io::ErrorKind::NotFound {
+                        FrankenError::CannotOpen { path: resolved }
+                    } else {
+                        FrankenError::Io(err)
+                    });
+                }
+            }
+        };
 
         let owner_id = next_owner_id();
         let shm_path = sqlite_shm_path(&resolved);
 
-        let delete_on_close = flags.contains(VfsOpenFlags::DELETEONCLOSE) || path.is_none();
+        let delete_on_close = flags.contains(VfsOpenFlags::DELETEONCLOSE) || is_temp;
         let out_flags = if is_create {
             flags | VfsOpenFlags::READWRITE
         } else {
             flags
         };
-        let os_locks = WindowsOsLockFiles::open(&resolved)?;
+        let os_locks = match WindowsOsLockFiles::open(&resolved) {
+            Ok(os_locks) => os_locks,
+            Err(err) => {
+                drop(file);
+                if created_db_file {
+                    let _ = fs::remove_file(&resolved);
+                }
+                return Err(err);
+            }
+        };
 
         Ok((
             WindowsFile {
                 path: resolved,
-                file,
-                os_locks,
+                file: Some(file),
+                os_locks: Some(os_locks),
                 owner_id,
                 lock_level: LockLevel::None,
                 delete_on_close,
@@ -488,6 +609,7 @@ impl Vfs for WindowsVfs {
         if shm_path.exists() {
             fs::remove_file(shm_path)?;
         }
+        try_remove_windows_lock_sidecars(&resolved);
         Ok(())
     }
 
@@ -498,12 +620,14 @@ impl Vfs for WindowsVfs {
         }
         match flags {
             f if f == AccessFlags::EXISTS => Ok(true),
-            f if f == AccessFlags::READ => Ok(File::open(resolved).is_ok()),
-            _ => Ok(OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(resolved)
-                .is_ok()),
+            f if f == AccessFlags::READ => {
+                let mut options = windows_open_options();
+                Ok(options.read(true).open(resolved).is_ok())
+            }
+            _ => {
+                let mut options = windows_open_options();
+                Ok(options.read(true).write(true).open(resolved).is_ok())
+            }
         }
     }
 
@@ -516,8 +640,8 @@ impl Vfs for WindowsVfs {
 #[derive(Debug)]
 pub struct WindowsFile {
     path: PathBuf,
-    file: File,
-    os_locks: WindowsOsLockFiles,
+    file: Option<File>,
+    os_locks: Option<WindowsOsLockFiles>,
     owner_id: u64,
     lock_level: LockLevel,
     delete_on_close: bool,
@@ -526,6 +650,42 @@ pub struct WindowsFile {
 }
 
 impl WindowsFile {
+    fn is_closed(&self) -> bool {
+        self.file.is_none() && self.os_locks.is_none()
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if self.is_closed() {
+            Err(FrankenError::internal("windows file is closed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn file_ref(&self) -> Result<&File> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| FrankenError::internal("windows file is closed"))
+    }
+
+    fn file_mut(&mut self) -> Result<&mut File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| FrankenError::internal("windows file is closed"))
+    }
+
+    fn os_locks_ref(&self) -> Result<&WindowsOsLockFiles> {
+        self.os_locks
+            .as_ref()
+            .ok_or_else(|| FrankenError::internal("windows lock files are closed"))
+    }
+
+    fn os_locks_mut(&mut self) -> Result<&mut WindowsOsLockFiles> {
+        self.os_locks
+            .as_mut()
+            .ok_or_else(|| FrankenError::internal("windows lock files are closed"))
+    }
+
     fn ensure_shm_state(&mut self) -> Result<Arc<Mutex<WindowsShmState>>> {
         if let Some(state) = &self.shm_state {
             return Ok(Arc::clone(state));
@@ -680,12 +840,37 @@ impl WindowsFile {
 
 impl VfsFile for WindowsFile {
     fn close(&mut self, cx: &Cx) -> Result<()> {
-        self.unlock(cx, LockLevel::None)?;
-        self.release_shm_owner_state(self.delete_on_close)?;
+        if self.is_closed() && self.shm_state.is_none() {
+            return Ok(());
+        }
+
+        let mut first_error = None;
+
+        if !self.is_closed() {
+            if let Err(err) = self.unlock(cx, LockLevel::None) {
+                first_error = Some(err);
+            }
+        }
+
+        let release_result = if self.shm_state.is_some() || self.delete_on_close {
+            self.release_shm_owner_state(self.delete_on_close)
+        } else {
+            Ok(())
+        };
+        if first_error.is_none() {
+            first_error = release_result.err();
+        }
+
+        drop(self.os_locks.take());
+        drop(self.file.take());
+        self.lock_level = LockLevel::None;
+
         if self.delete_on_close {
             drop(fs::remove_file(&self.path));
+            try_remove_windows_lock_sidecars(&self.path);
         }
-        Ok(())
+
+        first_error.map_or(Ok(()), Err)
     }
 
     fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
@@ -701,7 +886,7 @@ impl VfsFile for WindowsFile {
                     what: "read offset".to_string(),
                     value: "overflow".to_string(),
                 })?;
-            let n = self.file.seek_read(&mut buf[total..], read_offset)?;
+            let n = self.file_ref()?.seek_read(&mut buf[total..], read_offset)?;
             if n == 0 {
                 break;
             }
@@ -726,7 +911,7 @@ impl VfsFile for WindowsFile {
                     what: "write offset".to_string(),
                     value: "overflow".to_string(),
                 })?;
-            let n = self.file.seek_write(&buf[total..], write_offset)?;
+            let n = self.file_mut()?.seek_write(&buf[total..], write_offset)?;
             if n == 0 {
                 return Err(FrankenError::Io(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
@@ -739,21 +924,21 @@ impl VfsFile for WindowsFile {
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
-        self.file.set_len(size)?;
+        self.file_mut()?.set_len(size)?;
         Ok(())
     }
 
     fn sync(&mut self, _cx: &Cx, flags: SyncFlags) -> Result<()> {
         if flags.contains(SyncFlags::DATAONLY) {
-            self.file.sync_data()?;
+            self.file_mut()?.sync_data()?;
         } else {
-            self.file.sync_all()?;
+            self.file_mut()?.sync_all()?;
         }
         Ok(())
     }
 
     fn file_size(&self, _cx: &Cx) -> Result<u64> {
-        Ok(self.file.metadata()?.len())
+        Ok(self.file_ref()?.metadata()?.len())
     }
 
     fn lock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
@@ -765,9 +950,14 @@ impl VfsFile for WindowsFile {
         while self.lock_level < level {
             let next = next_lock_level(self.lock_level)
                 .ok_or_else(|| FrankenError::internal("invalid lock escalation"))?;
-            if let Err(err) = self.os_locks.try_lock_level(next) {
-                let _ = self.os_locks.unlock_to(prior_level);
-                self.lock_level = self.os_locks.highest_held_level();
+            let lock_result = self.os_locks_mut()?.try_lock_level(next);
+            if let Err(err) = lock_result {
+                let highest_held_level = {
+                    let os_locks = self.os_locks_mut()?;
+                    let _ = os_locks.unlock_to(prior_level);
+                    os_locks.highest_held_level()
+                };
+                self.lock_level = highest_held_level;
                 return Err(err);
             }
             self.lock_level = next;
@@ -779,8 +969,9 @@ impl VfsFile for WindowsFile {
         if level >= self.lock_level {
             return Ok(());
         }
-        if let Err(err) = self.os_locks.unlock_to(level) {
-            self.lock_level = self.os_locks.highest_held_level();
+        let unlock_result = self.os_locks_mut()?.unlock_to(level);
+        if let Err(err) = unlock_result {
+            self.lock_level = self.os_locks_mut()?.highest_held_level();
             return Err(err);
         }
         self.lock_level = level;
@@ -788,7 +979,7 @@ impl VfsFile for WindowsFile {
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
-        self.os_locks.reserved_locked_by_other()
+        self.os_locks_ref()?.reserved_locked_by_other()
     }
 
     fn sector_size(&self) -> u32 {
@@ -801,6 +992,7 @@ impl VfsFile for WindowsFile {
 
     #[allow(clippy::significant_drop_tightening)]
     fn shm_map(&mut self, _cx: &Cx, region: u32, size: u32, extend: bool) -> Result<ShmRegion> {
+        self.ensure_open()?;
         if size == 0 {
             return Err(FrankenError::LockFailed {
                 detail: "shm_map size must be > 0".to_string(),
@@ -819,8 +1011,59 @@ impl VfsFile for WindowsFile {
                 what: "shm file length".to_string(),
                 value: format!("region={region}, size={size}"),
             })?;
-        ensure_shm_file_len(&self.shm_path, min_len)?;
 
+        if !extend {
+            let mut needs_owner_ref = false;
+            let shm_state = if let Some(state) = &self.shm_state {
+                Arc::clone(state)
+            } else {
+                needs_owner_ref = true;
+                windows_shm_table().get(&self.shm_path)?.ok_or_else(|| {
+                    FrankenError::CannotOpen {
+                        path: self.shm_path.clone(),
+                    }
+                })?
+            };
+
+            let mapped_region = {
+                let mut state = shm_state
+                    .lock()
+                    .map_err(|_| lock_poisoned("windows shm state"))?;
+                let existing = state.regions.get(&region).cloned().ok_or_else(|| {
+                    FrankenError::CannotOpen {
+                        path: self.shm_path.clone(),
+                    }
+                })?;
+                if existing.len() < size_usize {
+                    return Err(FrankenError::LockFailed {
+                        detail: format!(
+                            "shm region {region} is {} bytes, requested {size_usize} bytes without extend",
+                            existing.len()
+                        ),
+                    });
+                }
+                if needs_owner_ref {
+                    *state.owner_refs.entry(self.owner_id).or_insert(0) += 1;
+                }
+                existing
+            };
+
+            if needs_owner_ref {
+                self.shm_state = Some(Arc::clone(&shm_state));
+            }
+
+            debug!(
+                target: "fsqlite_vfs::windows",
+                region,
+                size,
+                path = %self.shm_path.display(),
+                "mapped windows shm region"
+            );
+
+            return Ok(mapped_region);
+        }
+
+        ensure_shm_file_len(&self.shm_path, min_len)?;
         let shm_state = self.ensure_shm_state()?;
         let mapped_region = {
             let mut state = shm_state
@@ -829,28 +1072,14 @@ impl VfsFile for WindowsFile {
 
             let entry = state.regions.entry(region);
             let region_ref = match entry {
-                std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                    if occupied.get().len() < size_usize {
-                        if !extend {
-                            return Err(FrankenError::LockFailed {
-                                detail: format!(
-                                    "shm region {region} is {} bytes, requested {size_usize} bytes without extend",
-                                    occupied.get().len()
-                                ),
-                            });
-                        }
-                        let mut updated_region = occupied.get().clone();
-                        updated_region.try_resize_heap(size_usize)?;
-                        occupied.insert(updated_region);
+                std::collections::hash_map::Entry::Occupied(occupied) => {
+                    let region_ref = occupied.into_mut();
+                    if region_ref.len() < size_usize {
+                        region_ref.try_resize_heap(size_usize)?;
                     }
-                    occupied.into_mut()
+                    region_ref
                 }
                 std::collections::hash_map::Entry::Vacant(vacant) => {
-                    if !extend {
-                        return Err(FrankenError::CannotOpen {
-                            path: self.shm_path.clone(),
-                        });
-                    }
                     vacant.insert(ShmRegion::new(size_usize))
                 }
             };
@@ -869,6 +1098,7 @@ impl VfsFile for WindowsFile {
     }
 
     fn shm_lock(&mut self, _cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+        self.ensure_open()?;
         let end = Self::validate_shm_request(offset, n)?;
         let lock_requested = flags & SQLITE_SHM_LOCK != 0;
         let unlock_requested = flags & SQLITE_SHM_UNLOCK != 0;
@@ -934,15 +1164,34 @@ impl VfsFile for WindowsFile {
     }
 
     fn shm_unmap(&mut self, _cx: &Cx, delete: bool) -> Result<()> {
+        self.ensure_open()?;
         self.release_shm_owner_state(delete)
+    }
+}
+
+impl Drop for WindowsFile {
+    fn drop(&mut self) {
+        if !self.is_closed() || self.shm_state.is_some() {
+            let cx = Cx::new();
+            let _ = self.close(&cx);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
     use std::process::Command;
     use tempfile::tempdir;
+
+    struct TempPathCleanup(PathBuf);
+
+    impl Drop for TempPathCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
 
     fn open_flags_create() -> VfsOpenFlags {
         VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE
@@ -1089,6 +1338,36 @@ mod tests {
     }
 
     #[test]
+    fn test_windowsvfs_shm_map_extend_false_rejects_missing_without_side_effects() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("shm_missing_no_extend.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+        let shm_path = file.shm_path.clone();
+
+        let err = file.shm_map(&cx, 2, 64, false).unwrap_err();
+        assert!(
+            matches!(err, FrankenError::CannotOpen { .. }),
+            "missing non-extend shm_map should report CannotOpen, got {err:?}"
+        );
+        assert!(
+            file.shm_state.is_none(),
+            "failed non-extend shm_map must not register shm owner state"
+        );
+        assert!(
+            windows_shm_table().get(&shm_path).unwrap().is_none(),
+            "failed non-extend shm_map must not create a shared state entry"
+        );
+        assert!(
+            !shm_path.exists(),
+            "failed non-extend shm_map must not create a -shm file"
+        );
+    }
+
+    #[test]
     fn test_windowsvfs_reserved_lock_conflicts_across_handles() {
         let cx = Cx::new();
         let dir = tempdir().expect("temp dir");
@@ -1185,9 +1464,341 @@ mod tests {
             | VfsOpenFlags::DELETEONCLOSE;
         let (mut file, _) = vfs.open(&cx, None, flags).expect("open temp");
         let temp_path = file.path.clone();
+        let lock_sidecars = windows_lock_sidecar_paths(&temp_path);
         assert!(temp_path.exists());
+        for sidecar in &lock_sidecars {
+            assert!(
+                sidecar.exists(),
+                "temporary Windows VFS handle should create {}",
+                sidecar.display()
+            );
+        }
         file.close(&cx).expect("close");
         assert!(!temp_path.exists());
+        for sidecar in &lock_sidecars {
+            assert!(
+                !sidecar.exists(),
+                "temporary close should remove advisory lock sidecar {}",
+                sidecar.display()
+            );
+        }
+    }
+
+    #[test]
+    fn test_windowsvfs_temp_file_skips_existing_candidate() {
+        let cx = Cx::new();
+        let seed_base = 1_000_000_000_000_u64 + u64::from(std::process::id()) * 1_024;
+        let (seed, blocker, blocker_file) = (0_u64..1_024)
+            .find_map(|offset| {
+                let seed = seed_base + offset;
+                let blocker = env::temp_dir().join(format!("fsqlite-windows-{seed}.tmp"));
+                let mut blocker_options = windows_open_options();
+                blocker_options
+                    .write(true)
+                    .create_new(true)
+                    .open(&blocker)
+                    .ok()
+                    .map(|file| (seed, blocker, file))
+            })
+            .expect("available temp candidate");
+        let _blocker_cleanup = TempPathCleanup(blocker.clone());
+        let mut blocker_file = blocker_file;
+        blocker_file
+            .write_all(b"existing temp candidate")
+            .expect("write existing temp candidate");
+        drop(blocker_file);
+        let vfs = WindowsVfs {
+            inner: Arc::new(Mutex::new(WindowsVfsInner { next_temp_id: seed })),
+        };
+        let flags = VfsOpenFlags::TEMP_DB
+            | VfsOpenFlags::CREATE
+            | VfsOpenFlags::READWRITE
+            | VfsOpenFlags::DELETEONCLOSE;
+
+        let (mut file, _) = vfs.open(&cx, None, flags).expect("open temp");
+        let opened_path = file.path.clone();
+        assert_ne!(
+            opened_path, blocker,
+            "anonymous temp open must not reuse an existing candidate path"
+        );
+        assert!(
+            blocker.exists(),
+            "temp collision handling must preserve the existing candidate file"
+        );
+
+        file.close(&cx).expect("close temp");
+        assert!(
+            !opened_path.exists(),
+            "delete-on-close should remove the actual temp file"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_open_handles_block_delete_sharing() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("delete_sharing.db");
+        let mut options = windows_open_options();
+        let _file = options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .expect("open file without delete sharing");
+
+        assert!(
+            fs::remove_file(&path).is_err(),
+            "Windows VFS files must reject unlink while an open handle exists"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_lock_open_failure_cleans_created_shared_sidecar() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("partial_lock_open.db");
+        let shared_path = sqlite_shared_lock_path(&path);
+        let reserved_path = sqlite_reserved_lock_path(&path);
+        fs::create_dir(&reserved_path).expect("reserved sidecar blocker");
+
+        assert!(WindowsOsLockFiles::open(&path).is_err());
+        assert!(
+            !shared_path.exists(),
+            "failed lock setup should remove the shared sidecar it just created"
+        );
+        assert!(
+            reserved_path.is_dir(),
+            "cleanup must not disturb the path that caused the open failure"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_open_failure_cleans_created_db_file() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("partial_vfs_open.db");
+        let shared_path = sqlite_shared_lock_path(&path);
+        let reserved_path = sqlite_reserved_lock_path(&path);
+        fs::create_dir(&reserved_path).expect("reserved sidecar blocker");
+        let vfs = WindowsVfs::new();
+        let flags = open_flags_create() | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::DELETEONCLOSE;
+
+        assert!(vfs.open(&cx, Some(&path), flags).is_err());
+        assert!(
+            !path.exists(),
+            "failed exclusive create should remove the DB file it just created"
+        );
+        assert!(
+            !shared_path.exists(),
+            "failed lock setup should remove the shared sidecar it just created"
+        );
+        assert!(
+            reserved_path.is_dir(),
+            "cleanup must not disturb the path that caused the open failure"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_plain_create_failure_cleans_created_db_file() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("partial_plain_create.db");
+        let shared_path = sqlite_shared_lock_path(&path);
+        let reserved_path = sqlite_reserved_lock_path(&path);
+        fs::create_dir(&reserved_path).expect("reserved sidecar blocker");
+        let vfs = WindowsVfs::new();
+
+        assert!(vfs.open(&cx, Some(&path), open_flags_create()).is_err());
+        assert!(
+            !path.exists(),
+            "failed plain create should remove the DB file it just created"
+        );
+        assert!(
+            !shared_path.exists(),
+            "failed lock setup should remove the shared sidecar it just created"
+        );
+        assert!(
+            reserved_path.is_dir(),
+            "cleanup must not disturb the path that caused the open failure"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_plain_create_failure_preserves_existing_db_file() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("existing_plain_create.db");
+        let shared_path = sqlite_shared_lock_path(&path);
+        let reserved_path = sqlite_reserved_lock_path(&path);
+        fs::write(&path, b"existing db").expect("existing db");
+        fs::create_dir(&reserved_path).expect("reserved sidecar blocker");
+        let vfs = WindowsVfs::new();
+
+        assert!(vfs.open(&cx, Some(&path), open_flags_create()).is_err());
+        assert_eq!(
+            fs::read(&path).expect("read existing db"),
+            b"existing db",
+            "failed plain create must preserve an existing DB file"
+        );
+        assert!(
+            !shared_path.exists(),
+            "failed lock setup should remove only the shared sidecar it just created"
+        );
+        assert!(
+            reserved_path.is_dir(),
+            "cleanup must not disturb the path that caused the open failure"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_open_failure_preserves_existing_sidecar() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("partial_vfs_open_existing_sidecar.db");
+        let shared_path = sqlite_shared_lock_path(&path);
+        let reserved_path = sqlite_reserved_lock_path(&path);
+        fs::write(&shared_path, b"existing shared sidecar").expect("existing shared sidecar");
+        fs::create_dir(&reserved_path).expect("reserved sidecar blocker");
+        let vfs = WindowsVfs::new();
+        let flags = open_flags_create() | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::DELETEONCLOSE;
+
+        assert!(vfs.open(&cx, Some(&path), flags).is_err());
+        assert!(
+            !path.exists(),
+            "failed exclusive create should remove the DB file it just created"
+        );
+        assert!(
+            shared_path.exists(),
+            "failed VFS open must preserve a sidecar it did not create"
+        );
+        assert!(
+            reserved_path.is_dir(),
+            "cleanup must not disturb the path that caused the open failure"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_lock_open_failure_preserves_existing_sidecars() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("existing_partial_lock_open.db");
+        let shared_path = sqlite_shared_lock_path(&path);
+        let reserved_path = sqlite_reserved_lock_path(&path);
+        let pending_path = sqlite_pending_lock_path(&path);
+        fs::write(&shared_path, b"existing shared sidecar").expect("existing shared sidecar");
+        fs::create_dir(&pending_path).expect("pending sidecar blocker");
+
+        assert!(WindowsOsLockFiles::open(&path).is_err());
+        assert!(
+            shared_path.exists(),
+            "failed lock setup must not remove a sidecar it did not create"
+        );
+        assert!(
+            !reserved_path.exists(),
+            "failed lock setup should remove the reserved sidecar it just created"
+        );
+        assert!(
+            pending_path.is_dir(),
+            "cleanup must not disturb the path that caused the open failure"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_delete_on_close_is_idempotent() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("idempotent_close.db");
+        let vfs = WindowsVfs::new();
+        let flags = open_flags_create() | VfsOpenFlags::DELETEONCLOSE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), flags)
+            .expect("open delete-on-close file");
+        let shm_path = file.shm_path.clone();
+        let lock_sidecars = windows_lock_sidecar_paths(&path);
+
+        file.close(&cx).expect("first close");
+        assert!(!path.exists(), "first close should delete the DB file");
+
+        fs::write(&path, b"replacement db").expect("replacement db");
+        fs::write(&shm_path, b"replacement shm").expect("replacement shm");
+        for sidecar in &lock_sidecars {
+            fs::write(sidecar, b"replacement lock").expect("replacement sidecar");
+        }
+
+        file.close(&cx).expect("second close");
+        assert!(path.exists(), "second close must be a no-op");
+        assert!(
+            shm_path.exists(),
+            "second close must not delete replacement SHM"
+        );
+        for sidecar in &lock_sidecars {
+            assert!(
+                sidecar.exists(),
+                "second close must not delete replacement sidecar {}",
+                sidecar.display()
+            );
+        }
+    }
+
+    #[test]
+    fn test_windowsvfs_shm_rejects_use_after_close() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("closed_shm.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+
+        file.close(&cx).expect("close file");
+        assert!(
+            matches!(
+                file.shm_map(&cx, 0, 32 * 1024, true),
+                Err(FrankenError::Internal(_))
+            ),
+            "closed Windows handles must not recreate SHM state"
+        );
+        assert!(
+            matches!(
+                file.shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED),
+                Err(FrankenError::Internal(_))
+            ),
+            "closed Windows handles must reject SHM locks"
+        );
+        assert!(
+            matches!(file.shm_unmap(&cx, false), Err(FrankenError::Internal(_))),
+            "closed Windows handles must reject SHM unmap"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_delete_removes_lock_sidecars() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("delete_sidecars.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+        let lock_sidecars = windows_lock_sidecar_paths(&path);
+
+        for sidecar in &lock_sidecars {
+            assert!(
+                sidecar.exists(),
+                "opening the Windows VFS handle should create {}",
+                sidecar.display()
+            );
+        }
+
+        file.close(&cx).expect("close file");
+
+        vfs.delete(&cx, &path, false).expect("delete file");
+        assert!(!path.exists(), "Vfs::delete should remove the main DB");
+        for sidecar in &lock_sidecars {
+            assert!(
+                !sidecar.exists(),
+                "Vfs::delete should remove advisory lock sidecar {}",
+                sidecar.display()
+            );
+        }
     }
 
     #[test]
