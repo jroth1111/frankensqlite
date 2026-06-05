@@ -829,6 +829,54 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_calibration_boundaries_and_well_calibrated() {
+        // Existing tests cover clearly under/over/zero estimates; this covers
+        // the well-calibrated band, the exact (strict) high threshold, and a
+        // non-positive estimate.
+
+        // Perfect calibration: ratio 1.0 -> not miscalibrated, no alert.
+        let perfect = compute_calibration(50.0, 50).unwrap();
+        assert!((perfect.ratio - 1.0).abs() < 1e-9);
+        assert!(!perfect.miscalibrated);
+        assert!(perfect.alert.is_none());
+
+        // Inside the (0.2, 5.0) band: well-calibrated.
+        let mid = compute_calibration(100.0, 50).unwrap(); // ratio 0.5
+        assert!(!mid.miscalibrated && mid.alert.is_none());
+
+        // The high threshold is checked with strict `> 5.0`, so a ratio of
+        // exactly 5.0 stays well-calibrated.
+        let at_high = compute_calibration(20.0, 100).unwrap(); // ratio 5.0
+        assert!((at_high.ratio - 5.0).abs() < 1e-9);
+        assert!(
+            !at_high.miscalibrated,
+            "ratio == 5.0 should be well-calibrated under a strict > check"
+        );
+
+        // Just past the high threshold -> Underestimate alert.
+        let over_high = compute_calibration(20.0, 101).unwrap(); // ratio 5.05
+        assert!(over_high.miscalibrated);
+        assert!(matches!(
+            over_high.alert,
+            Some(MiscalibrationAlert::Underestimate { .. })
+        ));
+
+        // Clearly below the low threshold -> Overestimate alert.
+        let under_low = compute_calibration(100.0, 10).unwrap(); // ratio 0.1
+        assert!(under_low.miscalibrated);
+        assert!(matches!(
+            under_low.alert,
+            Some(MiscalibrationAlert::Overestimate { .. })
+        ));
+
+        // A non-positive estimate yields no meaningful ratio.
+        assert!(
+            compute_calibration(-5.0, 100).is_none(),
+            "negative estimate -> None"
+        );
+    }
+
+    #[test]
     fn decision_log_chain_integrity() {
         let tables = sample_tables();
         let indexes = sample_indexes();
@@ -846,6 +894,31 @@ mod tests {
         assert_eq!(log.decisions[0].prev_hash, GENESIS_HASH);
         assert_eq!(log.decisions[1].prev_hash, log.decisions[0].record_hash);
         assert_eq!(log.decisions[2].prev_hash, log.decisions[1].record_hash);
+    }
+
+    #[test]
+    fn chain_tip_hash_tracks_the_latest_record() {
+        // The empty-log genesis case is covered elsewhere; this pins that the
+        // chain tip advances to the most recent record's hash as plans are
+        // logged, and that each record chains onto the previous tip.
+        let tables = sample_tables();
+        let indexes = sample_indexes();
+        let plan = sample_plan();
+        let mut log = DecisionLog::new();
+        assert_eq!(log.chain_tip_hash(), GENESIS_HASH);
+
+        log.record_plan("SELECT 1", &tables, &indexes, 0, None, 0, &plan, 1, false);
+        let tip_after_first = log.chain_tip_hash().to_owned();
+        // The tip is no longer genesis and equals the first record's hash.
+        assert_ne!(tip_after_first, GENESIS_HASH);
+        assert_eq!(tip_after_first, log.decisions[0].record_hash);
+
+        log.record_plan("SELECT 2", &tables, &indexes, 0, None, 0, &plan, 1, false);
+        // The tip advances to the second record, which chains onto the first
+        // (its prev_hash is the previous tip).
+        assert_eq!(log.chain_tip_hash(), log.decisions[1].record_hash);
+        assert_eq!(log.decisions[1].prev_hash, tip_after_first);
+        assert_ne!(log.chain_tip_hash(), tip_after_first);
     }
 
     #[test]
@@ -905,6 +978,35 @@ mod tests {
         let misc = log.miscalibrated_decisions();
         assert_eq!(misc.len(), 1);
         assert_eq!(misc[0].query_text, "Q2");
+    }
+
+    #[test]
+    fn calibration_stats_handle_empty_and_uncalibrated_without_nan() {
+        // Empty log: the is_empty guard must return zeroed stats, never a
+        // div-by-zero NaN from the mean/median/stddev computation.
+        let empty = DecisionLog::new();
+        let s = empty.calibration_stats();
+        assert_eq!(s.calibrated_decisions, 0);
+        assert_eq!(s.miscalibrated_count, 0);
+        assert!(
+            !s.mean_ratio.is_nan() && !s.median_ratio.is_nan() && !s.stddev_ratio.is_nan(),
+            "empty log must not produce NaN ratios"
+        );
+        assert!(s.mean_ratio.abs() < f64::EPSILON);
+
+        // Decisions recorded but never given an actual cost contribute no
+        // calibrated samples, so the aggregate stays zeroed (still no NaN).
+        let tables = sample_tables();
+        let indexes = sample_indexes();
+        let plan = sample_plan();
+        let mut log = DecisionLog::new();
+        for i in 0..3 {
+            let _ =
+                log.record_plan(&format!("Q{i}"), &tables, &indexes, 0, None, 0, &plan, 1, false);
+        }
+        let s = log.calibration_stats();
+        assert_eq!(s.calibrated_decisions, 0, "no actuals recorded -> nothing calibrated");
+        assert!(!s.mean_ratio.is_nan(), "uncalibrated log must not produce NaN");
     }
 
     #[test]
@@ -1041,6 +1143,26 @@ mod tests {
     }
 
     #[test]
+    fn access_path_kind_label_formats_selectivity_to_three_decimals() {
+        // access_path_kind_labels only checks the prefix for the parameterized
+        // variants; this pins the exact (sel={:.3}) formatting: three decimal
+        // places with trailing-zero padding, for both Range and Covering scans.
+        assert_eq!(
+            access_path_kind_label(&AccessPathKind::IndexScanRange { selectivity: 0.5 }),
+            "index_scan_range(sel=0.500)"
+        );
+        assert_eq!(
+            access_path_kind_label(&AccessPathKind::CoveringIndexScan { selectivity: 0.25 }),
+            "covering_index_scan(sel=0.250)"
+        );
+        // A value with more than three decimals is rounded to three.
+        assert_eq!(
+            access_path_kind_label(&AccessPathKind::IndexScanRange { selectivity: 0.12345 }),
+            "index_scan_range(sel=0.123)"
+        );
+    }
+
+    #[test]
     fn table_stats_summary_from() {
         let ts = TableStats {
             name: "foo".to_owned(),
@@ -1052,6 +1174,38 @@ mod tests {
         assert_eq!(summary.name, "foo");
         assert_eq!(summary.n_pages, 42);
         assert_eq!(summary.source, "analyze");
+    }
+
+    #[test]
+    fn query_by_time_range_filters_inclusively() {
+        // query_by_time_range had no direct test. Its window is inclusive at
+        // both ends. record_plan stamps the system clock, so overwrite the
+        // recorded timestamps to fixed values to make the window deterministic.
+        let tables = sample_tables();
+        let indexes = sample_indexes();
+        let plan = sample_plan();
+        let mut log = DecisionLog::new();
+        for _ in 0..3 {
+            log.record_plan("SELECT 1", &tables, &indexes, 0, None, 0, &plan, 1, false);
+        }
+        log.decisions[0].timestamp_epoch_secs = 100;
+        log.decisions[1].timestamp_epoch_secs = 200;
+        log.decisions[2].timestamp_epoch_secs = 300;
+
+        // A window covering only the middle stamp returns exactly that decision.
+        let mid = log.query_by_time_range(150, 250);
+        assert_eq!(mid.len(), 1);
+        assert_eq!(mid[0].timestamp_epoch_secs, 200);
+
+        // Inclusive upper/lower bounds: [200, 300] includes both 200 and 300.
+        assert_eq!(log.query_by_time_range(200, 300).len(), 2);
+
+        // The full span returns all three; a disjoint window returns none.
+        assert_eq!(log.query_by_time_range(100, 300).len(), 3);
+        assert!(log.query_by_time_range(400, 500).is_empty());
+
+        // A zero-width window on an exact stamp still matches (inclusive).
+        assert_eq!(log.query_by_time_range(200, 200).len(), 1);
     }
 
     #[test]
@@ -1069,6 +1223,40 @@ mod tests {
     }
 
     #[test]
+    fn record_actual_returns_false_for_unknown_contract_id() {
+        let tables = sample_tables();
+        let indexes = sample_indexes();
+        let plan = sample_plan();
+        let mut log = DecisionLog::new();
+        let id = log.record_plan("SELECT 1", &tables, &indexes, 0, None, 0, &plan, 1, false);
+
+        // A bogus contract id is a safe no-op that reports failure: no panic, and
+        // the real decision stays uncalibrated.
+        assert!(!log.record_actual(
+            id + 1_000_000,
+            ActualCost {
+                page_reads: 50,
+                cpu_micros: 10,
+                actual_rows: 5,
+                wall_time_micros: 20,
+            }
+        ));
+        assert_eq!(log.calibration_stats().calibrated_decisions, 0);
+
+        // Recording against the real id succeeds and calibrates that decision.
+        assert!(log.record_actual(
+            id,
+            ActualCost {
+                page_reads: 50,
+                cpu_micros: 10,
+                actual_rows: 5,
+                wall_time_micros: 20,
+            }
+        ));
+        assert_eq!(log.calibration_stats().calibrated_decisions, 1);
+    }
+
+    #[test]
     fn empty_log_stats() {
         let log = DecisionLog::new();
         let stats = log.calibration_stats();
@@ -1076,6 +1264,40 @@ mod tests {
         assert_eq!(stats.calibrated_decisions, 0);
         assert!(stats.is_well_calibrated());
         assert_eq!(log.chain_tip_hash(), GENESIS_HASH);
+    }
+
+    #[test]
+    fn calibration_stats_rate_and_well_calibrated_boundaries() {
+        let stats = |cal: usize, misc: usize, median: f64| CalibrationStats {
+            total_decisions: cal,
+            calibrated_decisions: cal,
+            miscalibrated_count: misc,
+            mean_ratio: median,
+            median_ratio: median,
+            stddev_ratio: 0.0,
+            min_ratio: median,
+            max_ratio: median,
+        };
+
+        // miscalibration_rate: zero calibrated -> 0.0 (guarded, no div-by-zero).
+        assert!(stats(0, 5, 1.0).miscalibration_rate().abs() < f64::EPSILON);
+        assert!((stats(10, 3, 1.0).miscalibration_rate() - 0.3).abs() < 1e-9);
+        assert!((stats(4, 1, 1.0).miscalibration_rate() - 0.25).abs() < 1e-9);
+
+        // No data -> well-calibrated (no evidence of miscalibration).
+        assert!(CalibrationStats::default().is_well_calibrated());
+
+        // Median boundaries are inclusive [0.5, 2.0]; rate must stay under 10%.
+        assert!(stats(100, 0, 1.0).is_well_calibrated());
+        assert!(stats(100, 0, 0.5).is_well_calibrated(), "median == 0.5 is in range");
+        assert!(stats(100, 0, 2.0).is_well_calibrated(), "median == 2.0 is in range");
+        assert!(!stats(100, 0, 0.49).is_well_calibrated(), "median below 0.5 fails");
+        assert!(!stats(100, 0, 2.01).is_well_calibrated(), "median above 2.0 fails");
+
+        // The miscalibration-rate threshold is strict (< 0.10): exactly 10% fails.
+        assert!(stats(100, 9, 1.0).is_well_calibrated(), "9% with a good median is ok");
+        assert!(!stats(100, 10, 1.0).is_well_calibrated(), "exactly 10% is not ok");
+        assert!(!stats(100, 50, 1.0).is_well_calibrated(), "high rate overrides a good median");
     }
 
     #[test]

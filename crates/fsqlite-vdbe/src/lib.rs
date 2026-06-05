@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub mod codegen;
+pub mod dataflow;
 pub mod engine;
 pub mod frame;
 pub mod jit;
@@ -908,22 +909,32 @@ fn peephole_fuse_append_insert(ops: &mut smallvec::SmallVec<[VdbeOp; 64]>) {
 /// that stay on storage cursors plus pure register/control-flow opcodes, which
 /// lets hot prepared table executions skip the `MemDatabase` handoff entirely.
 fn compute_requires_attached_memdb(ops: &[VdbeOp]) -> bool {
+    compute_attached_memdb_requirement_reason(ops).is_some()
+}
+
+/// Return the first conservative reason a finalized program still needs an
+/// attached `MemDatabase`.
+fn compute_attached_memdb_requirement_reason(ops: &[VdbeOp]) -> Option<&'static str> {
     let mut storage_cursor_ids = HashSet::new();
+    let mut sorter_cursor_ids = HashSet::new();
 
     for op in ops {
         match op.opcode {
             Opcode::OpenRead | Opcode::OpenWrite | Opcode::FusedOpenWriteLast => {
                 storage_cursor_ids.insert(op.p1);
             }
+            Opcode::SorterOpen => {
+                sorter_cursor_ids.insert(op.p1);
+            }
             Opcode::Close => {
                 storage_cursor_ids.remove(&op.p1);
+                sorter_cursor_ids.remove(&op.p1);
             }
             Opcode::OpenEphemeral
             | Opcode::OpenAutoindex
             | Opcode::OpenPseudo
             | Opcode::OpenDup
             | Opcode::ReopenIdx
-            | Opcode::SorterOpen
             | Opcode::CreateBtree
             | Opcode::Clear
             | Opcode::Destroy
@@ -939,7 +950,7 @@ fn compute_requires_attached_memdb(ops: &[VdbeOp]) -> bool {
             | Opcode::VColumn
             | Opcode::VNext
             | Opcode::VRename
-            | Opcode::VUpdate => return true,
+            | Opcode::VUpdate => return Some("memdb_or_virtual_table_opcode"),
             Opcode::Rewind
             | Opcode::Last
             | Opcode::Next
@@ -977,20 +988,66 @@ fn compute_requires_attached_memdb(ops: &[VdbeOp]) -> bool {
             | Opcode::SetSnapshot
             | Opcode::CountIndexEqRun
             | Opcode::FusedAppendInsert
-                if !storage_cursor_ids.contains(&op.p1) =>
+                if !storage_cursor_ids.contains(&op.p1) && !sorter_cursor_ids.contains(&op.p1) =>
             {
-                return true;
+                return Some("cursor_opcode_without_storage_or_sorter_open");
             }
             _ => {}
         }
     }
 
-    false
+    None
 }
 
 // ── VDBE Program ────────────────────────────────────────────────────────────
 
 pub(crate) type TableIndexMetaMap = HashMap<i32, Box<[fsqlite_types::opcode::IndexCursorMeta]>>;
+
+/// Static storage role inferred from a VDBE root cursor open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageRootRole {
+    Table,
+    Index,
+    Unknown,
+}
+
+/// Static storage access kind inferred from a VDBE root cursor open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageRootAccess {
+    Read,
+    Write,
+}
+
+/// Deterministic storage-root usage emitted by finalized bytecode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageRootUsage {
+    pub pc: usize,
+    pub cursor_id: i32,
+    pub root_page: i32,
+    pub access: StorageRootAccess,
+    pub role: StorageRootRole,
+}
+
+fn storage_root_usage_for_op(pc: usize, op: &VdbeOp) -> Option<StorageRootUsage> {
+    let access = match op.opcode {
+        Opcode::OpenRead => StorageRootAccess::Read,
+        Opcode::OpenWrite | Opcode::FusedOpenWriteLast => StorageRootAccess::Write,
+        _ => return None,
+    };
+    let role = match &op.p4 {
+        P4::Table(_) => StorageRootRole::Table,
+        P4::Index(_) => StorageRootRole::Index,
+        _ => StorageRootRole::Unknown,
+    };
+
+    Some(StorageRootUsage {
+        pc,
+        cursor_id: op.p1,
+        root_page: op.p2,
+        access,
+        role,
+    })
+}
 
 /// A finalized VDBE bytecode program ready for execution.
 #[derive(Debug, Clone, PartialEq)]
@@ -1174,6 +1231,17 @@ impl VdbeProgram {
         self.table_index_meta.as_ref()
     }
 
+    /// Returns storage B-tree root usage in deterministic instruction order.
+    ///
+    /// Conflict-topology and backend-identity diagnostics can use this to tie
+    /// bytecode to root-page level heat without ad hoc opcode scans.
+    pub fn storage_root_usages(&self) -> impl Iterator<Item = StorageRootUsage> + '_ {
+        self.ops
+            .iter()
+            .enumerate()
+            .filter_map(|(pc, op)| storage_root_usage_for_op(pc, op))
+    }
+
     pub(crate) fn shared_table_index_meta(&self) -> &Arc<TableIndexMetaMap> {
         &self.table_index_meta
     }
@@ -1189,6 +1257,12 @@ impl VdbeProgram {
     /// `MemDatabase` for opcode semantics.
     pub fn requires_attached_memdb(&self) -> bool {
         self.requires_attached_memdb
+    }
+
+    /// Returns the first conservative reason this program still requires an
+    /// attached `MemDatabase`, or `None` for storage-only VDBE programs.
+    pub fn attached_memdb_requirement_reason(&self) -> Option<&'static str> {
+        compute_attached_memdb_requirement_reason(&self.ops)
     }
 
     /// Returns `true` when this program can read historical page versions.
@@ -2520,6 +2594,24 @@ mod tests {
             prog.requires_attached_memdb(),
             "ephemeral table programs still depend on the attached MemDatabase"
         );
+    }
+
+    #[test]
+    fn test_program_with_sorter_cursor_does_not_require_attached_memdb() -> Result<()> {
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::SorterOpen, 0, 1, 0, P4::Str("+".to_owned()), 0);
+        b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish()?;
+        assert!(
+            !prog.requires_attached_memdb(),
+            "sorter-backed temp/exchange state is owned by VDBE and should not force a MemDatabase handoff"
+        );
+        Ok(())
     }
 
     #[test]

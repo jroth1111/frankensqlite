@@ -6,7 +6,7 @@ use std::time::Instant;
 use fsqlite_ast::{BinaryOp as AstBinaryOp, ColumnRef, Expr, Literal, Span};
 use fsqlite_planner::{
     AccessPath, AccessPathKind, IndexInfo, PlannerFeatureFlags, QueryPlan, QueryPlanner,
-    StatsSource, TableStats, WhereTerm, classify_where_term,
+    StatsSource, TableStats, WhereTerm, classify_where_term, order_joins_with_hints_and_features,
 };
 
 fn table_stats(name: &str, n_pages: u64, n_rows: u64) -> TableStats {
@@ -127,6 +127,34 @@ fn bench_order_joins_with_cache_hit(iterations: u64) -> (f64, u64) {
     )
 }
 
+/// Cache-MISS single-table planning path: calls the join planner directly so
+/// every iteration rebuilds the plan (no plan-cache short-circuit). This is the
+/// dominant OLTP shape — one table, one equality predicate — and exercises the
+/// `n == 1` arm of `order_joins_with_hints_and_features`.
+fn bench_order_joins_single_table_miss(iterations: u64) -> f64 {
+    let tables = [table_stats("users", 512, 200_000)];
+    let indexes = [index_info("idx_users_email", "users", &["email"], true, 64)];
+    let where_terms = [eq_term("email")];
+    let needed_columns = [String::from("email")];
+    let feature_flags = PlannerFeatureFlags::default();
+
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let plan = order_joins_with_hints_and_features(
+            black_box(&tables),
+            black_box(&indexes),
+            black_box(&where_terms),
+            Some(black_box(&needed_columns)),
+            &[],
+            None,
+            None,
+            feature_flags,
+        );
+        black_box(plan);
+    }
+    start.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations as f64
+}
+
 fn parse_iterations() -> u64 {
     let mut args = env::args().skip(1);
     let mut iterations = 2_000_000_u64;
@@ -150,11 +178,15 @@ fn main() {
     let iterations = parse_iterations();
     let (cached_plan_ns, cached_plan_misses) = bench_cached_plan_hit(iterations);
     let (order_joins_ns, order_joins_misses) = bench_order_joins_with_cache_hit(iterations);
+    let order_joins_miss_ns = bench_order_joins_single_table_miss(iterations);
 
     println!(
         "plan_cache_hot_paths cached_plan_hit_ns_per_op={cached_plan_ns:.2} iterations={iterations} unexpected_misses={cached_plan_misses}"
     );
     println!(
         "plan_cache_hot_paths order_joins_with_cache_hit_ns_per_op={order_joins_ns:.2} iterations={iterations} unexpected_misses={order_joins_misses}"
+    );
+    println!(
+        "plan_cache_hot_paths order_joins_single_table_miss_ns_per_op={order_joins_miss_ns:.2} iterations={iterations}"
     );
 }

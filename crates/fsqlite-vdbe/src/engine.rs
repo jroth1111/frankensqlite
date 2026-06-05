@@ -166,8 +166,9 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{
     ColumnOffset, PrecomputedSerialTypeKind, RecordProfileScope, enter_record_profile_scope,
-    parse_record, serialize_record, serialize_record_iter_with_precomputed_header_into,
-    simd_serialize_integer_record,
+    parse_record, record_iter_with_precomputed_header_exact_size, serialize_record,
+    serialize_record_iter_with_precomputed_header_into,
+    serialize_record_iter_with_precomputed_header_into_slice, simd_serialize_integer_record,
 };
 use fsqlite_types::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_len,
@@ -184,8 +185,8 @@ use crate::{
     TableIndexMetaMap, VdbeProgram, enter_vdbe_decode_profile_stage,
     enter_vdbe_execute_profile_stage,
     jit::{
-        CompiledProgram, ConstantResultRowTemplate, FullScanSelectTemplate, InsertValueSource,
-        RowidLookupSelectTemplate, SimpleInsertTemplate, try_compile_program,
+        CompiledProgram, CompiledRecordBuilder, ConstantResultRowTemplate, FullScanSelectTemplate,
+        InsertValueSource, RowidLookupSelectTemplate, SimpleInsertTemplate, try_compile_program,
     },
     opcode_register_spans,
 };
@@ -3719,6 +3720,12 @@ struct StorageCursor {
     cached_rowid: Option<i64>,
     /// Cached result of payload_includes_rowid_alias check for the current row.
     payload_includes_rowid_alias: Option<bool>,
+    /// Schema-derived IPK column index for this root page (avoids per-Column HashMap probes).
+    ipk_col_idx: Option<usize>,
+    /// Schema-derived column count for this root page.
+    table_column_count: Option<usize>,
+    /// Schema-derived first NOT NULL non-IPK column for this root page.
+    first_not_null_non_ipk_col: Option<usize>,
 }
 
 /// Lightweight version token for `MemDatabase` undo/rollback (bd-g6eo).
@@ -3758,7 +3765,6 @@ enum MemDbUndoOp {
     },
     DeleteRow {
         root_page: i32,
-        index: usize,
         row: MemRow,
         prev_next_rowid: i64,
     },
@@ -3805,7 +3811,6 @@ impl MemDbUndoOp {
             }
             Self::DeleteRow {
                 root_page,
-                index: _,
                 row,
                 prev_next_rowid,
             } => {
@@ -4038,6 +4043,66 @@ impl MemDatabase {
         }
     }
 
+    /// Allocate an implicit rowid and insert the row, recording one undo entry
+    /// for both the rowid counter advance and the row mutation. If
+    /// `rowid_value_column` is present, that column is patched to the allocated
+    /// rowid before insertion.
+    #[must_use]
+    pub fn insert_auto_row<V>(
+        &mut self,
+        root_page: i32,
+        values: V,
+        rowid_value_column: Option<usize>,
+    ) -> Option<i64>
+    where
+        V: Into<MemRowValues>,
+    {
+        let mut values = values.into();
+        if let Some(table) = self.tables.get_mut(&root_page) {
+            let prev_next_rowid = table.next_rowid;
+            let rowid = table.alloc_rowid();
+            if let Some(column) = rowid_value_column
+                && let Some(value) = values.get_mut(column)
+            {
+                *value = SqliteValue::Integer(rowid);
+            }
+            let old_values = table
+                .rows
+                .binary_search_by_key(&rowid, |r| r.rowid)
+                .ok()
+                .map(|idx| table.rows[idx].values.clone());
+            table.insert(rowid, values);
+            self.push_undo(MemDbUndoOp::UpsertRow {
+                root_page,
+                rowid,
+                prev_next_rowid,
+                old_values,
+            });
+            Some(rowid)
+        } else {
+            None
+        }
+    }
+
+    /// Delete a row by rowid, recording undo information for rollback.
+    pub fn delete_rowid(&mut self, root_page: i32, rowid: i64) -> bool {
+        if let Some(table) = self.tables.get_mut(&root_page)
+            && let Ok(index) = table.rows.binary_search_by_key(&rowid, |r| r.rowid)
+        {
+            let prev_next_rowid = table.next_rowid;
+            let row = table.rows.remove(index);
+            table.remove_unique_entries(row.rowid, &row.values);
+            self.push_undo(MemDbUndoOp::DeleteRow {
+                root_page,
+                row,
+                prev_next_rowid,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
     #[allow(dead_code)]
     fn delete_at(&mut self, root_page: i32, index: usize) {
         if let Some(table) = self.tables.get_mut(&root_page) {
@@ -4047,7 +4112,6 @@ impl MemDatabase {
                 table.remove_unique_entries(row.rowid, &row.values);
                 self.push_undo(MemDbUndoOp::DeleteRow {
                     root_page,
-                    index,
                     row,
                     prev_next_rowid,
                 });
@@ -4198,7 +4262,7 @@ static FSQLITE_JIT_CACHE_CAPACITY: AtomicU64 = AtomicU64::new(128);
 #[derive(Debug, Clone)]
 struct JitCacheEntry {
     code_size_bytes: u64,
-    compiled_program: CompiledProgram,
+    compiled_program: Arc<CompiledProgram>,
 }
 
 #[derive(Debug, Default)]
@@ -4977,7 +5041,7 @@ enum JitDecision {
     CacheHit {
         plan_hash: u64,
         code_size_bytes: u64,
-        compiled_program: CompiledProgram,
+        compiled_program: Arc<CompiledProgram>,
     },
     UnsupportedCached {
         plan_hash: u64,
@@ -4987,7 +5051,7 @@ enum JitDecision {
         compile_time_us: u64,
         code_size_bytes: u64,
         evicted_plan_hash: Option<u64>,
-        compiled_program: CompiledProgram,
+        compiled_program: Arc<CompiledProgram>,
     },
     CompileFailed {
         plan_hash: u64,
@@ -5117,7 +5181,17 @@ fn estimate_compiled_program_size(compiled_program: &CompiledProgram) -> u64 {
         }
         CompiledProgram::SimpleInsert(template) => {
             let value_count = u64::try_from(template.value_sources.len()).unwrap_or(u64::MAX);
-            value_count.saturating_mul(32).saturating_add(96)
+            let builder_bytes = match &template.record_builder {
+                CompiledRecordBuilder::Generic => 0,
+                CompiledRecordBuilder::PrecomputedHeader(header) => {
+                    u64::try_from(header.template.len() + header.slots.len() * 8)
+                        .unwrap_or(u64::MAX)
+                }
+            };
+            value_count
+                .saturating_mul(32)
+                .saturating_add(96)
+                .saturating_add(builder_bytes)
         }
         CompiledProgram::RowidLookupSelect(template) => {
             let col_count = u64::try_from(template.column_indices.len()).unwrap_or(u64::MAX);
@@ -5164,13 +5238,17 @@ fn maybe_trigger_jit(program: &VdbeProgram) -> JitDecision {
     if runtime.is_unsupported_plan(plan_hash) {
         return JitDecision::UnsupportedCached { plan_hash };
     }
-    if let Some(entry) = runtime.cache.get(&plan_hash).cloned() {
+    if let Some((code_size_bytes, compiled_program)) = runtime
+        .cache
+        .get(&plan_hash)
+        .map(|entry| (entry.code_size_bytes, Arc::clone(&entry.compiled_program)))
+    {
         FSQLITE_JIT_CACHE_HITS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
         runtime.touch_lru(plan_hash);
         return JitDecision::CacheHit {
             plan_hash,
-            code_size_bytes: entry.code_size_bytes,
-            compiled_program: entry.compiled_program,
+            code_size_bytes,
+            compiled_program,
         };
     }
 
@@ -5181,11 +5259,12 @@ fn maybe_trigger_jit(program: &VdbeProgram) -> JitDecision {
             FSQLITE_JIT_COMPILATIONS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
             let compile_time_us =
                 u64::try_from(compile_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            let compiled_program = Arc::new(compiled_program);
             let evicted_plan_hash = runtime.insert_cache(
                 plan_hash,
                 JitCacheEntry {
                     code_size_bytes,
-                    compiled_program: compiled_program.clone(),
+                    compiled_program: Arc::clone(&compiled_program),
                 },
                 cache_capacity,
             );
@@ -5306,6 +5385,69 @@ impl MakeRecordStatementLookaside {
     fn as_slice(&self) -> &[u8] {
         self.buf.as_slice()
     }
+}
+
+enum CompiledRecordWritePlan<'a> {
+    PrecomputedHeader {
+        values: &'a [SqliteValue],
+        header: &'a fsqlite_types::record::PrecomputedRecordHeader,
+        exact_size: usize,
+    },
+    Generic(fsqlite_types::record::PlannedRecordSerialization<'a>),
+}
+
+impl CompiledRecordWritePlan<'_> {
+    #[must_use]
+    fn exact_size(&self) -> usize {
+        match self {
+            Self::PrecomputedHeader { exact_size, .. } => *exact_size,
+            Self::Generic(plan) => plan.exact_size(),
+        }
+    }
+
+    #[allow(clippy::result_unit_err)]
+    fn write_into_slice(self, dst: &mut [u8]) -> std::result::Result<(), ()> {
+        match self {
+            Self::PrecomputedHeader { values, header, .. } => {
+                serialize_record_iter_with_precomputed_header_into_slice(values.iter(), header, dst)
+            }
+            Self::Generic(plan) => plan.write_into_slice(dst),
+        }
+    }
+}
+
+fn build_compiled_record_write_plan<'a>(
+    values: &'a [SqliteValue],
+    record_builder: &'a CompiledRecordBuilder,
+) -> CompiledRecordWritePlan<'a> {
+    if let CompiledRecordBuilder::PrecomputedHeader(header) = record_builder
+        && let Some(exact_size) =
+            record_iter_with_precomputed_header_exact_size(values.iter(), header)
+    {
+        return CompiledRecordWritePlan::PrecomputedHeader {
+            values,
+            header,
+            exact_size,
+        };
+    }
+
+    CompiledRecordWritePlan::Generic(fsqlite_types::record::plan_record_iter_serialization(
+        values.iter(),
+    ))
+}
+
+fn serialize_compiled_record_into_vec(
+    values: &[SqliteValue],
+    record_builder: &CompiledRecordBuilder,
+    buf: &mut Vec<u8>,
+) {
+    if let CompiledRecordBuilder::PrecomputedHeader(header) = record_builder
+        && serialize_record_iter_with_precomputed_header_into(values.iter(), header, buf)
+    {
+        return;
+    }
+
+    fsqlite_types::record::serialize_record_iter_into(values.iter(), buf);
 }
 
 /// The VDBE bytecode interpreter.
@@ -7559,7 +7701,7 @@ impl VdbeEngine {
 
         if let Some(compiled_program) = compiled_program {
             let outcome = self.execute_compiled_program(
-                &compiled_program,
+                compiled_program.as_ref(),
                 borrowed_bindings,
                 collect_vdbe_metrics,
                 &mut row_handler,
@@ -8406,11 +8548,7 @@ impl VdbeEngine {
                         let cx = self.derive_execution_cx();
                         let mut cursor =
                             BtCursor::new(store, root_pgno, autoindex_page_size, false);
-                        let autoindex_collations = parse_compare_collations(&op.p4)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(Some)
-                            .collect::<Vec<_>>();
+                        let autoindex_collations = extract_collation_names_owned(&op.p4);
                         if !autoindex_collations.is_empty() {
                             cursor.set_index_collation_context(
                                 autoindex_collations,
@@ -8440,6 +8578,9 @@ impl VdbeEngine {
                                 last_rightmost_unique_index_position: None,
                                 cached_rowid: None,
                                 payload_includes_rowid_alias: None,
+                                ipk_col_idx: None,
+                                table_column_count: None,
+                                first_not_null_non_ipk_col: None,
                             },
                         );
                     }
@@ -8639,7 +8780,9 @@ impl VdbeEngine {
                 Opcode::Next | Opcode::SorterNext => {
                     // Advance cursor to the next row. Jump to p2 if more rows.
                     let cursor_id = op.p1;
-                    let has_next = if self.pending_next_after_delete.remove(&cursor_id) {
+                    let has_next = if !self.pending_next_after_delete.is_empty()
+                        && self.pending_next_after_delete.remove(&cursor_id)
+                    {
                         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                             !cursor.cursor.eof()
                         } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
@@ -8666,6 +8809,8 @@ impl VdbeEngine {
                         } else {
                             false
                         }
+                    } else if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                        cursor.cursor.next(&cursor.cx)?
                     } else if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
                         if let Some(pos) = sorter.position {
                             let next = pos + 1;
@@ -8702,8 +8847,6 @@ impl VdbeEngine {
                         } else {
                             false
                         }
-                    } else if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                        cursor.cursor.next(&cursor.cx)?
                     } else {
                         false
                     };
@@ -8719,7 +8862,9 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     // Prev repositions the cursor, so clear any pending
                     // delete/next state before evaluating movement.
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    if !self.pending_next_after_delete.is_empty() {
+                        self.pending_next_after_delete.remove(&cursor_id);
+                    }
                     let has_prev = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         cursor.cursor.prev(&cursor.cx)?
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
@@ -9706,13 +9851,11 @@ impl VdbeEngine {
                                         5 => {
                                             // OE_REPLACE: Delete conflicting row(s),
                                             // then insert new.
-                                            if let Some(table) = db.get_table_mut(root) {
-                                                for conflict_rid in unique_conflicts {
-                                                    // Delete conflicting rows that are not the new rowid
-                                                    // (which will be replaced by upsert_row).
-                                                    if conflict_rid != rowid {
-                                                        table.delete_by_rowid(conflict_rid);
-                                                    }
+                                            for conflict_rid in unique_conflicts {
+                                                // Delete conflicting rows that are not the new rowid
+                                                // (which will be replaced by upsert_row).
+                                                if conflict_rid != rowid {
+                                                    db.delete_rowid(root, conflict_rid);
                                                 }
                                             }
                                             db.upsert_row(root, rowid, values);
@@ -10599,7 +10742,6 @@ impl VdbeEngine {
                     let start_a = op.p1;
                     let start_b = op.p2;
                     let count = op.p3;
-                    let compare_collations = parse_compare_collations(&op.p4);
                     let coll_arc = Arc::clone(&self.collation_registry);
                     let result = {
                         let coll = coll_arc.lock().unwrap_or_else(|e| e.into_inner());
@@ -10608,10 +10750,7 @@ impl VdbeEngine {
                             let val_a = self.get_reg(start_a + i);
                             let val_b = self.get_reg(start_b + i);
                             let coll_name = usize::try_from(i).ok().and_then(|field_idx| {
-                                compare_collation_for_field(
-                                    compare_collations.as_deref(),
-                                    field_idx,
-                                )
+                                compare_collation_for_field_from_p4(&op.p4, field_idx)
                             });
                             // SQLite NULL sort order: NULLs sort before all other
                             // values.  When partial_cmp returns None (NULL vs
@@ -12587,8 +12726,113 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::If => {
+                let val = self.get_reg(op.p1);
+                let should_jump = if val.is_null() {
+                    op.p3 != 0
+                } else {
+                    vdbe_real_is_truthy(val)
+                };
+                if should_jump {
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        *pc = op.p2 as usize;
+                    }
+                } else {
+                    *pc += 1;
+                }
+                Ok(true)
+            }
+            Opcode::Next | Opcode::SorterNext => {
+                self.execute_next_hot(op, pc)?;
+                Ok(true)
+            }
             _ => Ok(false),
         }
+    }
+
+    #[inline(always)]
+    fn execute_next_hot(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<()> {
+        let cursor_id = op.p1;
+        let has_next = if !self.pending_next_after_delete.is_empty()
+            && self.pending_next_after_delete.remove(&cursor_id)
+        {
+            if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                !cursor.cursor.eof()
+            } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                if cursor.is_pseudo {
+                    false
+                } else if let Some(pos) = cursor.position {
+                    if let Some(table) = self
+                        .db
+                        .as_ref()
+                        .and_then(|db| db.get_table(cursor.root_page))
+                    {
+                        if pos < table.rows.len() {
+                            true
+                        } else {
+                            cursor.position = None;
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+            cursor.cursor.next(&cursor.cx)?
+        } else if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
+            if let Some(pos) = sorter.position {
+                let next = pos + 1;
+                if next < sorter.rows.len() {
+                    sorter.position = Some(next);
+                    true
+                } else {
+                    sorter.position = None;
+                    false
+                }
+            } else {
+                false
+            }
+        } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+            if cursor.is_pseudo {
+                false
+            } else if let Some(db) = self.db.as_ref() {
+                if let Some(table) = db.get_table(cursor.root_page) {
+                    if let Some(pos) = cursor.position {
+                        let next = pos + 1;
+                        if next < table.rows.len() {
+                            cursor.position = Some(next);
+                            true
+                        } else {
+                            cursor.position = None;
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if has_next {
+            #[allow(clippy::cast_sign_loss)]
+            {
+                *pc = op.p2 as usize;
+            }
+        } else {
+            *pc += 1;
+        }
+        Ok(())
     }
 
     #[inline(always)]
@@ -12821,7 +13065,8 @@ impl VdbeEngine {
             };
             rowid
         };
-        let record_plan = fsqlite_types::record::plan_record_iter_serialization(values.iter());
+        let record_plan =
+            build_compiled_record_write_plan(values.as_slice(), &template.record_builder);
         let payload_len = record_plan.exact_size();
         let appended_directly = if let Some(sc) = self.storage_cursors.get_mut(&template.cursor_id)
         {
@@ -12848,7 +13093,11 @@ impl VdbeEngine {
         };
         if !appended_directly {
             let mut payload_buf = self.make_record_lookaside.take_buf();
-            fsqlite_types::record::serialize_record_iter_into(values.iter(), &mut payload_buf);
+            serialize_compiled_record_into_vec(
+                values.as_slice(),
+                &template.record_builder,
+                &mut payload_buf,
+            );
             let append_result = if let Some(sc) = self.storage_cursors.get_mut(&template.cursor_id)
             {
                 let result =
@@ -13092,34 +13341,41 @@ impl VdbeEngine {
         let start_a = op.p1;
         let start_b = op.p2;
         let count = op.p3;
-        let compare_collations = parse_compare_collations(&op.p4);
-        let coll_arc = Arc::clone(&self.collation_registry);
+        let has_collation = matches!(op.p4, P4::Collation(_) | P4::Str(_));
+        let coll_arc = if has_collation {
+            Some(Arc::clone(&self.collation_registry))
+        } else {
+            None
+        };
         let mut coll_guard = None;
         let mut result = Ordering::Equal;
 
         for i in 0..count {
             let val_a = self.get_reg(start_a + i);
             let val_b = self.get_reg(start_b + i);
-            let coll_name = usize::try_from(i).ok().and_then(|field_idx| {
-                compare_collation_for_field(compare_collations.as_deref(), field_idx)
-            });
+            let coll_name = usize::try_from(i)
+                .ok()
+                .and_then(|field_idx| compare_collation_for_field_from_p4(&op.p4, field_idx));
 
             let ord = if let Some(coll_name) = coll_name {
                 if let (SqliteValue::Text(left), SqliteValue::Text(right)) = (val_a, val_b) {
                     if let Some(fast) = builtin_collation_compare_text(left, right, coll_name) {
                         Some(fast)
-                    } else {
-                        let coll = coll_guard.get_or_insert_with(|| {
-                            coll_arc.lock().unwrap_or_else(|e| e.into_inner())
-                        });
+                    } else if let Some(arc) = coll_arc.as_ref() {
+                        let coll = coll_guard
+                            .get_or_insert_with(|| arc.lock().unwrap_or_else(|e| e.into_inner()));
                         collate_compare(val_a, val_b, coll_name, coll)
+                    } else {
+                        val_a.partial_cmp(val_b)
                     }
                 } else if let Some(fast) = fast_compare_same_storage_class(val_a, val_b, &op.p4) {
                     fast
-                } else {
+                } else if let Some(arc) = coll_arc.as_ref() {
                     let coll = coll_guard
-                        .get_or_insert_with(|| coll_arc.lock().unwrap_or_else(|e| e.into_inner()));
+                        .get_or_insert_with(|| arc.lock().unwrap_or_else(|e| e.into_inner()));
                     collate_compare(val_a, val_b, coll_name, coll)
+                } else {
+                    val_a.partial_cmp(val_b)
                 }
             } else if let Some(fast) = fast_compare_same_storage_class(val_a, val_b, &P4::None) {
                 fast
@@ -13388,6 +13644,9 @@ impl VdbeEngine {
                 last_successful_insert_rowid: None,
                 last_rightmost_unique_index_prefix: None,
                 last_rightmost_unique_index_position: None,
+                ipk_col_idx: old_sc.ipk_col_idx,
+                table_column_count: old_sc.table_column_count,
+                first_not_null_non_ipk_col: old_sc.first_not_null_non_ipk_col,
             },
         );
         tracing::info!(
@@ -13750,43 +14009,17 @@ impl VdbeEngine {
 
         ensure_storage_cursor_row_layout(cursor, 0, collect_vdbe_metrics)?;
 
-        let root_page = self.cursor_root_pages.get(&cursor_id).copied();
-        let ipk_col_idx = root_page
-            .and_then(|rp| self.rowid_alias_col_by_root_page.get(&rp))
-            .copied();
+        let ipk_col_idx = cursor.ipk_col_idx;
         let payload_includes = if let Some(ipk) = ipk_col_idx {
             if let Some(cached) = cursor.payload_includes_rowid_alias {
                 cached
-            } else if let Some(rp) = root_page {
+            } else {
                 let includes = payload_includes_rowid_alias_without_rowid(
                     &cursor.row_decode,
                     ipk,
-                    self.table_column_count_by_root_page.get(&rp).copied(),
-                    self.first_not_null_non_ipk_col_by_root_page
-                        .get(&rp)
-                        .copied(),
+                    cursor.table_column_count,
+                    cursor.first_not_null_non_ipk_col,
                 );
-                cursor.payload_includes_rowid_alias = Some(includes);
-                includes
-            } else {
-                let rowid = storage_cursor_cached_rowid(cursor)?;
-                if let Some(ipk_col) = cursor.row_decode.column_offset(ipk).copied()
-                    && let Some(ipk_end) = column_payload_end(&ipk_col)
-                {
-                    ensure_storage_cursor_row_layout(cursor, ipk_end, collect_vdbe_metrics)?;
-                }
-                let includes = root_page.is_some_and(|rp| {
-                    payload_includes_rowid_alias_lazy(
-                        &cursor.row_decode,
-                        &cursor.payload_buf,
-                        rowid,
-                        ipk,
-                        self.table_column_count_by_root_page.get(&rp).copied(),
-                        self.first_not_null_non_ipk_col_by_root_page
-                            .get(&rp)
-                            .copied(),
-                    )
-                });
                 cursor.payload_includes_rowid_alias = Some(includes);
                 includes
             }
@@ -13884,49 +14117,17 @@ impl VdbeEngine {
             ensure_storage_cursor_row_layout(cursor, 0, self.collect_vdbe_metrics)?;
 
         // ── Resolve IPK alias and payload column index ────────────
-        let root_page = self.cursor_root_pages.get(&cursor_id).copied();
-        let ipk_col_idx = root_page
-            .and_then(|rp| self.rowid_alias_col_by_root_page.get(&rp))
-            .copied();
+        let ipk_col_idx = cursor.ipk_col_idx;
         let payload_includes = if let Some(ipk) = ipk_col_idx {
             if let Some(cached) = cursor.payload_includes_rowid_alias {
                 cached
-            } else if let Some(rp) = root_page {
+            } else {
                 let includes = payload_includes_rowid_alias_without_rowid(
                     &cursor.row_decode,
                     ipk,
-                    self.table_column_count_by_root_page.get(&rp).copied(),
-                    self.first_not_null_non_ipk_col_by_root_page
-                        .get(&rp)
-                        .copied(),
+                    cursor.table_column_count,
+                    cursor.first_not_null_non_ipk_col,
                 );
-                cursor.payload_includes_rowid_alias = Some(includes);
-                includes
-            } else {
-                let rowid = storage_cursor_cached_rowid(cursor)?;
-                if let Some(ipk_col) = cursor.row_decode.column_offset(ipk).copied()
-                    && let Some(ipk_end) = column_payload_end(&ipk_col)
-                {
-                    let ipk_refresh = ensure_storage_cursor_row_layout(
-                        cursor,
-                        ipk_end,
-                        self.collect_vdbe_metrics,
-                    )?;
-                    refresh_state.refreshed |= ipk_refresh.refreshed;
-                    refresh_state.eager_values_ready |= ipk_refresh.eager_values_ready;
-                }
-                let includes = root_page.is_some_and(|rp| {
-                    payload_includes_rowid_alias_lazy(
-                        &cursor.row_decode,
-                        &cursor.payload_buf,
-                        rowid,
-                        ipk,
-                        self.table_column_count_by_root_page.get(&rp).copied(),
-                        self.first_not_null_non_ipk_col_by_root_page
-                            .get(&rp)
-                            .copied(),
-                    )
-                });
                 cursor.payload_includes_rowid_alias = Some(includes);
                 includes
             }
@@ -14076,53 +14277,17 @@ impl VdbeEngine {
             let mut refresh_state =
                 ensure_storage_cursor_row_layout(cursor, 0, collect_vdbe_metrics)?;
 
-            let root_page = self.cursor_root_pages.get(&cursor_id).copied();
-            let ipk_col_idx = root_page
-                .and_then(|root_page| self.rowid_alias_col_by_root_page.get(&root_page))
-                .copied();
+            let ipk_col_idx = cursor.ipk_col_idx;
             let payload_includes_rowid_alias = if let Some(ipk_col_idx) = ipk_col_idx {
                 if let Some(cached) = cursor.payload_includes_rowid_alias {
                     cached
-                } else if let Some(root_page) = root_page {
+                } else {
                     let includes = payload_includes_rowid_alias_without_rowid(
                         &cursor.row_decode,
                         ipk_col_idx,
-                        self.table_column_count_by_root_page
-                            .get(&root_page)
-                            .copied(),
-                        self.first_not_null_non_ipk_col_by_root_page
-                            .get(&root_page)
-                            .copied(),
+                        cursor.table_column_count,
+                        cursor.first_not_null_non_ipk_col,
                     );
-                    cursor.payload_includes_rowid_alias = Some(includes);
-                    includes
-                } else {
-                    let rowid = storage_cursor_cached_rowid(cursor)?;
-                    if let Some(ipk_col) = cursor.row_decode.column_offset(ipk_col_idx).copied()
-                        && let Some(ipk_end) = column_payload_end(&ipk_col)
-                    {
-                        let ipk_refresh = ensure_storage_cursor_row_layout(
-                            cursor,
-                            ipk_end,
-                            collect_vdbe_metrics,
-                        )?;
-                        refresh_state.refreshed |= ipk_refresh.refreshed;
-                        refresh_state.eager_values_ready |= ipk_refresh.eager_values_ready;
-                    }
-                    let includes = root_page.is_some_and(|root_page| {
-                        payload_includes_rowid_alias_lazy(
-                            &cursor.row_decode,
-                            &cursor.payload_buf,
-                            rowid,
-                            ipk_col_idx,
-                            self.table_column_count_by_root_page
-                                .get(&root_page)
-                                .copied(),
-                            self.first_not_null_non_ipk_col_by_root_page
-                                .get(&root_page)
-                                .copied(),
-                        )
-                    });
                     cursor.payload_includes_rowid_alias = Some(includes);
                     includes
                 }
@@ -14561,6 +14726,15 @@ impl VdbeEngine {
                         );
                     }
                     configure_btree_cursor_page_size(&mut cursor, page_layout);
+                    let ipk_col_idx = self.rowid_alias_col_by_root_page.get(&root_page).copied();
+                    let table_column_count = self
+                        .table_column_count_by_root_page
+                        .get(&root_page)
+                        .copied();
+                    let first_not_null_non_ipk_col = self
+                        .first_not_null_non_ipk_col_by_root_page
+                        .get(&root_page)
+                        .copied();
                     self.storage_cursors.insert(
                         cursor_id,
                         StorageCursor {
@@ -14581,6 +14755,9 @@ impl VdbeEngine {
                             last_position_stamp: None,
                             cached_rowid: None,
                             payload_includes_rowid_alias: None,
+                            ipk_col_idx,
+                            table_column_count,
+                            first_not_null_non_ipk_col,
                         },
                     );
                     self.cursor_root_pages.insert(cursor_id, root_page);
@@ -14675,6 +14852,15 @@ impl VdbeEngine {
                         );
                     }
                     configure_btree_cursor_page_size(&mut cursor, page_layout);
+                    let ipk_col_idx = self.rowid_alias_col_by_root_page.get(&root_page).copied();
+                    let table_column_count = self
+                        .table_column_count_by_root_page
+                        .get(&root_page)
+                        .copied();
+                    let first_not_null_non_ipk_col = self
+                        .first_not_null_non_ipk_col_by_root_page
+                        .get(&root_page)
+                        .copied();
                     self.storage_cursors.insert(
                         cursor_id,
                         StorageCursor {
@@ -14695,6 +14881,9 @@ impl VdbeEngine {
                             last_position_stamp: None,
                             cached_rowid: None,
                             payload_includes_rowid_alias: None,
+                            ipk_col_idx,
+                            table_column_count,
+                            first_not_null_non_ipk_col,
                         },
                     );
                     self.cursor_root_pages.insert(cursor_id, root_page);
@@ -14811,6 +15000,15 @@ impl VdbeEngine {
             }
         }
 
+        let ipk_col_idx = self.rowid_alias_col_by_root_page.get(&root_page).copied();
+        let table_column_count = self
+            .table_column_count_by_root_page
+            .get(&root_page)
+            .copied();
+        let first_not_null_non_ipk_col = self
+            .first_not_null_non_ipk_col_by_root_page
+            .get(&root_page)
+            .copied();
         self.storage_cursors.insert(
             cursor_id,
             StorageCursor {
@@ -14831,6 +15029,9 @@ impl VdbeEngine {
                 last_position_stamp: None,
                 cached_rowid: None,
                 payload_includes_rowid_alias: None,
+                ipk_col_idx,
+                table_column_count,
+                first_not_null_non_ipk_col,
             },
         );
         self.cursor_root_pages.insert(cursor_id, root_page);
@@ -15101,28 +15302,46 @@ fn fast_compare_same_storage_class(
     }
 }
 
-fn parse_compare_collations(p4: &P4) -> Option<Vec<String>> {
+fn extract_collation_names_owned(p4: &P4) -> Vec<Option<String>> {
     match p4 {
-        P4::Collation(name) => Some(vec![name.clone()]),
-        P4::Str(spec) => {
-            let parsed: Vec<String> = spec
-                .split([',', '|', '\0'])
-                .map(str::trim)
-                .filter(|entry| !entry.is_empty())
-                .map(str::to_owned)
-                .collect();
-            (!parsed.is_empty()).then_some(parsed)
-        }
-        _ => None,
+        P4::Collation(name) => vec![Some(name.clone())],
+        P4::Str(spec) => spec
+            .split([',', '|', '\0'])
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|s| Some(s.to_owned()))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
-fn compare_collation_for_field(collations: Option<&[String]>, field_idx: usize) -> Option<&str> {
-    let collations = collations?;
-    if collations.len() == 1 {
-        return collations.first().map(String::as_str);
+fn compare_collation_for_field_from_p4(p4: &P4, field_idx: usize) -> Option<&str> {
+    match p4 {
+        P4::Collation(name) => Some(name.as_str()),
+        P4::Str(spec) => {
+            let mut idx = 0;
+            for entry in spec.split([',', '|', '\0']) {
+                let trimmed = entry.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if idx == field_idx {
+                    return Some(trimmed);
+                }
+                idx += 1;
+            }
+            if idx == 1 && field_idx > 0 {
+                for entry in spec.split([',', '|', '\0']) {
+                    let trimmed = entry.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
     }
-    collations.get(field_idx).map(String::as_str)
 }
 
 /// For REPLACE conflict resolution: re-seek the index cursor, find the
@@ -16231,6 +16450,23 @@ fn payload_includes_rowid_alias(
     matches!(payload_values.get(ipk_col_idx), Some(SqliteValue::Null))
 }
 
+#[allow(dead_code)]
+fn payload_includes_rowid_alias_lazy(
+    row_decode: &RowDecodeScratch,
+    _record: &[u8],
+    _rowid: i64,
+    ipk_col_idx: usize,
+    table_column_count: Option<usize>,
+    first_not_null_non_ipk_col_idx: Option<usize>,
+) -> bool {
+    payload_includes_rowid_alias_without_rowid(
+        row_decode,
+        ipk_col_idx,
+        table_column_count,
+        first_not_null_non_ipk_col_idx,
+    )
+}
+
 /// Resolve the rowid-alias payload shape from record-header metadata alone.
 ///
 /// This stays conservative for non-NULL IPK-position values: a shifted user
@@ -16284,75 +16520,6 @@ fn payload_includes_rowid_alias_without_rowid(
         return false;
     };
     matches!(classify_serial_type(col.serial_type), SerialTypeClass::Null)
-}
-
-/// Lazy-decode variant of [`payload_includes_rowid_alias`] that works
-/// with the header offset table instead of requiring all columns to be
-/// pre-decoded.
-///
-/// Only the serial type is inspected. Integer equality is deliberately
-/// ignored because a shifted first stored user column can coincidentally equal
-/// the physical rowid after `ALTER TABLE ADD COLUMN`.
-fn payload_includes_rowid_alias_lazy(
-    row_decode: &RowDecodeScratch,
-    _payload_buf: &[u8],
-    _rowid: i64,
-    ipk_col_idx: usize,
-    table_column_count: Option<usize>,
-    first_not_null_non_ipk_col_idx: Option<usize>,
-) -> bool {
-    use fsqlite_types::serial_type::{SerialTypeClass, classify_serial_type};
-
-    let payload_cols = row_decode.column_count();
-    if let Some(table_cols) = table_column_count {
-        if payload_cols == table_cols {
-            return true;
-        }
-        if ipk_col_idx < payload_cols {
-            // The IPK position exists in the payload. Check its serial
-            // type. SQLite-format INTEGER PRIMARY KEY aliases are stored as
-            // NULL placeholders, while a non-NULL value at this position may
-            // be a shifted user column from a shorter payload.
-            if let Some(col) = row_decode.column_offset(ipk_col_idx) {
-                let serial_class = classify_serial_type(col.serial_type);
-                if matches!(serial_class, SerialTypeClass::Null) {
-                    // NULL placeholder at IPK position → IPK is included.
-                    return true;
-                }
-                if matches!(serial_class, SerialTypeClass::Integer) {
-                    return false;
-                }
-            }
-        }
-        if let Some(not_null_col_idx) =
-            first_not_null_non_ipk_col_idx.filter(|idx| *idx > ipk_col_idx)
-        {
-            let omitted_payload_idx = not_null_col_idx - 1;
-            let present_payload_idx = not_null_col_idx;
-            if omitted_payload_idx < payload_cols
-                && present_payload_idx < payload_cols
-                && let Some(col) = row_decode.column_offset(omitted_payload_idx)
-            {
-                if matches!(classify_serial_type(col.serial_type), SerialTypeClass::Null) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-    if payload_cols <= ipk_col_idx {
-        return false;
-    }
-
-    let Some(col) = row_decode.column_offset(ipk_col_idx) else {
-        return false;
-    };
-
-    match classify_serial_type(col.serial_type) {
-        // NULL serial type → rowid alias is present (stored as NULL placeholder).
-        SerialTypeClass::Null => true,
-        _ => false,
-    }
 }
 
 fn column_payload_end(col: &ColumnOffset) -> Option<usize> {
@@ -21800,6 +21967,46 @@ mod tests {
             );
         }
 
+        #[test]
+        fn test_codegen_insert_current_timestamp_uses_runtime_make_record() {
+            let schema = test_schema();
+            let ctx = CodegenContext::default();
+            let stmt = InsertStatement {
+                with: None,
+                or_conflict: None,
+                table: QualifiedName {
+                    schema: None,
+                    name: "t".to_owned(),
+                },
+                alias: None,
+                columns: vec![],
+                source: InsertSource::Values(vec![vec![
+                    Expr::Literal(Literal::CurrentTimestamp, span()),
+                    Expr::Literal(Literal::String("runtime".to_owned()), span()),
+                ]]),
+                upsert: vec![],
+                returning: vec![],
+            };
+
+            let mut b = ProgramBuilder::new();
+            codegen_insert(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
+            let prog = b.finish().expect("program should build");
+            let insert = prog
+                .ops()
+                .iter()
+                .find(|op| op.opcode == Opcode::Insert)
+                .expect("program should contain Insert");
+
+            assert!(
+                prog.ops().iter().any(|op| op.opcode == Opcode::MakeRecord),
+                "volatile CURRENT_TIMESTAMP values must stay on the runtime record assembly path"
+            );
+            assert!(
+                !matches!(&insert.p4, P4::Blob(_)),
+                "volatile CURRENT_TIMESTAMP values must not be captured in a preformatted Insert payload"
+            );
+        }
+
         /// Verify emit_expr handles arithmetic BinaryOp in INSERT values.
         #[test]
         fn test_codegen_insert_arithmetic_expr() {
@@ -24165,6 +24372,66 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_record_builder_precomputed_header_matches_generic_and_logs_microbench() {
+        let header = fsqlite_types::record::PrecomputedRecordHeader::new(&[
+            fsqlite_types::record::PrecomputedSerialTypeKind::NullPlaceholder,
+            fsqlite_types::record::PrecomputedSerialTypeKind::IntegerOrNull,
+            fsqlite_types::record::PrecomputedSerialTypeKind::RealOrNull,
+        ]);
+        let builder = CompiledRecordBuilder::PrecomputedHeader(header);
+        let mut values = vec![
+            SqliteValue::Null,
+            SqliteValue::Integer(200),
+            SqliteValue::Float(2.5),
+        ];
+        let expected = serialize_record(&values);
+
+        let plan = build_compiled_record_write_plan(values.as_slice(), &builder);
+        assert_eq!(plan.exact_size(), expected.len());
+        let mut fused = vec![0; plan.exact_size()];
+        plan.write_into_slice(&mut fused)
+            .expect("precomputed record plan should write");
+        assert_eq!(fused, expected);
+
+        let mut fallback_buf = Vec::new();
+        serialize_compiled_record_into_vec(values.as_slice(), &builder, &mut fallback_buf);
+        assert_eq!(fallback_buf, expected);
+
+        let iterations = 20_000usize;
+        let mut generic_dst = Vec::new();
+        let generic_start = Instant::now();
+        for i in 0..iterations {
+            values[1] = SqliteValue::Integer(200 + i64::try_from(i % 100).unwrap_or(0));
+            let plan = fsqlite_types::record::plan_record_iter_serialization(values.iter());
+            generic_dst.resize(plan.exact_size(), 0);
+            plan.write_into_slice(generic_dst.as_mut_slice())
+                .expect("generic plan should write");
+            std::hint::black_box(&generic_dst);
+        }
+        let generic_elapsed = generic_start.elapsed();
+
+        let mut fused_dst = Vec::new();
+        let fused_start = Instant::now();
+        for i in 0..iterations {
+            values[1] = SqliteValue::Integer(200 + i64::try_from(i % 100).unwrap_or(0));
+            let plan = build_compiled_record_write_plan(values.as_slice(), &builder);
+            fused_dst.resize(plan.exact_size(), 0);
+            plan.write_into_slice(fused_dst.as_mut_slice())
+                .expect("precomputed plan should write");
+            std::hint::black_box(&fused_dst);
+        }
+        let fused_elapsed = fused_start.elapsed();
+
+        assert_eq!(fused_dst, generic_dst);
+        eprintln!(
+            "bd-q7qj6 record assembly microbench: iterations={iterations}, generic_plan_ns={}, fused_precomputed_ns={}, record_bytes={}",
+            generic_elapsed.as_nanos(),
+            fused_elapsed.as_nanos(),
+            fused_dst.len()
+        );
+    }
+
+    #[test]
     fn test_make_record_sideband_is_invalidated_by_register_overwrite() {
         let rows = run_program(|b| {
             let end = b.emit_label();
@@ -25353,6 +25620,149 @@ mod tests {
                 .next_rowid_hint(),
             12,
             "next_rowid should advance from the visible max"
+        );
+    }
+
+    #[test]
+    fn test_memdb_delete_rowid_records_undo() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(2);
+        db.get_table_mut(root)
+            .expect("table should exist")
+            .add_unique_column_group(vec![0]);
+        db.upsert_row(
+            root,
+            1,
+            vec![SqliteValue::Integer(10), SqliteValue::Integer(100)],
+        );
+
+        db.begin_undo();
+        let token = db.undo_version();
+        assert!(db.delete_rowid(root, 1), "delete should find the row");
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(table.row_values_by_rowid(1), None);
+        assert!(
+            table
+                .find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .is_empty(),
+            "delete should remove the unique-index entry"
+        );
+
+        db.rollback_to(token);
+        let table = db.get_table(root).expect("table should exist");
+        let restored = vec![SqliteValue::Integer(10), SqliteValue::Integer(100)];
+        assert_eq!(table.row_values_by_rowid(1), Some(restored.as_slice()));
+        assert_eq!(
+            table.find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)]),
+            vec![1],
+            "rollback should restore the unique-index entry"
+        );
+    }
+
+    #[test]
+    fn test_memdb_insert_auto_row_records_undo_and_patches_rowid_alias() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(2);
+        db.upsert_row(
+            root,
+            5,
+            vec![SqliteValue::Integer(5), SqliteValue::Text("old".into())],
+        );
+
+        db.begin_undo();
+        let token = db.undo_version();
+        let rowid = db
+            .insert_auto_row(
+                root,
+                vec![SqliteValue::Null, SqliteValue::Text("new".into())],
+                Some(0),
+            )
+            .expect("table should exist");
+        assert_eq!(rowid, 6);
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(table.next_rowid_hint(), 7);
+        assert_eq!(
+            table.row_values_by_rowid(6),
+            Some([SqliteValue::Integer(6), SqliteValue::Text("new".into())].as_slice())
+        );
+
+        db.rollback_to(token);
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(table.next_rowid_hint(), 6);
+        assert_eq!(table.row_values_by_rowid(6), None);
+        assert_eq!(
+            table.row_values_by_rowid(5),
+            Some([SqliteValue::Integer(5), SqliteValue::Text("old".into())].as_slice())
+        );
+    }
+
+    #[test]
+    fn test_memdb_replace_secondary_unique_rollback_restores_deleted_and_replaced_rows() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(2);
+        db.get_table_mut(root)
+            .expect("table should exist")
+            .add_unique_column_group(vec![1]);
+        db.upsert_row(
+            root,
+            1,
+            vec![SqliteValue::Integer(1), SqliteValue::Text("alpha".into())],
+        );
+        db.upsert_row(
+            root,
+            2,
+            vec![SqliteValue::Integer(2), SqliteValue::Text("beta".into())],
+        );
+
+        db.begin_undo();
+        let token = db.undo_version();
+        assert!(
+            db.delete_rowid(root, 1),
+            "REPLACE should delete the secondary-unique conflict"
+        );
+        db.upsert_row(
+            root,
+            2,
+            vec![SqliteValue::Integer(2), SqliteValue::Text("alpha".into())],
+        );
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(table.row_values_by_rowid(1), None);
+        assert_eq!(
+            table.row_values_by_rowid(2),
+            Some([SqliteValue::Integer(2), SqliteValue::Text("alpha".into())].as_slice())
+        );
+        assert_eq!(
+            table.find_unique_conflicts(&[
+                SqliteValue::Integer(99),
+                SqliteValue::Text("alpha".into())
+            ]),
+            vec![2]
+        );
+
+        db.rollback_to(token);
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(table.next_rowid_hint(), 3);
+        assert_eq!(
+            table.row_values_by_rowid(1),
+            Some([SqliteValue::Integer(1), SqliteValue::Text("alpha".into())].as_slice())
+        );
+        assert_eq!(
+            table.row_values_by_rowid(2),
+            Some([SqliteValue::Integer(2), SqliteValue::Text("beta".into())].as_slice())
+        );
+        assert_eq!(
+            table.find_unique_conflicts(&[
+                SqliteValue::Integer(99),
+                SqliteValue::Text("alpha".into())
+            ]),
+            vec![1]
+        );
+        assert_eq!(
+            table.find_unique_conflicts(&[
+                SqliteValue::Integer(99),
+                SqliteValue::Text("beta".into())
+            ]),
+            vec![2]
         );
     }
 
@@ -29738,6 +30148,48 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_cache_hit_arc_clone_microbench() {
+        let value_sources = (0..24).map(InsertValueSource::Binding).collect::<Vec<_>>();
+        let compiled = CompiledProgram::SimpleInsert(SimpleInsertTemplate {
+            cursor_id: 0,
+            root_page: 2,
+            num_cols: i32::try_from(value_sources.len()).expect("test value count fits i32"),
+            value_sources,
+            affinity: Some("BBBBBBBBBBBBBBBBBBBBBBBB".to_owned()),
+            record_p4: P4::None,
+            record_builder: CompiledRecordBuilder::Generic,
+            insert_flags: 2,
+        });
+        let shared = Arc::new(compiled.clone());
+        let iterations = 50_000_u64;
+
+        let direct_started = Instant::now();
+        let mut direct_acc = 0_u64;
+        for _ in 0..iterations {
+            let cloned = std::hint::black_box(compiled.clone());
+            direct_acc = direct_acc.wrapping_add(estimate_compiled_program_size(&cloned));
+        }
+        let direct_clone_ns = direct_started.elapsed().as_nanos();
+
+        let arc_started = Instant::now();
+        let mut arc_acc = 0_usize;
+        for _ in 0..iterations {
+            let cloned = std::hint::black_box(Arc::clone(&shared));
+            arc_acc = arc_acc.wrapping_add(Arc::strong_count(&cloned));
+        }
+        let arc_clone_ns = arc_started.elapsed().as_nanos();
+
+        std::hint::black_box((direct_acc, arc_acc));
+        eprintln!(
+            "bd-db300.2 jit cache-hit clone microbench: iterations={iterations}, deep_clone_ns={direct_clone_ns}, arc_clone_ns={arc_clone_ns}, template_size_bytes={}",
+            estimate_compiled_program_size(shared.as_ref())
+        );
+        assert!(direct_acc > 0);
+        assert!(arc_acc > 0);
+        assert_eq!(Arc::strong_count(&shared), 1);
+    }
+
+    #[test]
     fn test_sorter_spill_to_disk_under_low_threshold() {
         // Set an artificially low spill threshold to trigger disk spill
         // with a small dataset, then verify the external merge produces
@@ -30111,6 +30563,125 @@ mod tests {
         assert!(
             engine.take_database().is_none(),
             "the engine should not need an attached MemDatabase for this hot path"
+        );
+    }
+
+    #[test]
+    fn test_storage_only_nested_loop_join_executes_without_attached_memdb() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let orders_root = 256;
+        let customers_root = 257;
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, orders_root, 0, P4::Int(2), 0);
+        b.emit_op(Opcode::OpenWrite, 1, customers_root, 0, P4::Int(2), 0);
+
+        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 1, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::String8, 0, 3, 0, P4::Str("ann".to_owned()), 0);
+        b.emit_op(Opcode::MakeRecord, 2, 2, 4, P4::None, 0);
+        b.emit_op(Opcode::Insert, 1, 4, 1, P4::None, 0);
+
+        b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 2, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::String8, 0, 3, 0, P4::Str("bob".to_owned()), 0);
+        b.emit_op(Opcode::MakeRecord, 2, 2, 4, P4::None, 0);
+        b.emit_op(Opcode::Insert, 1, 4, 1, P4::None, 0);
+
+        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 1, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 10, 3, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 2, 4, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 4, 1, P4::None, 0);
+
+        b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 2, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 20, 3, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 2, 4, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 4, 1, P4::None, 0);
+
+        b.emit_op(Opcode::Integer, 3, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 1, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 30, 3, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 2, 4, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 4, 1, P4::None, 0);
+
+        let done = b.emit_label();
+        let next_order = b.emit_label();
+        b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
+        let order_body = b.current_addr();
+        b.emit_op(Opcode::Column, 0, 0, 10, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 1, 11, P4::None, 0);
+
+        b.emit_jump_to_label(Opcode::Rewind, 1, 0, next_order, P4::None, 0);
+        let customer_body = b.current_addr();
+        b.emit_op(Opcode::Column, 1, 0, 12, P4::None, 0);
+        let no_match = b.emit_label();
+        b.emit_jump_to_label(Opcode::Ne, 10, 12, no_match, P4::None, 0);
+        b.emit_op(Opcode::Column, 1, 1, 13, P4::None, 0);
+        b.emit_op(Opcode::SCopy, 11, 14, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 13, 2, 0, P4::None, 0);
+        b.resolve_label(no_match);
+        b.emit_op(
+            Opcode::Next,
+            1,
+            i32::try_from(customer_body).expect("test program address should fit in i32"),
+            0,
+            P4::None,
+            0,
+        );
+
+        b.resolve_label(next_order);
+        b.emit_op(
+            Opcode::Next,
+            0,
+            i32::try_from(order_body).expect("test program address should fit in i32"),
+            0,
+            P4::None,
+            0,
+        );
+        b.resolve_label(done);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        assert!(
+            !prog.requires_attached_memdb(),
+            "pager-backed nested-loop join bytecode must not require an attached MemDatabase"
+        );
+
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.set_transaction(txn);
+        engine.set_reject_mem_fallback(true);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert!(
+            engine.all_cursors_are_txn_backed(),
+            "join scan cursors must stay on txn-backed storage cursors"
+        );
+        let rows: Vec<_> = engine
+            .take_results()
+            .into_iter()
+            .map(|row| row.into_vec())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Text("ann".into()), SqliteValue::Integer(10)],
+                vec![SqliteValue::Text("bob".into()), SqliteValue::Integer(20)],
+                vec![SqliteValue::Text("ann".into()), SqliteValue::Integer(30)],
+            ]
+        );
+        assert!(
+            engine.take_database().is_none(),
+            "the engine should not need an attached MemDatabase for join scans"
         );
     }
 

@@ -1590,6 +1590,206 @@ mod tests {
         assert!(explain.contains("EMIT COUNT(*) AS n_orders"));
     }
 
+    #[test]
+    fn differential_display_and_explain_labels_are_well_formed() {
+        // These pure formatters are only exercised indirectly via explain_text;
+        // pin their exact rendering directly.
+        let col = DifferentialColumn {
+            binding: "t".to_owned(),
+            column: "x".to_owned(),
+        };
+        assert_eq!(col.to_string(), "t.x");
+
+        assert_eq!(DifferentialAggregate::CountRows.to_string(), "COUNT(*)");
+        assert_eq!(
+            DifferentialAggregate::Sum { column: col.clone() }.to_string(),
+            "SUM(t.x)"
+        );
+
+        // Source display_name: schema-qualified vs bare.
+        let qualified = DifferentialSource {
+            schema: Some("main".to_owned()),
+            table: "users".to_owned(),
+            binding: "u".to_owned(),
+        };
+        assert_eq!(qualified.display_name(), "main.users");
+        let bare = DifferentialSource {
+            schema: None,
+            table: "users".to_owned(),
+            binding: "u".to_owned(),
+        };
+        assert_eq!(bare.display_name(), "users");
+
+        // Output explain_label: alias appends " AS <alias>", otherwise bare.
+        let col_out = DifferentialOutput::Column {
+            column: col.clone(),
+            alias: None,
+        };
+        assert_eq!(col_out.explain_label(), "t.x");
+        let col_aliased = DifferentialOutput::Column {
+            column: col.clone(),
+            alias: Some("xx".to_owned()),
+        };
+        assert_eq!(col_aliased.explain_label(), "t.x AS xx");
+        let agg_out = DifferentialOutput::Aggregate {
+            aggregate: DifferentialAggregate::CountRows,
+            alias: Some("n".to_owned()),
+        };
+        assert_eq!(agg_out.explain_label(), "COUNT(*) AS n");
+        let agg_bare = DifferentialOutput::Aggregate {
+            aggregate: DifferentialAggregate::Sum { column: col },
+            alias: None,
+        };
+        assert_eq!(agg_bare.explain_label(), "SUM(t.x)");
+    }
+
+    #[test]
+    fn differential_source_from_qualified_name_resolves_binding_and_schema() {
+        // from_qualified_name is only used inside compile_differential_view_plan,
+        // never asserted directly. The binding defaults to the alias when given,
+        // otherwise the (unqualified) table name; schema and table are carried
+        // from the QualifiedName.
+
+        // With an explicit alias, the binding is the alias.
+        let aliased =
+            DifferentialSource::from_qualified_name(&QualifiedName::bare("users"), Some("u"));
+        assert_eq!(aliased.binding, "u");
+        assert_eq!(aliased.table, "users");
+        assert_eq!(aliased.schema, None);
+
+        // Without an alias, the binding falls back to the table name.
+        let no_alias = DifferentialSource::from_qualified_name(&QualifiedName::bare("users"), None);
+        assert_eq!(no_alias.binding, "users");
+
+        // A schema-qualified name carries its schema through; the binding still
+        // falls back to the table name when no alias is given.
+        let qualified = QualifiedName {
+            schema: Some("main".to_owned()),
+            name: "users".to_owned(),
+        };
+        let src = DifferentialSource::from_qualified_name(&qualified, None);
+        assert_eq!(src.schema, Some("main".to_owned()));
+        assert_eq!(src.table, "users");
+        assert_eq!(src.binding, "users");
+        assert_eq!(src.display_name(), "main.users");
+    }
+
+    #[test]
+    fn explain_differential_plan_renders_single_table_rowset_shape() {
+        // Companion to the grouped-aggregate explain test: the RowSet (single
+        // table, filters, projection) explain rendering was untested.
+        let select =
+            parse_select("SELECT id, name FROM users WHERE status = 'paid' AND tenant_id = 7");
+        let explain = explain_differential_view_plan(&select).expect("rowset shape should compile");
+        assert!(explain.contains("DIFFERENTIAL row_set"), "explain:\n{explain}");
+        assert!(explain.contains("SOURCE users AS users"));
+        assert!(explain.contains("EMIT users.id"));
+        assert!(explain.contains("EMIT users.name"));
+        assert!(explain.contains("FILTER users.status = 'paid'"));
+        assert!(explain.contains("FILTER users.tenant_id"));
+        // A RowSet plan has no join or grouping.
+        assert!(!explain.contains("JOIN"), "rowset has no join:\n{explain}");
+        assert!(!explain.contains("GROUP BY"), "rowset has no grouping:\n{explain}");
+    }
+
+    #[test]
+    fn differential_plan_compiles_global_aggregate_shape() {
+        // An aggregate with no GROUP BY is a whole-stream (global) aggregate -- a
+        // distinct DifferentialPlanMode that had no compile or explain coverage
+        // (existing tests cover only RowSet and GroupedAggregate).
+        let select = parse_select("SELECT COUNT(*) AS total FROM orders");
+
+        let plan = compile_differential_view_plan(&select).expect("global aggregate should compile");
+        assert_eq!(plan.mode, DifferentialPlanMode::GlobalAggregate);
+        assert!(plan.group_by.is_empty(), "a global aggregate has no grouping keys");
+        assert_eq!(plan.sources.len(), 1);
+        assert_eq!(plan.sources[0].binding, "orders");
+        assert_eq!(
+            plan.outputs,
+            vec![DifferentialOutput::Aggregate {
+                aggregate: DifferentialAggregate::CountRows,
+                alias: Some("total".to_owned()),
+            }]
+        );
+
+        // Explain renders the global-aggregate header and emits the aggregate.
+        let explain = explain_differential_view_plan(&select).expect("should compile");
+        assert!(explain.contains("DIFFERENTIAL global_aggregate"), "explain:\n{explain}");
+        assert!(explain.contains("SOURCE orders AS orders"));
+        assert!(explain.contains("EMIT COUNT(*) AS total"));
+        assert!(!explain.contains("GROUP BY"), "global aggregate has no grouping:\n{explain}");
+    }
+
+    #[test]
+    fn differential_plan_compiles_sum_and_rejects_unsupported_aggregate() {
+        // SUM(column) is the other supported aggregate; pin its compile + explain.
+        let select = parse_select("SELECT SUM(amount) AS total FROM orders");
+        let plan = compile_differential_view_plan(&select).expect("SUM should compile");
+        assert_eq!(plan.mode, DifferentialPlanMode::GlobalAggregate);
+        assert_eq!(
+            plan.outputs,
+            vec![DifferentialOutput::Aggregate {
+                aggregate: DifferentialAggregate::Sum {
+                    column: DifferentialColumn {
+                        binding: "orders".to_owned(),
+                        column: "amount".to_owned(),
+                    },
+                },
+                alias: Some("total".to_owned()),
+            }]
+        );
+        let explain = explain_differential_view_plan(&select).expect("should compile");
+        assert!(explain.contains("EMIT SUM(orders.amount) AS total"), "explain:\n{explain}");
+
+        // AVG is not a supported differential aggregate -> fails closed.
+        let avg = parse_select("SELECT AVG(amount) FROM orders");
+        assert!(matches!(
+            compile_differential_view_plan(&avg),
+            Err(DifferentialPlanError::UnsupportedAggregate { .. })
+        ));
+    }
+
+    #[test]
+    fn differential_plan_rejects_with_compound_and_having_clauses() {
+        // Per-clause fail-closed rejections the proptest's case set does not
+        // cover (it covers DISTINCT/ORDER BY/LIMIT/star/joins/aggregate-arg).
+        let with = parse_select("WITH c AS (SELECT id FROM users) SELECT id FROM c");
+        assert_eq!(
+            compile_differential_view_plan(&with).unwrap_err(),
+            DifferentialPlanError::UnsupportedWithClause
+        );
+
+        let compound = parse_select("SELECT id FROM a UNION SELECT id FROM b");
+        assert_eq!(
+            compile_differential_view_plan(&compound).unwrap_err(),
+            DifferentialPlanError::UnsupportedCompoundSelect
+        );
+
+        let having =
+            parse_select("SELECT status, COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) > 1");
+        assert_eq!(
+            compile_differential_view_plan(&having).unwrap_err(),
+            DifferentialPlanError::UnsupportedHavingClause
+        );
+    }
+
+    #[test]
+    fn differential_plan_rejects_values_core_and_window_clause() {
+        // A bare VALUES core is not a differentiable view.
+        let values = parse_select("VALUES (1), (2)");
+        assert_eq!(
+            compile_differential_view_plan(&values).unwrap_err(),
+            DifferentialPlanError::UnsupportedValuesCore
+        );
+
+        // A named WINDOW clause is unsupported.
+        let window = parse_select("SELECT id FROM users WINDOW w AS (PARTITION BY status)");
+        assert_eq!(
+            compile_differential_view_plan(&window).unwrap_err(),
+            DifferentialPlanError::UnsupportedWindowClause
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
 

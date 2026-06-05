@@ -1678,7 +1678,10 @@ fn best_access_path_internal(
     adaptive_preferred_index: Option<&str>,
     rowid_alias_hints: &[RowidAliasHint],
 ) -> AccessPath {
-    let started = std::time::Instant::now();
+    // Only pay the clock read when an INFO subscriber will consume the
+    // `selection_elapsed_us` diagnostic below. The cost-estimation path is
+    // otherwise allocation- and syscall-free on the per-compile hot loop.
+    let started = tracing::enabled!(tracing::Level::INFO).then(std::time::Instant::now);
     let explicit_indexed_by = match index_hint {
         Some(IndexHint::IndexedBy(index_name)) => Some(index_name.as_str()),
         _ => None,
@@ -1686,8 +1689,17 @@ fn best_access_path_internal(
     let not_indexed = matches!(index_hint, Some(IndexHint::NotIndexed));
     let rowid_equality_candidate =
         find_rowid_equality_term(&table.name, where_terms, rowid_alias_hints).is_some();
-    let rowid_range_candidate =
-        find_rowid_range_column(&table.name, where_terms, rowid_alias_hints).is_some();
+    // The range branch below is only reached when the equality branch did not
+    // match, so the range candidate is dead work in the common point-lookup
+    // case — short-circuit it. When it is needed, probe with the
+    // allocation-free matcher instead of `find_rowid_range_column`, which
+    // clones the matched column name only to discard it for this boolean.
+    // `where_term_matches_rowid_range` already requires a present column, so
+    // `.any(..)` is equivalent to the previous `.is_some()`.
+    let rowid_range_candidate = !rowid_equality_candidate
+        && where_terms
+            .iter()
+            .any(|term| where_term_matches_rowid_range(&table.name, term, rowid_alias_hints));
 
     let mut best = if explicit_indexed_by.is_some() {
         AccessPath {
@@ -1982,64 +1994,75 @@ fn best_access_path_internal(
         rowid_alias_hints,
     );
 
-    let chosen_index = best.index.as_deref().unwrap_or("(none)");
-    let selectivity = match &best.kind {
-        AccessPathKind::IndexScanRange { selectivity }
-        | AccessPathKind::CoveringIndexScan { selectivity } => *selectivity,
-        AccessPathKind::IndexScanEquality | AccessPathKind::RowidLookup => {
-            best.estimated_rows / table.n_rows.max(1) as f64
-        }
-        AccessPathKind::FullTableScan => 1.0,
-    };
-    let metric_index_type = access_path_metric_label(&best.kind);
+    // The index-selection metric counter is a real always-on metric: it must
+    // increment for every planning decision regardless of tracing config.
     let metric_total = increment_index_selection_total(&best.kind);
-    let explicit_hint = match index_hint {
-        Some(IndexHint::IndexedBy(index_name)) => format!("indexed_by:{index_name}"),
-        Some(IndexHint::NotIndexed) => "not_indexed".to_owned(),
-        None => "(none)".to_owned(),
-    };
-    let run_id = std::env::var("RUN_ID").unwrap_or_else(|_| "(none)".to_owned());
-    let trace_id = std::env::var("TRACE_ID")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    let scenario_id = std::env::var("SCENARIO_ID").unwrap_or_else(|_| "(none)".to_owned());
-    let selection_elapsed_us = started.elapsed().as_micros().max(1);
-    let adaptive_hint = adaptive_preferred_index.unwrap_or("(none)");
-    let hint_applied = explicit_hint_applied || adaptive_hint_applied;
-    let span = tracing::info_span!(
-        "index_select",
-        run_id = %run_id,
-        trace_id,
-        scenario_id = %scenario_id,
-        table = %table.name,
-        explicit_hint = %explicit_hint,
-        adaptive_hint = %adaptive_hint,
-        candidates = candidates_considered,
-        partial_pruned = partial_indexes_pruned,
-        hint_filtered = hint_filtered_indexes,
-        skip_scan_candidates
-    );
-    let _span_guard = span.enter();
 
-    tracing::info!(
-        table = %table.name,
-        candidates = candidates_considered,
-        chosen_index = %chosen_index,
-        estimated_selectivity = selectivity,
-        access_path = %access_path_kind_label(&best.kind),
-        estimated_cost = best.estimated_cost,
-        estimated_rows = best.estimated_rows,
-        selection_elapsed_us,
-        run_id = %run_id,
-        trace_id,
-        scenario_id = %scenario_id,
-        index_type = metric_index_type,
-        fsqlite_index_selection_total = metric_total,
-        hint_applied,
-        explicit_hint_missing,
-        "planner.index_select.choice"
-    );
+    // The structured `index_select` span/event below is the only consumer of
+    // three `std::env::var` lookups (each a global env lock + heap String), a
+    // `format!`/`to_owned` hint label, and the `Instant` clock read above.
+    // None of that work is observable unless an INFO subscriber is listening,
+    // so gate it behind a cheap level check. When INFO is enabled the emitted
+    // diagnostics are identical to before.
+    if tracing::enabled!(tracing::Level::INFO) {
+        let chosen_index = best.index.as_deref().unwrap_or("(none)");
+        let selectivity = match &best.kind {
+            AccessPathKind::IndexScanRange { selectivity }
+            | AccessPathKind::CoveringIndexScan { selectivity } => *selectivity,
+            AccessPathKind::IndexScanEquality | AccessPathKind::RowidLookup => {
+                best.estimated_rows / table.n_rows.max(1) as f64
+            }
+            AccessPathKind::FullTableScan => 1.0,
+        };
+        let metric_index_type = access_path_metric_label(&best.kind);
+        let explicit_hint = match index_hint {
+            Some(IndexHint::IndexedBy(index_name)) => format!("indexed_by:{index_name}"),
+            Some(IndexHint::NotIndexed) => "not_indexed".to_owned(),
+            None => "(none)".to_owned(),
+        };
+        let run_id = std::env::var("RUN_ID").unwrap_or_else(|_| "(none)".to_owned());
+        let trace_id = std::env::var("TRACE_ID")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let scenario_id = std::env::var("SCENARIO_ID").unwrap_or_else(|_| "(none)".to_owned());
+        let selection_elapsed_us = started.map_or(1, |start| start.elapsed().as_micros().max(1));
+        let adaptive_hint = adaptive_preferred_index.unwrap_or("(none)");
+        let hint_applied = explicit_hint_applied || adaptive_hint_applied;
+        let span = tracing::info_span!(
+            "index_select",
+            run_id = %run_id,
+            trace_id,
+            scenario_id = %scenario_id,
+            table = %table.name,
+            explicit_hint = %explicit_hint,
+            adaptive_hint = %adaptive_hint,
+            candidates = candidates_considered,
+            partial_pruned = partial_indexes_pruned,
+            hint_filtered = hint_filtered_indexes,
+            skip_scan_candidates
+        );
+        let _span_guard = span.enter();
+
+        tracing::info!(
+            table = %table.name,
+            candidates = candidates_considered,
+            chosen_index = %chosen_index,
+            estimated_selectivity = selectivity,
+            access_path = %access_path_kind_label(&best.kind),
+            estimated_cost = best.estimated_cost,
+            estimated_rows = best.estimated_rows,
+            selection_elapsed_us,
+            run_id = %run_id,
+            trace_id,
+            scenario_id = %scenario_id,
+            index_type = metric_index_type,
+            fsqlite_index_selection_total = metric_total,
+            hint_applied,
+            explicit_hint_missing,
+            "planner.index_select.choice"
+        );
+    }
 
     best
 }
@@ -4162,11 +4185,16 @@ pub fn order_joins_with_hints_and_features(
             table_index_hints,
             cracking_hints.as_deref(),
         );
+        // Move the access path into the plan rather than cloning it (its cost
+        // is a Copy f64, captured first), so the single owned AccessPath — which
+        // carries two heap Strings — is not duplicated on this dominant
+        // single-table planning path.
+        let total_cost = ap.estimated_cost;
         let plan = QueryPlan {
             join_order: vec![tables[0].name.clone()],
-            access_paths: vec![ap.clone()],
+            access_paths: vec![ap],
             join_segments: vec![],
-            total_cost: ap.estimated_cost,
+            total_cost,
             morsel_eligibility: None,
         };
         if let Some(store) = cracking_hints {
@@ -4281,10 +4309,11 @@ pub fn order_joins_with_hints_and_features(
             cracking_hints.as_deref(),
         );
         let cumulative_rows = ap.estimated_rows;
+        let cost = ap.estimated_cost;
         paths.push(PartialPath {
             tables: vec![t.name.clone()],
-            access_paths: vec![ap.clone()],
-            cost: ap.estimated_cost,
+            access_paths: vec![ap],
+            cost,
             cumulative_rows,
         });
     }
@@ -4376,11 +4405,13 @@ pub fn order_joins_with_hints_and_features(
                 table_index_hints,
                 cracking_hints.as_deref(),
             );
+            let cost = ap.estimated_cost;
+            let cumulative_rows = ap.estimated_rows;
             paths.push(PartialPath {
                 tables: vec![t.name.clone()],
-                access_paths: vec![ap.clone()],
-                cost: ap.estimated_cost,
-                cumulative_rows: ap.estimated_rows,
+                access_paths: vec![ap],
+                cost,
+                cumulative_rows,
             });
         }
     }
@@ -5244,6 +5275,57 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_output_aliases_and_count_output_columns() {
+        // SELECT 1 AS renamed, bare_col, 2 -> aliased / bare-column-name / unaliased-expr.
+        let core = SelectCore::Select {
+            distinct: Distinctness::All,
+            columns: vec![
+                ResultColumn::Expr {
+                    expr: Expr::Literal(Literal::Integer(1), Span::ZERO),
+                    alias: Some("renamed".to_owned()),
+                },
+                ResultColumn::Expr {
+                    expr: Expr::Column(ColumnRef::bare("bare_col"), Span::ZERO),
+                    alias: None,
+                },
+                ResultColumn::Expr {
+                    expr: Expr::Literal(Literal::Integer(2), Span::ZERO),
+                    alias: None,
+                },
+            ],
+            from: None,
+            where_clause: None,
+            group_by: vec![],
+            having: None,
+            windows: vec![],
+        };
+        assert_eq!(count_output_columns(&core), 3);
+        assert_eq!(
+            extract_output_aliases(&core),
+            vec![Some("renamed".to_owned()), Some("bare_col".to_owned()), None]
+        );
+
+        // VALUES: width comes from the first row; every column is unnamed.
+        let values = SelectCore::Values(vec![
+            vec![
+                Expr::Literal(Literal::Integer(1), Span::ZERO),
+                Expr::Literal(Literal::Integer(2), Span::ZERO),
+            ],
+            vec![
+                Expr::Literal(Literal::Integer(3), Span::ZERO),
+                Expr::Literal(Literal::Integer(4), Span::ZERO),
+            ],
+        ]);
+        assert_eq!(count_output_columns(&values), 2);
+        assert_eq!(extract_output_aliases(&values), vec![None, None]);
+
+        // Empty VALUES -> zero columns.
+        let empty = SelectCore::Values(vec![]);
+        assert_eq!(count_output_columns(&empty), 0);
+        assert!(extract_output_aliases(&empty).is_empty());
+    }
+
+    #[test]
     fn test_compound_order_by_second_select_alias() {
         // SELECT 1 AS a UNION SELECT 2 AS b ORDER BY b
         // → b is in the second SELECT at col 0
@@ -5736,9 +5818,346 @@ mod tests {
         assert!((cost - expected).abs() < 1e-10);
     }
 
+    #[test]
+    fn test_cost_ranks_covering_index_below_non_covering_range_scan() {
+        // A covering index avoids the per-match table dereference, so for the
+        // same selectivity/pages it must cost strictly less than a non-covering
+        // range scan — by exactly the table-access term (sel * table_pages) it
+        // skips. The existing tests check each formula in isolation; this pins
+        // the cross-kind ordering that makes the planner prefer covering indexes.
+        let sel = 0.1;
+        let range = estimate_cost(&AccessPathKind::IndexScanRange { selectivity: sel }, 200, 50);
+        let covering =
+            estimate_cost(&AccessPathKind::CoveringIndexScan { selectivity: sel }, 200, 50);
+        assert!(
+            covering < range,
+            "covering index must rank below a range scan: {covering} vs {range}"
+        );
+        // The gap is exactly the avoided table-access term: sel * table_pages.
+        assert!(
+            ((range - covering) - sel * 200.0).abs() < 1e-9,
+            "covering/range gap should equal sel*table_pages (= {}), got {}",
+            sel * 200.0,
+            range - covering
+        );
+
+        // With a row count, the covering scan also pays the cheaper per-row term
+        // (decode only, not decode + dereference), so its advantage widens.
+        let range_r =
+            estimate_cost_ext(&AccessPathKind::IndexScanRange { selectivity: sel }, 200, 50, 1_000);
+        let covering_r = estimate_cost_ext(
+            &AccessPathKind::CoveringIndexScan { selectivity: sel },
+            200,
+            50,
+            1_000,
+        );
+        assert!(
+            covering_r < range_r,
+            "covering must stay cheaper once rows are counted: {covering_r} vs {range_r}"
+        );
+        assert!(
+            (range_r - covering_r) > (range - covering),
+            "per-row terms must widen the covering advantage"
+        );
+    }
+
     // ===================================================================
     // PLANNER-2: estimate_cost_ext should react monotonically to n_rows
     // ===================================================================
+
+    #[test]
+    fn access_path_metric_label_maps_every_kind() {
+        // The bare metric/tracing label for each access path (no selectivity),
+        // used in cost-estimate tracing and differential-plan fingerprints. It
+        // is only ever used as a value, never directly asserted per variant, so
+        // a wrong label would silently break observability.
+        assert_eq!(
+            access_path_metric_label(&AccessPathKind::FullTableScan),
+            "full_table_scan"
+        );
+        assert_eq!(
+            access_path_metric_label(&AccessPathKind::IndexScanRange { selectivity: 0.1 }),
+            "index_scan_range"
+        );
+        assert_eq!(
+            access_path_metric_label(&AccessPathKind::IndexScanEquality),
+            "index_scan_equality"
+        );
+        assert_eq!(
+            access_path_metric_label(&AccessPathKind::CoveringIndexScan { selectivity: 0.1 }),
+            "covering_index_scan"
+        );
+        assert_eq!(
+            access_path_metric_label(&AccessPathKind::RowidLookup),
+            "rowid_lookup"
+        );
+    }
+
+    #[test]
+    fn test_estimate_cost_ext_exact_page_costs_at_zero_rows() {
+        // At n_rows == 0 every per-row term vanishes, leaving the closed-form
+        // page-level cost for each access path. test_estimate_cost_ext_zero_rows_
+        // matches_legacy only checks FullTableScan and IndexScanEquality; pin the
+        // exact log2-based formulas for the remaining variants too. Power-of-two
+        // page counts keep the logs exact: ip=16 -> log2=4, tp=64 -> log2=6.
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let (ip, tp) = (16u64, 64u64);
+
+        // Full scan == table page count.
+        assert!(approx(estimate_cost_ext(&AccessPathKind::FullTableScan, tp, ip, 0), 64.0));
+        // Rowid lookup == log2(table pages); no index term.
+        assert!(approx(estimate_cost_ext(&AccessPathKind::RowidLookup, tp, ip, 0), 6.0));
+        // Index equality == log2(index pages) + log2(table pages).
+        assert!(approx(estimate_cost_ext(&AccessPathKind::IndexScanEquality, tp, ip, 0), 10.0));
+
+        // Range scan == log2(ip) + sel*ip + sel*tp = 4 + 8 + 32.
+        let range = estimate_cost_ext(&AccessPathKind::IndexScanRange { selectivity: 0.5 }, tp, ip, 0);
+        assert!(approx(range, 44.0), "range page cost, got {range}");
+
+        // Covering scan omits the table-page (row dereference) term:
+        // log2(ip) + sel*ip = 4 + 8, with no sel*tp.
+        let covering =
+            estimate_cost_ext(&AccessPathKind::CoveringIndexScan { selectivity: 0.5 }, tp, ip, 0);
+        assert!(approx(covering, 12.0), "covering page cost, got {covering}");
+
+        // The structural difference is exactly the avoided table dereference,
+        // sel*tp = 0.5*64 = 32 -- the reason a covering scan ranks below a range
+        // scan over the same index.
+        assert!(approx(range - covering, 0.5 * 64.0));
+    }
+
+    #[test]
+    fn test_has_join_predicate_detects_equi_join_either_orientation() {
+        // has_join_predicate finds an equi-join column predicate between two
+        // tables in either argument order, case-insensitively; absent or
+        // unrelated tables yield false.
+        let terms = [join_term("a", "x", "b", "y")]; // a.x = b.y
+
+        assert!(has_join_predicate("a", "b", &terms));
+        assert!(has_join_predicate("b", "a", &terms), "either argument order");
+        assert!(has_join_predicate("A", "B", &terms), "case-insensitive");
+        assert!(!has_join_predicate("a", "c", &terms), "no predicate to c");
+        assert!(!has_join_predicate("c", "d", &terms));
+        assert!(!has_join_predicate("a", "b", &[]), "no terms -> no predicate");
+    }
+
+    #[test]
+    fn test_cross_join_allowed_enforces_right_after_left_ordering() {
+        // For a cross-join pair (A, B), B may only be placed after A in the join
+        // order. cross_join_allowed enforces this case-insensitively; candidates
+        // not on the right of any pair are always allowed.
+        let pairs = vec![("A".to_owned(), "B".to_owned())];
+
+        // B before A is not allowed (A is not yet in the path).
+        assert!(!cross_join_allowed(&[], "B", &pairs));
+        // B after A is allowed.
+        assert!(cross_join_allowed(&["A".to_owned()], "B", &pairs));
+        // A (the left side) is unconstrained -- allowed anywhere.
+        assert!(cross_join_allowed(&[], "A", &pairs));
+        // A table not in any pair is allowed.
+        assert!(cross_join_allowed(&[], "C", &pairs));
+        // The check is case-insensitive on both the candidate and the path.
+        assert!(!cross_join_allowed(&[], "b", &pairs));
+        assert!(cross_join_allowed(&["a".to_owned()], "b", &pairs));
+    }
+
+    #[test]
+    fn test_collect_conjuncts_flattens_and_tree_regardless_of_nesting() {
+        // collect_conjuncts recursively splits on AND (both sides), so any AND
+        // tree flattens to its leaves no matter how it is nested; a non-AND
+        // expression yields a single conjunct.
+        let leaf = |n: i64| Expr::Literal(Literal::Integer(n), Span::ZERO);
+        let and = |l: Expr, r: Expr| Expr::BinaryOp {
+            left: Box::new(l),
+            op: AstBinaryOp::And,
+            right: Box::new(r),
+            span: Span::ZERO,
+        };
+        let count = |e: &Expr| {
+            let mut v = Vec::new();
+            collect_conjuncts(e, &mut v);
+            v.len()
+        };
+
+        // A non-AND expression is a single conjunct.
+        assert_eq!(count(&leaf(1)), 1);
+        // a AND b -> 2.
+        assert_eq!(count(&and(leaf(1), leaf(2))), 2);
+        // Right-nested a AND (b AND c) -> 3.
+        assert_eq!(count(&and(leaf(1), and(leaf(2), leaf(3)))), 3);
+        // Left-nested (a AND b) AND c -> 3.
+        assert_eq!(count(&and(and(leaf(1), leaf(2)), leaf(3))), 3);
+        // Balanced (a AND b) AND (c AND d) -> 4.
+        assert_eq!(
+            count(&and(and(leaf(1), leaf(2)), and(leaf(3), leaf(4)))),
+            4
+        );
+    }
+
+    #[test]
+    fn test_classify_or_disjunction_as_in_list() {
+        // a = 1 OR a = 2 OR a = 3 classifies as an IN-list on column a with 3
+        // disjuncts. Mixed columns, a single (non-OR) equality, and a non-
+        // equality disjunct all decline.
+        let col = |n: &str| Box::new(Expr::Column(ColumnRef::bare(n), Span::ZERO));
+        let lit = |n: i64| Box::new(Expr::Literal(Literal::Integer(n), Span::ZERO));
+        let eqc = |c: &str, n: i64| Expr::BinaryOp {
+            left: col(c),
+            op: AstBinaryOp::Eq,
+            right: lit(n),
+            span: Span::ZERO,
+        };
+        let or = |l: Expr, r: Expr| Expr::BinaryOp {
+            left: Box::new(l),
+            op: AstBinaryOp::Or,
+            right: Box::new(r),
+            span: Span::ZERO,
+        };
+
+        // a = 1 OR a = 2 OR a = 3 -> IN-list on a, 3 disjuncts.
+        let three = or(eqc("a", 1), or(eqc("a", 2), eqc("a", 3)));
+        assert_eq!(
+            classify_or_disjunction_as_in_list(&three),
+            Some((
+                WhereColumn {
+                    table: None,
+                    column: "a".to_owned()
+                },
+                3
+            ))
+        );
+
+        // Mixed columns decline.
+        assert!(classify_or_disjunction_as_in_list(&or(eqc("a", 1), eqc("b", 2))).is_none());
+
+        // A single equality (no OR) has too few disjuncts.
+        assert!(classify_or_disjunction_as_in_list(&eqc("a", 1)).is_none());
+
+        // A non-equality disjunct declines.
+        let gt = Expr::BinaryOp {
+            left: col("a"),
+            op: AstBinaryOp::Gt,
+            right: lit(2),
+            span: Span::ZERO,
+        };
+        assert!(classify_or_disjunction_as_in_list(&or(eqc("a", 1), gt)).is_none());
+    }
+
+    #[test]
+    fn test_extract_comparison_operand_returns_other_side_of_column_comparison() {
+        // extract_comparison_operand returns the non-column side of a binary
+        // comparison: a column on the left yields the right operand and vice
+        // versa; with no column operand (or a non-BinaryOp) it yields None.
+        let col = |n: &str| Box::new(Expr::Column(ColumnRef::bare(n), Span::ZERO));
+        let lit = |n: i64| Box::new(Expr::Literal(Literal::Integer(n), Span::ZERO));
+        let binop = |l: Box<Expr>, r: Box<Expr>| Expr::BinaryOp {
+            left: l,
+            op: AstBinaryOp::Eq,
+            right: r,
+            span: Span::ZERO,
+        };
+
+        // x = 5 -> the literal 5 (column on the left).
+        assert!(matches!(
+            extract_comparison_operand(&binop(col("x"), lit(5))),
+            Some(Expr::Literal(Literal::Integer(5), _))
+        ));
+        // 5 = x -> the literal 5 (column on the right).
+        assert!(matches!(
+            extract_comparison_operand(&binop(lit(5), col("x"))),
+            Some(Expr::Literal(Literal::Integer(5), _))
+        ));
+        // No column operand -> None.
+        assert!(extract_comparison_operand(&binop(lit(5), lit(6))).is_none());
+        // Not a binary op -> None.
+        assert!(
+            extract_comparison_operand(&Expr::Literal(Literal::Integer(1), Span::ZERO)).is_none()
+        );
+    }
+
+    #[test]
+    fn test_extract_where_column_preserves_qualifier_and_rejects_non_columns() {
+        // extract_where_column lifts a column reference into a WhereColumn,
+        // preserving the table qualifier, and returns None for anything that is
+        // not a bare column expression.
+        let bare = Expr::Column(ColumnRef::bare("x"), Span::ZERO);
+        assert_eq!(
+            extract_where_column(&bare),
+            Some(WhereColumn {
+                table: None,
+                column: "x".to_owned()
+            })
+        );
+
+        let qualified = Expr::Column(ColumnRef::qualified("t", "x"), Span::ZERO);
+        assert_eq!(
+            extract_where_column(&qualified),
+            Some(WhereColumn {
+                table: Some("t".to_owned()),
+                column: "x".to_owned()
+            })
+        );
+
+        // Non-column expressions yield None.
+        assert_eq!(
+            extract_where_column(&Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            None
+        );
+        let binop = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("x"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        assert_eq!(extract_where_column(&binop), None);
+    }
+
+    #[test]
+    fn test_expr_guarantees_non_null_for_matching_column() {
+        // expr_guarantees_non_null reports whether a WHERE expression proves the
+        // given column is non-NULL: an explicit IS NOT NULL, or a comparison to a
+        // non-NULL literal, on the SAME column qualifies; IS NULL, a NULL
+        // literal, or a different column does not.
+        let pcol = WhereColumn {
+            table: None,
+            column: "x".to_owned(),
+        };
+        let col = |n: &str| Box::new(Expr::Column(ColumnRef::bare(n), Span::ZERO));
+
+        // x IS NOT NULL guarantees x is non-null.
+        let is_not_null = Expr::IsNull {
+            expr: col("x"),
+            not: true,
+            span: Span::ZERO,
+        };
+        assert!(expr_guarantees_non_null(&is_not_null, &pcol));
+
+        // x IS NULL does not.
+        let is_null = Expr::IsNull {
+            expr: col("x"),
+            not: false,
+            span: Span::ZERO,
+        };
+        assert!(!expr_guarantees_non_null(&is_null, &pcol));
+
+        // x = 5 (non-null literal) guarantees non-null; x = NULL does not.
+        let eq = |lit: Literal| Expr::BinaryOp {
+            left: col("x"),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(lit, Span::ZERO)),
+            span: Span::ZERO,
+        };
+        assert!(expr_guarantees_non_null(&eq(Literal::Integer(5)), &pcol));
+        assert!(!expr_guarantees_non_null(&eq(Literal::Null), &pcol));
+
+        // An IS NOT NULL on a DIFFERENT column does not help.
+        let other = Expr::IsNull {
+            expr: col("y"),
+            not: true,
+            span: Span::ZERO,
+        };
+        assert!(!expr_guarantees_non_null(&other, &pcol));
+    }
 
     #[test]
     fn test_estimate_cost_ext_zero_rows_matches_legacy() {
@@ -5771,6 +6190,34 @@ mod tests {
         let c_small = estimate_cost_ext(&kind, 1000, 100, 1_000);
         let c_big = estimate_cost_ext(&kind, 1000, 100, 1_000_000);
         assert!(c_big > c_small);
+    }
+
+    #[test]
+    fn test_estimate_cost_ext_ranks_point_access_below_full_scan_for_large_tables() {
+        // The PLANNER-2 per-row terms exist so the cost model ranks a point
+        // access *below* a full scan once a table has many rows. Verify the
+        // cross-path ordering (the planning consequence), not just per-path
+        // monotonicity: for the same table, rowid <= index-equality << full scan.
+        let (tp, ip, big) = (100u64, 50u64, 1_000_000u64);
+        let full = estimate_cost_ext(&AccessPathKind::FullTableScan, tp, ip, big);
+        let eq = estimate_cost_ext(&AccessPathKind::IndexScanEquality, tp, ip, big);
+        let rowid = estimate_cost_ext(&AccessPathKind::RowidLookup, tp, ip, big);
+
+        assert!(rowid <= eq, "rowid lookup should not cost more than index equality: {rowid} vs {eq}");
+        assert!(eq < full, "index equality must rank below a full scan on a large table: {eq} vs {full}");
+
+        // Equality/rowid stay ~row-count-insensitive (only one matched row's
+        // access cost), unlike the full scan which scales with n_rows.
+        let eq_zero = estimate_cost_ext(&AccessPathKind::IndexScanEquality, tp, ip, 0);
+        let rowid_zero = estimate_cost_ext(&AccessPathKind::RowidLookup, tp, ip, 0);
+        assert!(eq - eq_zero < 1.0, "equality cost must not scale with n_rows: delta {}", eq - eq_zero);
+        assert!(rowid - rowid_zero < 1.0, "rowid cost must not scale with n_rows: delta {}", rowid - rowid_zero);
+
+        // Sanity: n_rows=0 full scan equals table-page count, and a large row
+        // count grows it by orders of magnitude.
+        let full_zero = estimate_cost_ext(&AccessPathKind::FullTableScan, tp, ip, 0);
+        assert!((full_zero - 100.0).abs() < f64::EPSILON, "n_rows=0 full scan == table pages");
+        assert!(full > full_zero * 10.0, "full scan must grow strongly with n_rows: {full} vs {full_zero}");
     }
 
     #[test]
@@ -5907,6 +6354,51 @@ mod tests {
         assert_eq!(
             inputs[perm[3]].name, "t_huge",
             "largest relation should sink to the last probe slot; perm={perm:?}",
+        );
+    }
+
+    #[test]
+    fn test_order_joins_preserves_source_order_on_equal_cost_ties() {
+        // Equal-cost tables must keep their source order in BOTH branches: the
+        // greedy path uses a stable sort, and the exhaustive path scores the
+        // identity permutation first with a strict-less update, so no equal-cost
+        // permutation can displace it. (Documented "stable keeps ties in source
+        // order" contract; existing tests only exercise distinct costs.)
+
+        // Exhaustive branch (N <= JOIN_ORDER_EXHAUSTIVE_LIMIT = 4).
+        let exhaustive = vec![
+            stats_ref("e0", 100, 5_000, true),
+            stats_ref("e1", 100, 5_000, true),
+            stats_ref("e2", 100, 5_000, true),
+        ];
+        assert_eq!(
+            order_join_inputs_with_hints(&exhaustive),
+            vec![0, 1, 2],
+            "equal-cost tables keep source order (exhaustive branch)"
+        );
+
+        // Greedy branch (N > 4, stable sort).
+        let greedy = vec![
+            stats_ref("g0", 100, 5_000, true),
+            stats_ref("g1", 100, 5_000, true),
+            stats_ref("g2", 100, 5_000, true),
+            stats_ref("g3", 100, 5_000, true),
+            stats_ref("g4", 100, 5_000, true),
+        ];
+        assert_eq!(
+            order_join_inputs_with_hints(&greedy),
+            vec![0, 1, 2, 3, 4],
+            "equal-cost tables keep source order (greedy branch)"
+        );
+
+        // Deterministic: repeated calls yield identical permutations.
+        assert_eq!(
+            order_join_inputs_with_hints(&exhaustive),
+            order_join_inputs_with_hints(&exhaustive)
+        );
+        assert_eq!(
+            order_join_inputs_with_hints(&greedy),
+            order_join_inputs_with_hints(&greedy)
         );
     }
 
@@ -6839,6 +7331,91 @@ mod tests {
         // Despite t2 being smaller, CROSS JOIN forces t1 first.
         assert_eq!(plan.join_order[0], "t1");
         assert_eq!(plan.join_order[1], "t2");
+    }
+
+    #[test]
+    fn test_from_clause_supports_leapfrog_branches() {
+        use fsqlite_ast::{JoinClause, JoinConstraint, JoinKind, JoinType};
+
+        // from_clause_supports_leapfrog gates leapfrog routing on join shape.
+        // The routing tests only ever pass None (-> supported); the rejection
+        // branches were never exercised directly.
+        let tbl = |name: &str| TableOrSubquery::Table {
+            name: QualifiedName::bare(name),
+            alias: None,
+            index_hint: None,
+            time_travel: None,
+        };
+        let col = |name: &str| Expr::Column(ColumnRef::bare(name), Span::ZERO);
+        let from = |jt: JoinType, constraint: Option<JoinConstraint>| FromClause {
+            source: tbl("a"),
+            joins: vec![JoinClause {
+                join_type: jt,
+                table: tbl("b"),
+                constraint,
+            }],
+        };
+        let inner = || JoinType {
+            natural: false,
+            kind: JoinKind::Inner,
+        };
+
+        // No FROM clause at all -> trivially supported.
+        assert!(from_clause_supports_leapfrog(None));
+
+        // Inner join with an equi-column ON predicate (x = y) is supported.
+        let equi_on = Expr::BinaryOp {
+            left: Box::new(col("x")),
+            op: AstBinaryOp::Eq,
+            right: Box::new(col("y")),
+            span: Span::ZERO,
+        };
+        assert!(from_clause_supports_leapfrog(Some(&from(
+            inner(),
+            Some(JoinConstraint::On(equi_on))
+        ))));
+
+        // A non-empty USING constraint is supported.
+        assert!(from_clause_supports_leapfrog(Some(&from(
+            inner(),
+            Some(JoinConstraint::Using(vec!["x".to_owned()]))
+        ))));
+
+        // Rejection: a non-equi ON (column = literal) is not equi-column.
+        let nonequi_on = Expr::BinaryOp {
+            left: Box::new(col("x")),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(5), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        assert!(!from_clause_supports_leapfrog(Some(&from(
+            inner(),
+            Some(JoinConstraint::On(nonequi_on))
+        ))));
+
+        // Rejection: an empty USING list.
+        assert!(!from_clause_supports_leapfrog(Some(&from(
+            inner(),
+            Some(JoinConstraint::Using(vec![]))
+        ))));
+
+        // Rejection: a NATURAL join.
+        assert!(!from_clause_supports_leapfrog(Some(&from(
+            JoinType {
+                natural: true,
+                kind: JoinKind::Inner,
+            },
+            None
+        ))));
+
+        // Rejection: an outer (LEFT) join.
+        assert!(!from_clause_supports_leapfrog(Some(&from(
+            JoinType {
+                natural: false,
+                kind: JoinKind::Left,
+            },
+            None
+        ))));
     }
 
     #[test]
@@ -8292,6 +8869,100 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_pairwise_hash_join_cost_left_deep_accumulation() {
+        // Left-deep hash-join cost model: each join step charges build+probe
+        // (scanning both inputs, written as min+max which equals their sum) and
+        // grows the running intermediate cardinality by a factor of the join
+        // selectivity heuristic (0.25). A single relation costs nothing.
+        // estimate_pairwise_hash_join_cost has no direct unit test, only
+        // indirect coverage inside best_access_path.
+
+        // Fewer than two relations: nothing to join, zero cost.
+        assert!(
+            estimate_pairwise_hash_join_cost(&["A".to_owned()], &HashMap::new()).abs() < 1e-9
+        );
+        let empty: Vec<String> = vec![];
+        assert!(estimate_pairwise_hash_join_cost(&empty, &HashMap::new()).abs() < 1e-9);
+
+        let rows = |pairs: &[(&str, f64)]| -> HashMap<String, f64> {
+            pairs.iter().map(|&(t, n)| (t.to_owned(), n)).collect()
+        };
+
+        // Two relations A(100) |><| B(250): cost is just the two scans, 100+250,
+        // independent of selectivity (the intermediate is never reused).
+        let ab = estimate_pairwise_hash_join_cost(
+            &["A".to_owned(), "B".to_owned()],
+            &rows(&[("A", 100.0), ("B", 250.0)]),
+        );
+        assert!((ab - 350.0).abs() < 1e-9, "two-table cost should be 100+250, got {ab}");
+
+        // Three relations A(100), B(250), C(40): after A|><|B the intermediate is
+        // 100*250*0.25 = 6250, so the third step charges 6250+40. Total =
+        // (100+250) + (6250+40) = 6640.
+        let abc = estimate_pairwise_hash_join_cost(
+            &["A".to_owned(), "B".to_owned(), "C".to_owned()],
+            &rows(&[("A", 100.0), ("B", 250.0), ("C", 40.0)]),
+        );
+        assert!((abc - 6640.0).abs() < 1e-9, "three-table cost should be 6640, got {abc}");
+
+        // Unknown tables default to 1 row (floored at 1.0): cost 1 + 1 = 2.
+        let defaulted =
+            estimate_pairwise_hash_join_cost(&["X".to_owned(), "Y".to_owned()], &HashMap::new());
+        assert!(
+            (defaulted - 2.0).abs() < 1e-9,
+            "missing rows default to 1 -> 2, got {defaulted}"
+        );
+    }
+
+    #[test]
+    fn test_estimate_agm_upper_bound_triangle_and_guards() {
+        // The AGM (Atserias-Grohe-Marx) fractional-cover bound on worst-case join
+        // output. The textbook case is the triangle query R(A,B) |><| S(B,C) |><|
+        // T(A,C): every variable has degree 2, so each relation's exponent is
+        // max(1/2, 1/2) = 1/2 and the bound is (N_R * N_S * N_T)^(1/2). With all
+        // three relations at N=100 rows this is 100^(3/2) = 1000 -- the classic
+        // sub-N^3 bound. estimate_agm_upper_bound has no direct unit test (only
+        // indirect coverage through best_access_path).
+        let triangle = TrieHypergraph {
+            relation_variables: vec![vec![0, 1], vec![1, 2], vec![0, 2]],
+            variable_count: 3,
+            arity: 2,
+        };
+        let component = vec!["R".to_owned(), "S".to_owned(), "T".to_owned()];
+        let mut rows: HashMap<String, f64> = HashMap::new();
+        rows.insert("R".to_owned(), 100.0);
+        rows.insert("S".to_owned(), 100.0);
+        rows.insert("T".to_owned(), 100.0);
+
+        let bound = estimate_agm_upper_bound(&component, &rows, &triangle).unwrap();
+        assert!(
+            (bound - 1000.0).abs() < 1e-6,
+            "triangle bound should be 100^1.5 = 1000, got {bound}"
+        );
+
+        // A component whose length does not match the relation count is rejected.
+        let two = vec!["R".to_owned(), "S".to_owned()];
+        assert!(estimate_agm_upper_bound(&two, &rows, &triangle).is_none());
+
+        // An empty hypergraph (variable_count == 0) is rejected.
+        let empty_hg = TrieHypergraph {
+            relation_variables: vec![],
+            variable_count: 0,
+            arity: 0,
+        };
+        let empty_component: Vec<String> = vec![];
+        assert!(estimate_agm_upper_bound(&empty_component, &rows, &empty_hg).is_none());
+
+        // Missing row counts default to 1 and the bound is floored at 1.0.
+        let no_rows: HashMap<String, f64> = HashMap::new();
+        let floored = estimate_agm_upper_bound(&component, &no_rows, &triangle).unwrap();
+        assert!(
+            (floored - 1.0).abs() < 1e-9,
+            "missing row counts default to 1 -> bound 1.0, got {floored}"
+        );
+    }
+
+    #[test]
     fn test_best_access_path_skip_scan_on_low_cardinality_leading_column() {
         let table = TableStats {
             name: "users".to_owned(),
@@ -9509,6 +10180,37 @@ mod tests {
         // Zero estimated cost → loss = actual.
         let loss = asymmetric_estimation_loss(0.0, 50.0);
         assert!((loss - 50.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_asymmetric_loss_quadratic_under_linear_over() {
+        // Existing tests compare one under vs one over point; this pins the
+        // functional shape: overestimate is a linear 1 - ratio penalty, while
+        // underestimate grows quadratically in (ratio - 1).
+        let loss = asymmetric_estimation_loss;
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+
+        // Overestimate (ratio < 1): exact linear 1 - ratio.
+        assert!(approx(loss(100.0, 75.0), 0.25));
+        assert!(approx(loss(100.0, 50.0), 0.5));
+        assert!(approx(loss(100.0, 25.0), 0.75));
+        assert!(approx(loss(100.0, 0.0), 1.0));
+        // Linear: equal actual-decrements yield equal loss increments.
+        assert!(approx(
+            loss(100.0, 50.0) - loss(100.0, 75.0),
+            loss(100.0, 25.0) - loss(100.0, 50.0)
+        ));
+
+        // Underestimate (ratio > 1): doubling the excess (ratio - 1) quadruples
+        // the loss, independent of the penalty constant (it cancels in the ratio).
+        let base = loss(100.0, 200.0); // ratio 2 -> k * 1
+        assert!(base > 0.0);
+        assert!(approx(loss(100.0, 300.0), 4.0 * base)); // ratio 3 -> k * 4
+        assert!(approx(loss(100.0, 500.0), 16.0 * base)); // ratio 5 -> k * 16
+
+        // Loss is monotonic in the ratio on both sides.
+        assert!(loss(100.0, 250.0) > loss(100.0, 200.0), "underestimate loss grows with ratio");
+        assert!(loss(100.0, 25.0) > loss(100.0, 50.0), "overestimate loss grows as estimate worsens");
     }
 
     // ── DPccp tests (bd-1as.3) ──

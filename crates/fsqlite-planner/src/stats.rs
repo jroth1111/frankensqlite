@@ -538,6 +538,197 @@ mod tests {
     }
 
     #[test]
+    fn test_histogram_bucket_contains_is_inclusive_on_both_ends() {
+        let int_bucket = HistogramBucket {
+            lower: SqliteValue::Integer(10),
+            upper: SqliteValue::Integer(20),
+            count: 5,
+            ndv: 3,
+        };
+        assert!(int_bucket.contains(&SqliteValue::Integer(10)), "lower bound is inclusive");
+        assert!(int_bucket.contains(&SqliteValue::Integer(20)), "upper bound is inclusive");
+        assert!(int_bucket.contains(&SqliteValue::Integer(15)));
+        assert!(!int_bucket.contains(&SqliteValue::Integer(9)));
+        assert!(!int_bucket.contains(&SqliteValue::Integer(21)));
+
+        // A single-value bucket [5, 5] contains only 5.
+        let point = HistogramBucket {
+            lower: SqliteValue::Integer(5),
+            upper: SqliteValue::Integer(5),
+            count: 1,
+            ndv: 1,
+        };
+        assert!(point.contains(&SqliteValue::Integer(5)));
+        assert!(!point.contains(&SqliteValue::Integer(4)));
+        assert!(!point.contains(&SqliteValue::Integer(6)));
+
+        // Float buckets behave the same: inclusive endpoints, exclusive outside.
+        let float_bucket = HistogramBucket {
+            lower: SqliteValue::Float(1.0),
+            upper: SqliteValue::Float(2.0),
+            count: 4,
+            ndv: 4,
+        };
+        assert!(float_bucket.contains(&SqliteValue::Float(1.0)));
+        assert!(float_bucket.contains(&SqliteValue::Float(2.0)));
+        assert!(float_bucket.contains(&SqliteValue::Float(1.5)));
+        assert!(!float_bucket.contains(&SqliteValue::Float(0.99)));
+        assert!(!float_bucket.contains(&SqliteValue::Float(2.01)));
+    }
+
+    #[test]
+    fn test_bytes_to_fraction_base256_encoding() {
+        let bf = bytes_to_fraction;
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-12;
+
+        // Empty -> 0; a single byte contributes value / 256.
+        assert!(approx(bf(b""), 0.0));
+        assert!(approx(bf(&[0x80]), 0.5));
+        assert!(approx(bf(&[0x40]), 0.25));
+        assert!(approx(bf(&[0xFF]), 255.0 / 256.0));
+
+        // The second byte contributes value / 256^2.
+        assert!(approx(bf(&[0x00, 0x80]), 128.0 / 65536.0)); // 2^-9 = 0.001953125
+        assert!(approx(bf(&[0x80, 0x80]), 0.5 + 128.0 / 65536.0));
+
+        // Only the first 8 bytes matter; trailing bytes are ignored.
+        assert!(approx(bf(&[0xFF; 9]), bf(&[0xFF; 8])));
+
+        // Strictly increasing with the most-significant byte; result stays in [0, 1).
+        assert!(bf(&[0x02]) > bf(&[0x01]));
+        assert!(bf(&[0x01]) > bf(&[0x00, 0xFF, 0xFF]));
+        let max8 = bf(&[0xFF; 8]);
+        assert!(
+            (0.0..1.0).contains(&max8),
+            "eight 0xFF bytes must stay below 1.0, got {max8}"
+        );
+    }
+
+    #[test]
+    fn test_interpolate_position_clamps_handles_degenerate_and_mixed_types() {
+        use SqliteValue::{Float, Integer};
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+
+        // Integer: linear position, clamped to [0,1] for values outside [min,max].
+        assert!(approx(interpolate_position(&Integer(0), &Integer(100), &Integer(50)), 0.5));
+        assert!(approx(interpolate_position(&Integer(0), &Integer(100), &Integer(0)), 0.0));
+        assert!(approx(interpolate_position(&Integer(0), &Integer(100), &Integer(100)), 1.0));
+        assert!(
+            approx(interpolate_position(&Integer(0), &Integer(100), &Integer(-50)), 0.0),
+            "below min clamps to 0"
+        );
+        assert!(
+            approx(interpolate_position(&Integer(0), &Integer(100), &Integer(200)), 1.0),
+            "above max clamps to 1"
+        );
+        // Degenerate range (max <= min) carries no information -> 0.5.
+        assert!(approx(interpolate_position(&Integer(50), &Integer(50), &Integer(50)), 0.5));
+        assert!(approx(interpolate_position(&Integer(100), &Integer(0), &Integer(50)), 0.5));
+
+        // Float: same linear behavior; any NaN endpoint/value returns 0.5.
+        assert!(approx(interpolate_position(&Float(0.0), &Float(10.0), &Float(2.5)), 0.25));
+        assert!(
+            approx(interpolate_position(&Float(0.0), &Float(10.0), &Float(f64::NAN)), 0.5),
+            "NaN value -> 0.5"
+        );
+        assert!(
+            approx(interpolate_position(&Float(f64::NAN), &Float(10.0), &Float(5.0)), 0.5),
+            "NaN min -> 0.5"
+        );
+
+        // Mixed / uncomparable types fall through to the 0.5 default.
+        assert!(approx(interpolate_position(&Integer(0), &Float(10.0), &Integer(5)), 0.5));
+    }
+
+    #[test]
+    fn test_interpolate_position_text_and_blob_branches() {
+        // The existing interpolate_position test covers Integer/Float/mixed; the
+        // Text and Blob branches (which interpolate via the base-256 byte
+        // fraction and have their own degenerate-range guards) were untested.
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+
+        // Text: linear position via the base-256 fraction of the bytes. With
+        // ASCII 'A'(65), 'B'(66), 'C'(67), B sits halfway between A and C.
+        let t = |s: &str| SqliteValue::from(s);
+        assert!(approx(interpolate_position(&t("A"), &t("C"), &t("B")), 0.5));
+        assert!(approx(interpolate_position(&t("A"), &t("C"), &t("A")), 0.0));
+        assert!(approx(interpolate_position(&t("A"), &t("C"), &t("C")), 1.0));
+        // Out-of-range values clamp to [0, 1].
+        assert!(approx(interpolate_position(&t("A"), &t("C"), &t("@")), 0.0)); // '@'=64 < min
+        assert!(approx(interpolate_position(&t("A"), &t("C"), &t("D")), 1.0)); // 'D'=68 > max
+        // A reversed or empty text range carries no information -> 0.5.
+        assert!(approx(interpolate_position(&t("C"), &t("A"), &t("B")), 0.5));
+        assert!(approx(interpolate_position(&t("B"), &t("B"), &t("B")), 0.5));
+
+        // Blob: same base-256 interpolation, but the bytes can be arbitrary.
+        let b = |bytes: &[u8]| SqliteValue::from(bytes);
+        assert!(approx(interpolate_position(&b(&[0x00]), &b(&[0x80]), &b(&[0x40])), 0.5));
+        // A reversed blob range -> 0.5.
+        assert!(approx(interpolate_position(&b(&[0x80]), &b(&[0x00]), &b(&[0x40])), 0.5));
+        // Distinct blobs (max > min lexically) whose 8-byte base-256 encodings
+        // collide because trailing zero bytes are ignored hit the inner
+        // zero-range guard -> 0.5.
+        assert!(approx(interpolate_position(&b(&[0x01]), &b(&[0x01, 0x00]), &b(&[0x01])), 0.5));
+    }
+
+    #[test]
+    fn test_histogram_equality_and_range_estimates_multi_bucket() {
+        // Two equi-depth buckets with distinct densities so equality estimates
+        // (count / ndv) differ per bucket and range estimates span both.
+        let hist = Histogram {
+            buckets: vec![
+                HistogramBucket {
+                    lower: SqliteValue::Integer(0),
+                    upper: SqliteValue::Integer(99),
+                    count: 100,
+                    ndv: 10,
+                },
+                HistogramBucket {
+                    lower: SqliteValue::Integer(100),
+                    upper: SqliteValue::Integer(199),
+                    count: 200,
+                    ndv: 50,
+                },
+            ],
+        };
+        let total = 300.0;
+        let iv = SqliteValue::Integer;
+
+        // Equality: uniform within bucket = count / ndv (boundaries included).
+        assert!((hist.estimate_equality_rows(&iv(50)) - 10.0).abs() < f64::EPSILON); // A: 100/10
+        assert!((hist.estimate_equality_rows(&iv(0)) - 10.0).abs() < f64::EPSILON); // A lower
+        assert!((hist.estimate_equality_rows(&iv(99)) - 10.0).abs() < f64::EPSILON); // A upper
+        assert!((hist.estimate_equality_rows(&iv(100)) - 4.0).abs() < f64::EPSILON); // B: 200/50
+        assert!((hist.estimate_equality_rows(&iv(150)) - 4.0).abs() < f64::EPSILON);
+        // Out of histogram range -> minimal-selectivity fallback of 1.0 row.
+        assert!((hist.estimate_equality_rows(&iv(10_000)) - 1.0).abs() < f64::EPSILON);
+
+        // Range endpoints: below all rows -> 0; at/above all rows -> total.
+        assert!((hist.estimate_less_than_rows(&iv(-100)) - 0.0).abs() < f64::EPSILON);
+        assert!((hist.estimate_less_than_rows(&iv(10_000)) - total).abs() < f64::EPSILON);
+        assert!((hist.estimate_greater_than_rows(&iv(10_000)) - 0.0).abs() < f64::EPSILON);
+        assert!((hist.estimate_greater_than_rows(&iv(-100)) - total).abs() < f64::EPSILON);
+
+        // less_than is monotonic non-decreasing across the domain.
+        let lt_lo = hist.estimate_less_than_rows(&iv(-100));
+        let lt_a = hist.estimate_less_than_rows(&iv(50));
+        let lt_b = hist.estimate_less_than_rows(&iv(150));
+        let lt_hi = hist.estimate_less_than_rows(&iv(10_000));
+        assert!(
+            lt_lo <= lt_a && lt_a <= lt_b && lt_b <= lt_hi,
+            "less_than must be monotonic: {lt_lo} <= {lt_a} <= {lt_b} <= {lt_hi}"
+        );
+
+        // Every estimate stays within [0, total].
+        for n in [-100_i64, 0, 50, 99, 100, 150, 199, 10_000] {
+            let lt = hist.estimate_less_than_rows(&iv(n));
+            let gt = hist.estimate_greater_than_rows(&iv(n));
+            assert!((0.0..=total).contains(&lt), "less_than({n})={lt} out of [0,{total}]");
+            assert!((0.0..=total).contains(&gt), "greater_than({n})={gt} out of [0,{total}]");
+        }
+    }
+
+    #[test]
     fn test_selectivity_defaults() {
         let stats = ColumnStats {
             table_row_count: 1000,
@@ -556,6 +747,78 @@ mod tests {
         // Gt: 1/3 heuristic
         let sel = stats.estimate_selectivity(&Operator::Gt, &SqliteValue::Integer(50));
         assert!((sel - 0.333).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_estimate_selectivity_operator_dispatch_and_null_handling() {
+        // test_selectivity_defaults only covers Eq + Gt; this covers the rest of
+        // the no-histogram dispatch (Ne/Lt/Le/Ge), NULL handling, empty/all-NULL
+        // edges, and the algebraic relationships between operators.
+        let base = ColumnStats {
+            table_row_count: 1000,
+            null_count: 0,
+            ndv: 100,
+            min_value: Some(SqliteValue::Integer(0)),
+            max_value: Some(SqliteValue::Integer(1000)),
+            avg_width: 8.0,
+            histogram: None,
+        };
+        let v = SqliteValue::Integer(50);
+        let sel = |stats: &ColumnStats, op: Operator| stats.estimate_selectivity(&op, &v);
+
+        let eq = sel(&base, Operator::Eq);
+        let ne = sel(&base, Operator::Ne);
+        let lt = sel(&base, Operator::Lt);
+        let gt = sel(&base, Operator::Gt);
+        let le = sel(&base, Operator::Le);
+        let ge = sel(&base, Operator::Ge);
+        assert!((eq - 0.01).abs() < 1e-9, "Eq = 1/ndv = 0.01, got {eq}");
+        assert!((lt - gt).abs() < 1e-12, "Lt and Gt share the 1/3 default");
+        assert!((lt - 1.0 / 3.0).abs() < 1e-9, "Lt = 1/3 default, got {lt}");
+        // Eq and Ne partition the non-NULL space: with no NULLs they sum to 1.0.
+        assert!(
+            (eq + ne - 1.0).abs() < 1e-9,
+            "Eq + Ne should be 1.0 with no NULLs, got {}",
+            eq + ne
+        );
+        // Closed endpoints add the equality mass: Le = Lt + Eq, Ge = Gt + Eq.
+        assert!(((le - lt) - eq).abs() < 1e-9, "Le - Lt should equal Eq");
+        assert!(((ge - gt) - eq).abs() < 1e-9, "Ge - Gt should equal Eq");
+
+        // NULLs shrink the non-NULL base: equality selectivity drops and Eq+Ne
+        // sums to the non-NULL fraction rather than 1.0.
+        let with_nulls = ColumnStats { null_count: 200, ..base.clone() };
+        let eq_n = sel(&with_nulls, Operator::Eq);
+        let ne_n = sel(&with_nulls, Operator::Ne);
+        assert!(
+            (eq_n - 0.008).abs() < 1e-9,
+            "Eq with 200/1000 NULLs = (800/100)/1000 = 0.008, got {eq_n}"
+        );
+        assert!(
+            (eq_n + ne_n - 0.8).abs() < 1e-9,
+            "Eq+Ne should equal the non-NULL fraction 0.8, got {}",
+            eq_n + ne_n
+        );
+
+        // Edge cases: empty table and an all-NULL column yield zero selectivity
+        // for every operator. Every estimate stays a valid probability in [0,1].
+        let empty = ColumnStats { table_row_count: 0, ..base.clone() };
+        let all_null = ColumnStats { table_row_count: 500, null_count: 500, ..base.clone() };
+        for op in [
+            Operator::Eq,
+            Operator::Ne,
+            Operator::Lt,
+            Operator::Le,
+            Operator::Gt,
+            Operator::Ge,
+        ] {
+            assert!(sel(&empty, op).abs() < f64::EPSILON, "empty table -> 0 selectivity");
+            assert!(sel(&all_null, op).abs() < f64::EPSILON, "all-NULL -> 0 selectivity");
+            for stats in [&base, &with_nulls] {
+                let s = sel(stats, op);
+                assert!((0.0..=1.0).contains(&s), "selectivity {s} out of [0,1]");
+            }
+        }
     }
 
     // ── Cardinality estimation with sampling fallback (bd-1as.1) ──
@@ -632,6 +895,45 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_cardinality_empty_table_and_ndv_only_for_equality() {
+        // Empty table -> zero estimate with heuristic provenance.
+        let empty = ColumnStats {
+            table_row_count: 0,
+            ndv: 100,
+            ..ColumnStats::default()
+        };
+        let est = empty.estimate_cardinality(&Operator::Eq, &SqliteValue::Integer(1), None);
+        assert!(est.estimated_rows.abs() < f64::EPSILON);
+        assert!(est.selectivity.abs() < f64::EPSILON);
+        assert_eq!(est.method, EstimationMethod::Heuristic);
+
+        // With NDV but no histogram/sample, the NDV fallback is wired ONLY for
+        // equality. A range operator with the same stats falls through to the
+        // default heuristic instead of using NDV.
+        let stats = ColumnStats {
+            table_row_count: 1000,
+            ndv: 50,
+            ..ColumnStats::default()
+        };
+        let eq = stats.estimate_cardinality(&Operator::Eq, &SqliteValue::Integer(1), None);
+        assert_eq!(eq.method, EstimationMethod::Ndv, "equality uses NDV");
+        let lt = stats.estimate_cardinality(&Operator::Lt, &SqliteValue::Integer(1), None);
+        assert_eq!(
+            lt.method,
+            EstimationMethod::Heuristic,
+            "a range op falls to the heuristic, not NDV"
+        );
+
+        // Across methods, estimated_rows is exactly selectivity * row_count.
+        for est in [&eq, &lt] {
+            assert!(
+                est.selectivity.mul_add(-1000.0, est.estimated_rows).abs() < 1e-6,
+                "estimated_rows must equal selectivity * row_count"
+            );
+        }
+    }
+
+    #[test]
     fn test_cardinality_estimate_heuristic_fallback() {
         let stats = ColumnStats {
             table_row_count: 1000,
@@ -654,6 +956,20 @@ mod tests {
         assert!((default_selectivity(Operator::Ne) - 0.99).abs() < 0.001);
         assert!((default_selectivity(Operator::Lt) - 0.333).abs() < 0.001);
         assert!((default_selectivity(Operator::Like) - 0.1).abs() < 0.001);
+
+        // Complete the operator coverage: the aliases collapse to their primary
+        // operator's selectivity, and all four range operators agree.
+        let eps = 1e-9;
+        assert!((default_selectivity(Operator::Is) - default_selectivity(Operator::Eq)).abs() < eps);
+        assert!(
+            (default_selectivity(Operator::IsNot) - default_selectivity(Operator::Ne)).abs() < eps
+        );
+        assert!(
+            (default_selectivity(Operator::Glob) - default_selectivity(Operator::Like)).abs() < eps
+        );
+        for op in [Operator::Le, Operator::Gt, Operator::Ge] {
+            assert!((default_selectivity(op) - default_selectivity(Operator::Lt)).abs() < eps);
+        }
     }
 
     #[test]
@@ -669,6 +985,21 @@ mod tests {
         assert!(cmp_matches(&v100, Operator::Gt, &v50));
         assert!(cmp_matches(&v100, Operator::Ge, &v100));
         assert!(cmp_matches(&v50, Operator::Ne, &v100));
+
+        // IS / IS NOT mirror Eq / Ne on samples.
+        assert!(cmp_matches(&v50, Operator::Is, &v50));
+        assert!(!cmp_matches(&v50, Operator::Is, &v100));
+        assert!(cmp_matches(&v50, Operator::IsNot, &v100));
+        assert!(!cmp_matches(&v50, Operator::IsNot, &v50));
+
+        // Le also matches strictly-less; Ge also matches strictly-greater.
+        assert!(cmp_matches(&v50, Operator::Le, &v100));
+        assert!(cmp_matches(&v100, Operator::Ge, &v50));
+
+        // LIKE / GLOB are not evaluated against samples: they never match, even
+        // when the two values are equal.
+        assert!(!cmp_matches(&v50, Operator::Like, &v50));
+        assert!(!cmp_matches(&v50, Operator::Glob, &v50));
     }
 
     #[test]

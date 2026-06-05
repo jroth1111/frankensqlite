@@ -650,6 +650,65 @@ fn bench_vdbe_commit_stage(c: &mut Criterion) {
     group.finish();
 }
 
+fn build_execute_stage_next_program(root_page: i32) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let halt = builder.emit_label();
+    builder.emit_op(Opcode::OpenWrite, 0, root_page, 0, P4::Int(1), 0);
+    builder.emit_jump_to_label(Opcode::Rewind, 0, 0, halt, P4::None, 0);
+    let body = i32::try_from(builder.current_addr()).expect("body addr fits i32");
+    builder.emit_op(Opcode::Next, 0, body, 0, P4::None, 0);
+    builder.resolve_label(halt);
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder
+        .finish()
+        .expect("pipeline execute next benchmark program should build")
+}
+
+fn bench_vdbe_execute_next_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_next");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).expect("table should exist");
+        for i in 1..=op_repeats {
+            table.insert_row(
+                i64::try_from(i).unwrap_or(1),
+                vec![SqliteValue::Integer(i64::try_from(i).unwrap_or(0))],
+            );
+        }
+        let program = build_execute_stage_next_program(root);
+
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &(program, db),
+            |b, (program, db)| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                engine.set_database(db.clone());
+                engine.set_reject_mem_fallback(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute next benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_vdbe_decode_stage,
@@ -662,6 +721,7 @@ criterion_group!(
     bench_vdbe_execute_ifnot_stage,
     bench_vdbe_execute_rowid_stage,
     bench_vdbe_execute_idx_rowid_stage,
+    bench_vdbe_execute_next_stage,
     bench_vdbe_commit_stage
 );
 criterion_main!(benches);

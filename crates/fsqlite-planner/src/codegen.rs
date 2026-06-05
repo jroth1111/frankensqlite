@@ -182,9 +182,7 @@ pub fn codegen_select(
 ) -> Result<(), CodegenError> {
     let core = match &stmt.body.select {
         SelectCore::Select { .. } => &stmt.body.select,
-        SelectCore::Values(_) => {
-            return Err(CodegenError::Unsupported("VALUES in SELECT".to_owned()));
-        }
+        SelectCore::Values(rows) => return codegen_select_values(b, rows),
     };
 
     let (columns, from, where_clause) = match core {
@@ -203,14 +201,7 @@ pub fn codegen_select(
     }
     let from_clause = from.as_ref().expect("checked above");
 
-    let table_name = match &from_clause.source {
-        fsqlite_ast::TableOrSubquery::Table { name, .. } => &name.name,
-        _ => {
-            return Err(CodegenError::Unsupported(
-                "non-table FROM source".to_owned(),
-            ));
-        }
-    };
+    let table_name = single_table_select_source_name(&from_clause.source)?;
 
     let table = find_table(schema, table_name)?;
     let cursor = 0_i32;
@@ -273,11 +264,20 @@ pub fn codegen_select(
         b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     } else if let Some((col_name, param_idx)) = &index_eq {
         // --- Index-seek SELECT ---
-        let idx_schema = table.index_for_column(col_name).ok_or_else(|| {
-            CodegenError::Unsupported(format!(
-                "SELECT WHERE `{col_name} = ?` requires an index on `{col_name}`"
-            ))
-        })?;
+        let Some(idx_schema) = table.index_for_column(col_name) else {
+            return codegen_select_column_eq_scan(
+                b,
+                cursor,
+                table,
+                columns,
+                out_regs,
+                out_col_count,
+                done_label,
+                end_label,
+                col_name,
+                *param_idx,
+            );
+        };
         let idx_cursor = 1_i32;
         index_cursor_to_close = Some(idx_cursor);
         let param_reg = b.alloc_reg();
@@ -375,6 +375,67 @@ pub fn codegen_select(
     Ok(())
 }
 
+/// Codegen for a top-level `VALUES (..), (..)` SELECT core.
+fn codegen_select_values(b: &mut ProgramBuilder, rows: &[Vec<Expr>]) -> Result<(), CodegenError> {
+    let end_label = b.emit_label();
+
+    // Init: jump to end.
+    b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+
+    // Read-only transaction.
+    b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+
+    let Some(first_row) = rows.first() else {
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end_label);
+        return Ok(());
+    };
+
+    let out_col_count = i32::try_from(first_row.len())
+        .map_err(|_| CodegenError::Unsupported("VALUES row has too many columns".to_owned()))?;
+
+    if rows.iter().any(|row| row.len() != first_row.len()) {
+        return Err(CodegenError::Unsupported(
+            "VALUES rows must have the same arity".to_owned(),
+        ));
+    }
+
+    let out_regs = b.alloc_regs(out_col_count);
+    for row in rows {
+        for (reg, expr) in (out_regs..).zip(row.iter()) {
+            emit_expr(b, expr, reg)?;
+        }
+        b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    }
+
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    // End target for Init jump.
+    b.resolve_label(end_label);
+
+    Ok(())
+}
+
+fn single_table_select_source_name(
+    source: &fsqlite_ast::TableOrSubquery,
+) -> Result<&str, CodegenError> {
+    match source {
+        fsqlite_ast::TableOrSubquery::Table { name, .. } => Ok(&name.name),
+        fsqlite_ast::TableOrSubquery::ParenJoin(inner) if inner.joins.is_empty() => {
+            single_table_select_source_name(&inner.source)
+        }
+        fsqlite_ast::TableOrSubquery::ParenJoin(_) => Err(CodegenError::Unsupported(
+            "parenthesized JOIN source in single-table SELECT".to_owned(),
+        )),
+        fsqlite_ast::TableOrSubquery::Subquery { .. } => Err(CodegenError::Unsupported(
+            "subquery FROM source in single-table SELECT".to_owned(),
+        )),
+        fsqlite_ast::TableOrSubquery::TableFunction { .. } => Err(CodegenError::Unsupported(
+            "table-valued function FROM source in single-table SELECT".to_owned(),
+        )),
+    }
+}
+
 /// Codegen for a full table scan SELECT.
 #[allow(clippy::too_many_arguments)]
 fn codegen_select_full_scan(
@@ -417,6 +478,78 @@ fn codegen_select_full_scan(
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
     // End target for Init jump.
+    b.resolve_label(end_label);
+
+    Ok(())
+}
+
+/// Codegen for `SELECT ... FROM table WHERE column = ?` when no usable index exists.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+fn codegen_select_column_eq_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    columns: &[ResultColumn],
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: Label,
+    end_label: Label,
+    filter_column: &str,
+    param_idx: i32,
+) -> Result<(), CodegenError> {
+    let filter_col_idx =
+        table
+            .column_index(filter_column)
+            .ok_or_else(|| CodegenError::ColumnNotFound {
+                table: table.name.clone(),
+                column: filter_column.to_owned(),
+            })?;
+    let param_reg = b.alloc_reg();
+    let value_reg = b.alloc_reg();
+    b.emit_op(Opcode::Variable, param_idx, param_reg, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+
+    let loop_start = b.current_addr();
+    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
+
+    let skip_row_label = b.emit_label();
+    b.emit_op(
+        Opcode::Column,
+        cursor,
+        filter_col_idx as i32,
+        value_reg,
+        P4::None,
+        0,
+    );
+    b.emit_jump_to_label(
+        Opcode::Ne,
+        param_reg,
+        value_reg,
+        skip_row_label,
+        P4::None,
+        0x10,
+    );
+    emit_column_reads(b, cursor, columns, table, out_regs)?;
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    b.resolve_label(skip_row_label);
+
+    let loop_body = (loop_start + 1) as i32;
+    b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
 
     Ok(())
@@ -1935,6 +2068,715 @@ mod tests {
         Expr::Placeholder(PlaceholderType::Numbered(n), Span::ZERO)
     }
 
+    #[test]
+    fn test_table_schema_accessors_affinity_index_and_case_insensitive_lookup() {
+        let schema = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "name".to_owned(),
+                    affinity: 'b',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "age".to_owned(),
+                    affinity: 'c',
+                    default_value: None,
+                },
+            ],
+            indexes: vec![IndexSchema {
+                name: "idx_age_name".to_owned(),
+                root_page: 3,
+                columns: vec!["age".to_owned(), "name".to_owned()],
+                is_unique: false,
+            }],
+        };
+
+        // affinity_string: one char per column, in declaration order.
+        assert_eq!(schema.affinity_string(), "dbc");
+
+        // column_index: case-insensitive, in declaration order; None for absent.
+        assert_eq!(schema.column_index("id"), Some(0));
+        assert_eq!(schema.column_index("NAME"), Some(1), "lookup is case-insensitive");
+        assert_eq!(schema.column_index("Age"), Some(2));
+        assert_eq!(schema.column_index("missing"), None);
+
+        // index_for_column matches the LEFTMOST index column only (case-insensitive).
+        assert_eq!(schema.index_for_column("age").map(|i| i.name.as_str()), Some("idx_age_name"));
+        assert_eq!(
+            schema.index_for_column("AGE").map(|i| i.name.as_str()),
+            Some("idx_age_name"),
+            "case-insensitive"
+        );
+        assert!(
+            schema.index_for_column("name").is_none(),
+            "a non-leftmost index column is not matched"
+        );
+        assert!(schema.index_for_column("id").is_none());
+    }
+
+    #[test]
+    fn test_type_to_affinity_follows_sqlite_rules() {
+        // SQLite affinity determination is a case-insensitive substring scan in
+        // precedence order: INT->'D', {CHAR,CLOB,TEXT,VARCHAR}->'B',
+        // {BLOB, no type}->'A', {REAL,FLOA,DOUB}->'E', else NUMERIC 'C'.
+        assert_eq!(type_to_affinity("INTEGER"), 'D');
+        assert_eq!(type_to_affinity("int"), 'D');
+        assert_eq!(type_to_affinity("BIGINT"), 'D');
+        assert_eq!(type_to_affinity("TINYINT"), 'D');
+        // SQLite quirk: anything containing "INT" gets INTEGER affinity ("POINT").
+        assert_eq!(type_to_affinity("POINT"), 'D');
+
+        assert_eq!(type_to_affinity("TEXT"), 'B');
+        assert_eq!(type_to_affinity("VARCHAR(255)"), 'B');
+        assert_eq!(type_to_affinity("CHARACTER(20)"), 'B');
+        assert_eq!(type_to_affinity("CLOB"), 'B');
+
+        // BLOB or a missing declared type yields no affinity ('A').
+        assert_eq!(type_to_affinity("BLOB"), 'A');
+        assert_eq!(type_to_affinity(""), 'A');
+
+        assert_eq!(type_to_affinity("REAL"), 'E');
+        assert_eq!(type_to_affinity("DOUBLE PRECISION"), 'E');
+        assert_eq!(type_to_affinity("FLOAT"), 'E');
+
+        // Everything else falls through to NUMERIC.
+        assert_eq!(type_to_affinity("NUMERIC"), 'C');
+        assert_eq!(type_to_affinity("DECIMAL(10,2)"), 'C');
+        assert_eq!(type_to_affinity("BOOLEAN"), 'C');
+        assert_eq!(type_to_affinity("DATETIME"), 'C');
+    }
+
+    #[test]
+    fn test_rowid_ref_aliases_and_conflict_action_codes() {
+        // SQLite recognizes three case-insensitive rowid aliases.
+        for name in ["rowid", "ROWID", "_rowid_", "oid", "OID", "RowId"] {
+            assert!(is_rowid_ref(&ColumnRef::bare(name)), "{name} is a rowid alias");
+        }
+        for name in ["id", "name", "rowid_", "row_id", "_oid_"] {
+            assert!(!is_rowid_ref(&ColumnRef::bare(name)), "{name} is not a rowid alias");
+        }
+
+        // ON CONFLICT actions map to OE_ codes; a missing action defaults to ABORT.
+        assert_eq!(conflict_action_to_oe(None), OE_ABORT, "default conflict action is ABORT");
+        assert_eq!(conflict_action_to_oe(Some(&ConflictAction::Abort)), OE_ABORT);
+        assert_eq!(conflict_action_to_oe(Some(&ConflictAction::Rollback)), OE_ROLLBACK);
+        assert_eq!(conflict_action_to_oe(Some(&ConflictAction::Fail)), OE_FAIL);
+        assert_eq!(conflict_action_to_oe(Some(&ConflictAction::Ignore)), OE_IGNORE);
+        assert_eq!(conflict_action_to_oe(Some(&ConflictAction::Replace)), OE_REPLACE);
+        // The five OE conflict codes are distinct.
+        let codes: std::collections::HashSet<u16> =
+            [OE_ROLLBACK, OE_ABORT, OE_FAIL, OE_IGNORE, OE_REPLACE].into_iter().collect();
+        assert_eq!(codes.len(), 5, "OE conflict codes must be distinct");
+    }
+
+    #[test]
+    fn test_emit_comparison_expr_shape_and_is_nulleq_flag() {
+        // emit_comparison_expr evaluates both operands into temps, then a
+        // comparison opcode jumps to set dest=1, falling through to dest=0 via a
+        // Goto. IS / IS NOT additionally set the NULLEQ flag (p5=0x80) so that
+        // NULL IS NULL compares true. Neither the emitted shape nor the flag was
+        // directly asserted (binary_op_to_opcode only checks Is -> Eq).
+        let lit = |n: i64| Expr::Literal(Literal::Integer(n), Span::ZERO);
+
+        // `3 < 5`: eval, eval, Lt(jump), Integer 0, Goto, Integer 1.
+        let mut b = ProgramBuilder::new();
+        let dest = b.alloc_reg();
+        emit_comparison_expr(&mut b, &lit(3), AstBinaryOp::Lt, &lit(5), dest).unwrap();
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let prog = b.finish().unwrap();
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Integer, // left operand
+                Opcode::Integer, // right operand
+                Opcode::Lt,      // comparison jump
+                Opcode::Integer, // false branch -> 0
+                Opcode::Goto,
+                Opcode::Integer, // true branch -> 1
+            ]
+        ));
+        let lt = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Lt)
+            .expect("Lt present");
+        assert_eq!(lt.p5, 0, "a plain comparison carries no NULLEQ flag");
+
+        // `3 IS 5`: maps to Eq with the NULLEQ flag set (0x80).
+        let mut b2 = ProgramBuilder::new();
+        let d2 = b2.alloc_reg();
+        emit_comparison_expr(&mut b2, &lit(3), AstBinaryOp::Is, &lit(5), d2).unwrap();
+        b2.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let prog2 = b2.finish().unwrap();
+        let eq = prog2
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Eq)
+            .expect("Eq present");
+        assert_eq!(eq.p5, 0x80, "IS uses the NULLEQ flag so NULL IS NULL is true");
+    }
+
+    #[test]
+    fn test_is_rowid_ref_recognizes_aliases_case_insensitively() {
+        // is_rowid_ref accepts the three rowid aliases (rowid, _rowid_, oid)
+        // case-insensitively and rejects everything else. It is exercised
+        // indirectly via SELECT codegen but never asserted as a predicate.
+        for name in ["rowid", "ROWID", "RowId", "_rowid_", "_ROWID_", "oid", "OID"] {
+            assert!(
+                is_rowid_ref(&ColumnRef::bare(name)),
+                "{name} should be a rowid alias"
+            );
+        }
+        for name in ["id", "row_id", "rowid2", "oids", "_rowid", "rowi", ""] {
+            assert!(
+                !is_rowid_ref(&ColumnRef::bare(name)),
+                "{name} should NOT be a rowid alias"
+            );
+        }
+    }
+
+    #[test]
+    fn test_binary_op_to_opcode_and_is_comparison_classification() {
+        use AstBinaryOp as B;
+
+        // Arithmetic / bitwise / logical / concat map directly...
+        assert_eq!(binary_op_to_opcode(B::Add), Opcode::Add);
+        assert_eq!(binary_op_to_opcode(B::Subtract), Opcode::Subtract);
+        assert_eq!(binary_op_to_opcode(B::Multiply), Opcode::Multiply);
+        assert_eq!(binary_op_to_opcode(B::Divide), Opcode::Divide);
+        // ...with one rename: Modulo -> Remainder.
+        assert_eq!(binary_op_to_opcode(B::Modulo), Opcode::Remainder);
+        assert_eq!(binary_op_to_opcode(B::Concat), Opcode::Concat);
+        assert_eq!(binary_op_to_opcode(B::BitAnd), Opcode::BitAnd);
+        assert_eq!(binary_op_to_opcode(B::BitOr), Opcode::BitOr);
+        assert_eq!(binary_op_to_opcode(B::ShiftLeft), Opcode::ShiftLeft);
+        assert_eq!(binary_op_to_opcode(B::ShiftRight), Opcode::ShiftRight);
+        assert_eq!(binary_op_to_opcode(B::And), Opcode::And);
+        assert_eq!(binary_op_to_opcode(B::Or), Opcode::Or);
+
+        // Comparisons; IS / IS NOT collapse onto Eq / Ne at the opcode level.
+        assert_eq!(binary_op_to_opcode(B::Eq), Opcode::Eq);
+        assert_eq!(binary_op_to_opcode(B::Is), Opcode::Eq);
+        assert_eq!(binary_op_to_opcode(B::Ne), Opcode::Ne);
+        assert_eq!(binary_op_to_opcode(B::IsNot), Opcode::Ne);
+        assert_eq!(binary_op_to_opcode(B::Lt), Opcode::Lt);
+        assert_eq!(binary_op_to_opcode(B::Le), Opcode::Le);
+        assert_eq!(binary_op_to_opcode(B::Gt), Opcode::Gt);
+        assert_eq!(binary_op_to_opcode(B::Ge), Opcode::Ge);
+
+        // is_comparison_op: the six relational ops plus IS / IS NOT, nothing else.
+        for op in [B::Eq, B::Ne, B::Lt, B::Le, B::Gt, B::Ge, B::Is, B::IsNot] {
+            assert!(is_comparison_op(op), "{op:?} is a comparison");
+        }
+        for op in [
+            B::Add, B::Subtract, B::Multiply, B::Divide, B::Modulo, B::Concat, B::BitAnd, B::BitOr,
+            B::ShiftLeft, B::ShiftRight, B::And, B::Or,
+        ] {
+            assert!(!is_comparison_op(op), "{op:?} is not a comparison");
+        }
+    }
+
+    #[test]
+    fn test_extract_column_eq_bind_symmetry_and_rowid_exclusion() {
+        let bin = |left: Expr, right: Expr| Expr::BinaryOp {
+            left: Box::new(left),
+            op: AstBinaryOp::Eq,
+            right: Box::new(right),
+            span: Span::ZERO,
+        };
+        let col = |name: &str| Expr::Column(ColumnRef::bare(name), Span::ZERO);
+
+        // `name = ?2` -> ("name", 2).
+        let e = bin(col("name"), placeholder(2));
+        assert_eq!(extract_column_eq_bind(Some(&e)), Some(("name".to_owned(), 2)));
+
+        // Symmetric form `?3 = age` -> ("age", 3).
+        let e = bin(placeholder(3), col("age"));
+        assert_eq!(extract_column_eq_bind(Some(&e)), Some(("age".to_owned(), 3)));
+
+        // rowid columns are excluded (they take a separate seek path) -> None.
+        let e = bin(col("rowid"), placeholder(1));
+        assert_eq!(extract_column_eq_bind(Some(&e)), None);
+
+        // A non-bind right-hand side (`name = age`) -> None.
+        let e = bin(col("name"), col("age"));
+        assert_eq!(extract_column_eq_bind(Some(&e)), None);
+
+        // A non-equality operator (`name < ?1`) -> None.
+        let lt = Expr::BinaryOp {
+            left: Box::new(col("name")),
+            op: AstBinaryOp::Lt,
+            right: Box::new(placeholder(1)),
+            span: Span::ZERO,
+        };
+        assert_eq!(extract_column_eq_bind(Some(&lt)), None);
+
+        // No WHERE clause -> None.
+        assert_eq!(extract_column_eq_bind(None), None);
+    }
+
+    #[test]
+    fn test_extract_rowid_bind_symmetry_and_form_preservation() {
+        let eq = |left: Expr, right: Expr| Expr::BinaryOp {
+            left: Box::new(left),
+            op: AstBinaryOp::Eq,
+            right: Box::new(right),
+            span: Span::ZERO,
+        };
+        let col = |name: &str| Expr::Column(ColumnRef::bare(name), Span::ZERO);
+
+        // `rowid = ?2` -> Numbered(2); the *_param form collapses to 2.
+        let e = eq(col("rowid"), placeholder(2));
+        assert_eq!(extract_rowid_bind(Some(&e)), Some(BindParamRef::Numbered(2)));
+        assert_eq!(extract_rowid_bind_param(Some(&e)), Some(2));
+
+        // Symmetric, and the `oid` alias is recognized: `?3 = oid` -> Numbered(3).
+        let e = eq(placeholder(3), col("oid"));
+        assert_eq!(extract_rowid_bind(Some(&e)), Some(BindParamRef::Numbered(3)));
+
+        // An anonymous placeholder preserves its form; *_param collapses it to 1.
+        let e = eq(col("rowid"), Expr::Placeholder(PlaceholderType::Anonymous, Span::ZERO));
+        assert_eq!(extract_rowid_bind(Some(&e)), Some(BindParamRef::Anonymous));
+        assert_eq!(extract_rowid_bind_param(Some(&e)), Some(1));
+
+        // A non-rowid column is not extracted here (handled by column-eq path).
+        let e = eq(col("name"), placeholder(1));
+        assert_eq!(extract_rowid_bind(Some(&e)), None);
+
+        // Non-bind RHS and a missing WHERE -> None.
+        assert_eq!(extract_rowid_bind(Some(&eq(col("rowid"), col("id")))), None);
+        assert_eq!(extract_rowid_bind(None), None);
+    }
+
+    #[test]
+    fn test_result_column_count_expands_stars() {
+        let table = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "a".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "b".to_owned(),
+                    affinity: 'b',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "c".to_owned(),
+                    affinity: 'c',
+                    default_value: None,
+                },
+            ],
+            indexes: vec![],
+        };
+        let expr = || ResultColumn::Expr {
+            expr: Expr::Literal(Literal::Integer(1), Span::ZERO),
+            alias: None,
+        };
+
+        assert_eq!(result_column_count(&[], &table), 0);
+        assert_eq!(result_column_count(&[expr(), expr()], &table), 2);
+        // `*` expands to the table's column count (3); each Expr adds 1.
+        assert_eq!(result_column_count(&[ResultColumn::Star], &table), 3);
+        assert_eq!(result_column_count(&[ResultColumn::Star, expr()], &table), 4);
+        // Each star expands independently.
+        assert_eq!(
+            result_column_count(&[ResultColumn::Star, ResultColumn::Star], &table),
+            6
+        );
+
+        // `t.*` (TableStar) expands exactly like `*` and composes with a plain
+        // star and with an expr. This variant was not previously constructed by
+        // the test, even though result_column_count handles it identically.
+        let table_star = || ResultColumn::TableStar(QualifiedName::bare("t"));
+        assert_eq!(result_column_count(&[table_star()], &table), 3);
+        assert_eq!(
+            result_column_count(&[table_star(), ResultColumn::Star], &table),
+            6
+        );
+        assert_eq!(result_column_count(&[table_star(), expr()], &table), 4);
+    }
+
+    #[test]
+    fn test_expr_classifiers_column_name_rowid_and_bind_param() {
+        let col = |name: &str| Expr::Column(ColumnRef::bare(name), Span::ZERO);
+        let lit = Expr::Literal(Literal::Integer(7), Span::ZERO);
+
+        // column_name: a plain column -> its name; rowid aliases / non-columns -> None.
+        assert_eq!(column_name(&col("name")), Some("name".to_owned()));
+        assert_eq!(column_name(&col("rowid")), None, "rowid is excluded from column extraction");
+        assert_eq!(column_name(&col("OID")), None);
+        assert_eq!(column_name(&lit), None);
+
+        // is_rowid_expr: true only for a rowid-alias column expression.
+        assert!(is_rowid_expr(&col("rowid")));
+        assert!(is_rowid_expr(&col("_rowid_")));
+        assert!(!is_rowid_expr(&col("name")));
+        assert!(!is_rowid_expr(&lit));
+
+        // bind_param_ref: numbered/anonymous placeholders; non-placeholder -> None.
+        assert_eq!(bind_param_ref(&placeholder(5)), Some(BindParamRef::Numbered(5)));
+        assert_eq!(
+            bind_param_ref(&Expr::Placeholder(PlaceholderType::Anonymous, Span::ZERO)),
+            Some(BindParamRef::Anonymous)
+        );
+        assert_eq!(bind_param_ref(&lit), None);
+        // bind_param_index collapses anonymous to 1, numbered to its index.
+        assert_eq!(bind_param_index(&placeholder(5)), Some(5));
+        assert_eq!(
+            bind_param_index(&Expr::Placeholder(PlaceholderType::Anonymous, Span::ZERO)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_default_value_to_expr_handles_missing_valid_and_invalid_defaults() {
+        let no_default = ColumnInfo {
+            name: "a".to_owned(),
+            affinity: 'd',
+            default_value: None,
+        };
+        let with_default = ColumnInfo {
+            name: "b".to_owned(),
+            affinity: 'd',
+            default_value: Some("42".to_owned()),
+        };
+        let bad_default = ColumnInfo {
+            name: "c".to_owned(),
+            affinity: 'd',
+            default_value: Some("1 +".to_owned()),
+        };
+        let table = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![no_default.clone(), with_default.clone()],
+            indexes: vec![],
+        };
+
+        // No DEFAULT -> NULL literal.
+        assert!(matches!(
+            default_value_to_expr(&table, &no_default),
+            Ok(Expr::Literal(Literal::Null, _))
+        ));
+        // A valid DEFAULT parses to an expression.
+        assert!(default_value_to_expr(&table, &with_default).is_ok());
+        // An unparseable DEFAULT surfaces as a CodegenError::Unsupported.
+        assert!(matches!(
+            default_value_to_expr(&table, &bad_default),
+            Err(CodegenError::Unsupported(_))
+        ));
+
+        // insert_default_exprs produces one expr per column; the no-default
+        // column yields a NULL literal.
+        let defaults = insert_default_exprs(&table).expect("defaults compile");
+        assert_eq!(defaults.len(), 2);
+        assert!(
+            matches!(defaults[0], Expr::Literal(Literal::Null, _)),
+            "column a has no default -> NULL"
+        );
+    }
+
+    #[test]
+    fn test_insert_target_indices_resolution_order_and_errors() {
+        let table = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "a".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "b".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "c".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+            ],
+            indexes: vec![],
+        };
+
+        // An empty column list targets all columns in declaration order.
+        assert_eq!(insert_target_indices(&[], &table).unwrap(), vec![0, 1, 2]);
+
+        // An explicit list resolves to positions in INSERT order (not table
+        // order), case-insensitively.
+        assert_eq!(
+            insert_target_indices(&["c".to_owned(), "A".to_owned()], &table).unwrap(),
+            vec![2, 0]
+        );
+
+        // An unknown column is rejected with ColumnNotFound.
+        assert!(matches!(
+            insert_target_indices(&["a".to_owned(), "missing".to_owned()], &table),
+            Err(CodegenError::ColumnNotFound { ref column, .. }) if column == "missing"
+        ));
+    }
+
+    #[test]
+    fn test_expand_insert_values_row_places_values_and_fills_defaults() {
+        let lit = |n: i64| Expr::Literal(Literal::Integer(n), Span::ZERO);
+        let table = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "a".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "b".to_owned(),
+                    affinity: 'd',
+                    default_value: Some("99".to_owned()),
+                },
+                ColumnInfo {
+                    name: "c".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+            ],
+            indexes: vec![],
+        };
+
+        // No column list -> values pass through unchanged.
+        let passed = expand_insert_values_row(&[lit(1), lit(2), lit(3)], &[], &table).unwrap();
+        assert_eq!(passed.len(), 3);
+        assert!(matches!(passed[0], Expr::Literal(Literal::Integer(1), _)));
+        assert!(matches!(passed[2], Expr::Literal(Literal::Integer(3), _)));
+
+        // INSERT INTO t(c, a) VALUES (10, 20): values land at their TARGET
+        // positions (a=20, c=10); the omitted column b takes its DEFAULT (99).
+        let expanded =
+            expand_insert_values_row(&[lit(10), lit(20)], &["c".to_owned(), "a".to_owned()], &table)
+                .unwrap();
+        assert_eq!(expanded.len(), 3);
+        assert!(matches!(expanded[0], Expr::Literal(Literal::Integer(20), _)), "a = 20");
+        assert!(matches!(expanded[1], Expr::Literal(Literal::Integer(99), _)), "b = default 99");
+        assert!(matches!(expanded[2], Expr::Literal(Literal::Integer(10), _)), "c = 10");
+
+        // A value/column count mismatch -> Unsupported.
+        assert!(matches!(
+            expand_insert_values_row(&[lit(1)], &["a".to_owned(), "b".to_owned()], &table),
+            Err(CodegenError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn test_single_table_select_source_name_resolves_table_and_rejects_subquery() {
+        // A bare table source yields its name.
+        let from = from_table("users");
+        assert_eq!(single_table_select_source_name(&from.source).unwrap(), "users");
+
+        // A subquery FROM source is not a single-table source -> Unsupported.
+        let subquery = TableOrSubquery::Subquery {
+            query: Box::new(star_select("x")),
+            alias: None,
+        };
+        assert!(matches!(
+            single_table_select_source_name(&subquery),
+            Err(CodegenError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn test_find_table_is_case_insensitive_and_errors_on_missing() {
+        let schema = vec![
+            TableSchema {
+                name: "Users".to_owned(),
+                root_page: 2,
+                columns: vec![],
+                indexes: vec![],
+            },
+            TableSchema {
+                name: "orders".to_owned(),
+                root_page: 3,
+                columns: vec![],
+                indexes: vec![],
+            },
+        ];
+        // Exact and case-insensitive name matches.
+        assert_eq!(find_table(&schema, "Users").unwrap().name, "Users");
+        assert_eq!(find_table(&schema, "users").unwrap().name, "Users", "case-insensitive");
+        assert_eq!(find_table(&schema, "ORDERS").unwrap().name, "orders");
+        // A missing table -> TableNotFound carrying the requested name.
+        assert!(matches!(
+            find_table(&schema, "missing"),
+            Err(CodegenError::TableNotFound(ref n)) if n == "missing"
+        ));
+    }
+
+    #[test]
+    fn test_codegen_error_display_messages() {
+        assert_eq!(
+            CodegenError::TableNotFound("users".to_owned()).to_string(),
+            "table not found: users"
+        );
+        // The message names the column before the table.
+        assert_eq!(
+            CodegenError::ColumnNotFound {
+                table: "t".to_owned(),
+                column: "c".to_owned(),
+            }
+            .to_string(),
+            "column c not found in table t"
+        );
+        assert_eq!(
+            CodegenError::Unsupported("DISTINCT".to_owned()).to_string(),
+            "unsupported: DISTINCT"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_no_from_emits_resultrow_without_cursor() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Literal(Literal::Integer(1), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: None,
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema: Vec<TableSchema> = vec![];
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // A no-FROM SELECT evaluates the expression and emits ResultRow + Halt...
+        assert!(has_opcodes(&prog, &[Opcode::Integer, Opcode::ResultRow, Opcode::Halt]));
+        // ...and never opens a table cursor.
+        assert!(
+            prog.ops().iter().all(|op| op.opcode != Opcode::OpenRead),
+            "a no-FROM SELECT must not open a read cursor"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_column_eq_emits_filtered_scan() {
+        // SELECT a FROM t WHERE b = ?1 -> a full scan with an equality filter on
+        // b (the non-rowid column-eq path), distinct from a plain full scan.
+        let stmt = simple_select(&["a"], "t", Some(col_eq_param("b", 1)));
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Loads the bind param, opens the table, reads the filter column and
+        // skips non-matching rows (Ne), then emits matches and iterates.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Variable,
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::Column,
+                Opcode::Ne,
+                Opcode::ResultRow,
+                Opcode::Next,
+                Opcode::Halt,
+            ]
+        ));
+    }
+
+    #[test]
+    fn test_codegen_select_values_emits_one_resultrow_per_row() {
+        let lit = |n: i64| Expr::Literal(Literal::Integer(n), Span::ZERO);
+        let values = |rows: Vec<Vec<Expr>>| SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Values(rows),
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema: Vec<TableSchema> = vec![];
+        let ctx = CodegenContext::default();
+
+        // VALUES (1,2), (3,4) -> one ResultRow per row, no table cursor.
+        let stmt = values(vec![vec![lit(1), lit(2)], vec![lit(3), lit(4)]]);
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let resultrows = prog.ops().iter().filter(|op| op.opcode == Opcode::ResultRow).count();
+        assert_eq!(resultrows, 2, "one ResultRow per VALUES row");
+        assert!(
+            prog.ops().iter().all(|op| op.opcode != Opcode::OpenRead),
+            "VALUES has no table cursor"
+        );
+        assert!(has_opcodes(&prog, &[Opcode::ResultRow, Opcode::Halt]));
+
+        // Rows with mismatched arity are rejected.
+        let bad = values(vec![vec![lit(1)], vec![lit(1), lit(2)]]);
+        let mut b2 = ProgramBuilder::new();
+        assert!(matches!(
+            codegen_select(&mut b2, &bad, &schema, &ctx),
+            Err(CodegenError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn test_codegen_insert_threads_conflict_action_into_insert_op() {
+        let make = |conflict: Option<ConflictAction>| InsertStatement {
+            with: None,
+            or_conflict: conflict,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+
+        // The conflict operand (p5) of the emitted Insert op carries the OE_ code.
+        let oe_of = |conflict: Option<ConflictAction>| -> u16 {
+            let mut b = ProgramBuilder::new();
+            codegen_insert(&mut b, &make(conflict), &schema, &ctx).unwrap();
+            let prog = b.finish().unwrap();
+            prog.ops()
+                .iter()
+                .find(|op| op.opcode == Opcode::Insert)
+                .expect("Insert op present")
+                .p5
+        };
+
+        // A plain INSERT defaults to ABORT; OR IGNORE / OR REPLACE thread theirs.
+        assert_eq!(oe_of(None), OE_ABORT);
+        assert_eq!(oe_of(Some(ConflictAction::Ignore)), OE_IGNORE);
+        assert_eq!(oe_of(Some(ConflictAction::Replace)), OE_REPLACE);
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
@@ -2122,6 +2964,289 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_expr_scalar_literal_opcodes() {
+        // test_emit_expr_large_integer_literal_uses_int64_opcode covers the
+        // Integer small/large split; this pins the opcode (and p1, for booleans)
+        // that each remaining scalar literal lowers to.
+        let emit_first = |lit: Literal| -> (Opcode, i32) {
+            let mut b = ProgramBuilder::new();
+            let reg = b.alloc_reg();
+            emit_expr(&mut b, &Expr::Literal(lit, Span::ZERO), reg).unwrap();
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            let prog = b.finish().unwrap();
+            let op = prog
+                .ops()
+                .iter()
+                .find(|o| o.opcode != Opcode::Halt)
+                .expect("a literal op");
+            (op.opcode, op.p1)
+        };
+
+        assert_eq!(emit_first(Literal::Null).0, Opcode::Null);
+        assert_eq!(emit_first(Literal::Float(1.5)).0, Opcode::Real);
+        assert_eq!(emit_first(Literal::String("hi".to_owned())).0, Opcode::String8);
+        assert_eq!(emit_first(Literal::Blob(vec![1, 2, 3])).0, Opcode::Blob);
+
+        // Boolean literals both lower to Integer, distinguished by p1 (1 / 0).
+        assert_eq!(emit_first(Literal::True), (Opcode::Integer, 1));
+        assert_eq!(emit_first(Literal::False), (Opcode::Integer, 0));
+    }
+
+    #[test]
+    fn test_emit_expr_arithmetic_and_unary_ops() {
+        // emit_expr lowers a non-comparison BinaryOp to the matching arithmetic
+        // opcode (left into dest, right into a temp), and the four unary ops to:
+        // Negate -> multiply by -1, Plus -> no-op, Not -> Not, BitNot -> BitNot.
+        let lit = |n: i64| Box::new(Expr::Literal(Literal::Integer(n), Span::ZERO));
+        let prog_of = |expr: Expr| {
+            let mut b = ProgramBuilder::new();
+            let reg = b.alloc_reg();
+            emit_expr(&mut b, &expr, reg).unwrap();
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.finish().unwrap()
+        };
+
+        // 3 + 5 -> Integer, Integer, Add.
+        let add = prog_of(Expr::BinaryOp {
+            left: lit(3),
+            op: AstBinaryOp::Add,
+            right: lit(5),
+            span: Span::ZERO,
+        });
+        assert!(has_opcodes(&add, &[Opcode::Integer, Opcode::Integer, Opcode::Add]));
+
+        // -3 -> operand, Integer(-1), Multiply (negation lowers to x * -1).
+        let neg = prog_of(Expr::UnaryOp {
+            op: AstUnaryOp::Negate,
+            expr: lit(3),
+            span: Span::ZERO,
+        });
+        assert!(has_opcodes(
+            &neg,
+            &[Opcode::Integer, Opcode::Integer, Opcode::Multiply]
+        ));
+
+        // NOT x -> Not; ~x -> BitNot.
+        let not = prog_of(Expr::UnaryOp {
+            op: AstUnaryOp::Not,
+            expr: lit(3),
+            span: Span::ZERO,
+        });
+        assert!(not.ops().iter().any(|o| o.opcode == Opcode::Not));
+        let bitnot = prog_of(Expr::UnaryOp {
+            op: AstUnaryOp::BitNot,
+            expr: lit(3),
+            span: Span::ZERO,
+        });
+        assert!(bitnot.ops().iter().any(|o| o.opcode == Opcode::BitNot));
+
+        // Unary plus is a no-op: only the operand (one Integer) plus the Halt.
+        let plus = prog_of(Expr::UnaryOp {
+            op: AstUnaryOp::Plus,
+            expr: lit(3),
+            span: Span::ZERO,
+        });
+        let non_halt: Vec<Opcode> = plus
+            .ops()
+            .iter()
+            .map(|o| o.opcode)
+            .filter(|&o| o != Opcode::Halt)
+            .collect();
+        assert_eq!(
+            non_halt,
+            vec![Opcode::Integer],
+            "unary plus emits only the operand"
+        );
+    }
+
+    #[test]
+    fn test_emit_expr_cast_threads_affinity_char_into_cast_op_p2() {
+        // CAST(expr AS type) emits a Cast op whose p2 is the affinity
+        // character's byte value (type_to_affinity applied to the type name).
+        // type_to_affinity is unit-tested, but its wire-up into the emitted Cast
+        // op was not.
+        let cast_p2 = |type_name: &str| -> i32 {
+            let mut b = ProgramBuilder::new();
+            let reg = b.alloc_reg();
+            let expr = Expr::Cast {
+                expr: Box::new(Expr::Literal(Literal::Integer(3), Span::ZERO)),
+                type_name: fsqlite_ast::TypeName {
+                    name: type_name.to_owned(),
+                    arg1: None,
+                    arg2: None,
+                },
+                span: Span::ZERO,
+            };
+            emit_expr(&mut b, &expr, reg).unwrap();
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            let prog = b.finish().unwrap();
+            prog.ops()
+                .iter()
+                .find(|o| o.opcode == Opcode::Cast)
+                .expect("Cast op present")
+                .p2
+        };
+
+        // Affinity char codes: A=Blob(65), B=Text(66), D=Integer(68), E=Real(69).
+        assert_eq!(cast_p2("INTEGER"), i32::from(b'D'));
+        assert_eq!(cast_p2("TEXT"), i32::from(b'B'));
+        assert_eq!(cast_p2("REAL"), i32::from(b'E'));
+        assert_eq!(cast_p2("BLOB"), i32::from(b'A'));
+    }
+
+    #[test]
+    fn test_emit_expr_is_null_vs_is_not_null_guard_opcode() {
+        // x IS NULL and x IS NOT NULL both materialize 1/0, but the guard is
+        // IsNull vs NotNull respectively. emit_expr's IsNull branch was untested.
+        let prog_of = |not: bool| {
+            let mut b = ProgramBuilder::new();
+            let reg = b.alloc_reg();
+            let expr = Expr::IsNull {
+                expr: Box::new(Expr::Literal(Literal::Integer(3), Span::ZERO)),
+                not,
+                span: Span::ZERO,
+            };
+            emit_expr(&mut b, &expr, reg).unwrap();
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.finish().unwrap()
+        };
+
+        // IS NULL: guarded by IsNull, then the 0 / Goto / 1 materialization.
+        let is_null = prog_of(false);
+        assert!(has_opcodes(
+            &is_null,
+            &[Opcode::IsNull, Opcode::Integer, Opcode::Goto, Opcode::Integer]
+        ));
+        assert!(!is_null.ops().iter().any(|o| o.opcode == Opcode::NotNull));
+
+        // IS NOT NULL: guarded by NotNull instead.
+        let is_not_null = prog_of(true);
+        assert!(has_opcodes(
+            &is_not_null,
+            &[Opcode::NotNull, Opcode::Integer, Opcode::Goto, Opcode::Integer]
+        ));
+        assert!(!is_not_null.ops().iter().any(|o| o.opcode == Opcode::IsNull));
+    }
+
+    #[test]
+    fn test_emit_expr_function_call_canonicalizes_name_and_threads_arg_count() {
+        // emit_expr lowers a scalar function call to PureFunc, canonicalizing the
+        // name to uppercase (the registry's canonical form) and threading the
+        // argument count into p5.
+        let mut b = ProgramBuilder::new();
+        let reg = b.alloc_reg();
+        let expr = Expr::FunctionCall {
+            name: "abs".to_owned(), // lowercase on purpose
+            args: FunctionArgs::List(vec![Expr::Literal(Literal::Integer(3), Span::ZERO)]),
+            distinct: false,
+            order_by: vec![],
+            filter: None,
+            over: None,
+            span: Span::ZERO,
+        };
+        emit_expr(&mut b, &expr, reg).unwrap();
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let prog = b.finish().unwrap();
+        let func = prog
+            .ops()
+            .iter()
+            .find(|o| o.opcode == Opcode::PureFunc)
+            .expect("PureFunc op present");
+        assert!(
+            matches!(&func.p4, P4::FuncName(n) if n.as_str() == "ABS"),
+            "lowercase 'abs' must be canonicalized to uppercase in P4"
+        );
+        assert_eq!(func.p5, 1, "one argument threaded into p5");
+    }
+
+    #[test]
+    fn test_emit_expr_collate_is_transparent() {
+        // COLLATE is a no-op at this codegen layer: emit_expr(x COLLATE C) emits
+        // exactly what emit_expr(x) would, with no collation-specific opcode.
+        let mut b = ProgramBuilder::new();
+        let reg = b.alloc_reg();
+        let expr = Expr::Collate {
+            expr: Box::new(Expr::Literal(Literal::Integer(3), Span::ZERO)),
+            collation: "NOCASE".to_owned(),
+            span: Span::ZERO,
+        };
+        emit_expr(&mut b, &expr, reg).unwrap();
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let prog = b.finish().unwrap();
+        let non_halt: Vec<Opcode> = prog
+            .ops()
+            .iter()
+            .map(|o| o.opcode)
+            .filter(|&o| o != Opcode::Halt)
+            .collect();
+        assert_eq!(
+            non_halt,
+            vec![Opcode::Integer],
+            "COLLATE wraps transparently: only the inner literal's opcode is emitted"
+        );
+    }
+
+    #[test]
+    fn test_emit_expr_case_searched_and_simple_forms() {
+        let lit = |n: i64| Expr::Literal(Literal::Integer(n), Span::ZERO);
+        let prog_of = |expr: Expr| {
+            let mut b = ProgramBuilder::new();
+            let reg = b.alloc_reg();
+            emit_expr(&mut b, &expr, reg).unwrap();
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.finish().unwrap()
+        };
+
+        // Searched CASE (no operand, no ELSE): each WHEN is guarded by IfNot,
+        // and the missing ELSE falls through to a Null default.
+        let searched = prog_of(Expr::Case {
+            operand: None,
+            whens: vec![(lit(1), lit(10))],
+            else_expr: None,
+            span: Span::ZERO,
+        });
+        assert!(
+            searched.ops().iter().any(|o| o.opcode == Opcode::IfNot),
+            "searched CASE guards each WHEN with IfNot"
+        );
+        assert!(
+            searched.ops().iter().any(|o| o.opcode == Opcode::Null),
+            "a CASE with no ELSE falls through to a Null default"
+        );
+
+        // Simple CASE (with operand and an ELSE): WHENs compare against the
+        // operand with Ne, and the explicit ELSE means no Null default.
+        let simple = prog_of(Expr::Case {
+            operand: Some(Box::new(lit(5))),
+            whens: vec![(lit(5), lit(10))],
+            else_expr: Some(Box::new(lit(0))),
+            span: Span::ZERO,
+        });
+        assert!(
+            simple.ops().iter().any(|o| o.opcode == Opcode::Ne),
+            "simple CASE compares the operand against each WHEN with Ne"
+        );
+        assert!(
+            !simple.ops().iter().any(|o| o.opcode == Opcode::Null),
+            "an explicit ELSE means no implicit Null default"
+        );
+    }
+
+    #[test]
+    fn test_emit_expr_unsupported_expr_returns_error() {
+        // emit_expr handles literals, placeholders, binary/unary ops, IsNull,
+        // Cast, FunctionCall, Case, and Collate; everything else hits the
+        // catch-all and returns Unsupported. A bare column reference is only
+        // emittable in a cursor/scan context (via emit_column_reads), not as a
+        // free expression, so emit_expr rejects it.
+        let mut b = ProgramBuilder::new();
+        let reg = b.alloc_reg();
+        let err = emit_expr(&mut b, &Expr::Column(ColumnRef::bare("x"), Span::ZERO), reg)
+            .expect_err("a free column reference is not emittable by emit_expr");
+        assert!(matches!(err, CodegenError::Unsupported(_)));
+    }
+
+    #[test]
     fn test_emit_expr_large_integer_literal_uses_int64_opcode() {
         let mut b = ProgramBuilder::new();
         let reg = b.alloc_reg();
@@ -2172,6 +3297,151 @@ mod tests {
             .find(|op| op.opcode == Opcode::Transaction)
             .unwrap();
         assert_eq!(txn.p2, 0);
+    }
+
+    #[test]
+    fn test_codegen_select_parenthesized_single_table_source() -> Result<(), String> {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::bare("b"), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::ParenJoin(Box::new(from_table("t"))),
+                        joins: vec![],
+                    }),
+                    where_clause: Some(rowid_eq_param()),
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).map_err(|err| format!("{err:?}"))?;
+        let prog = b.finish().map_err(|err| format!("{err:?}"))?;
+
+        if !has_opcodes(
+            &prog,
+            &[
+                Opcode::OpenRead,
+                Opcode::SeekRowid,
+                Opcode::Column,
+                Opcode::ResultRow,
+            ],
+        ) {
+            return Err(format!(
+                "parenthesized table source should use table SELECT path, got {:?}",
+                opcode_sequence(&prog)
+            ));
+        }
+
+        let open_read_root = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::OpenRead)
+            .map(|op| op.p2);
+        if open_read_root != Some(2) {
+            return Err(format!(
+                "expected OpenRead root page 2, got {open_read_root:?}"
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_codegen_select_values_multirow() -> Result<(), String> {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Values(vec![
+                    vec![
+                        Expr::Literal(Literal::Integer(1), Span::ZERO),
+                        Expr::Literal(Literal::String("alpha".to_owned()), Span::ZERO),
+                    ],
+                    vec![
+                        Expr::Literal(Literal::Integer(2), Span::ZERO),
+                        Expr::Literal(Literal::String("beta".to_owned()), Span::ZERO),
+                    ],
+                ]),
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &[], &ctx).map_err(|err| format!("{err:?}"))?;
+        let prog = b.finish().map_err(|err| format!("{err:?}"))?;
+
+        if !has_opcodes(
+            &prog,
+            &[
+                Opcode::Init,
+                Opcode::Transaction,
+                Opcode::Integer,
+                Opcode::String8,
+                Opcode::ResultRow,
+                Opcode::Integer,
+                Opcode::String8,
+                Opcode::ResultRow,
+                Opcode::Halt,
+            ],
+        ) {
+            return Err(format!(
+                "VALUES SELECT should emit one result row per VALUES row, got {:?}",
+                opcode_sequence(&prog)
+            ));
+        }
+
+        let result_row_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::ResultRow && op.p2 == 2)
+            .count();
+        if result_row_count != 2 {
+            return Err(format!(
+                "VALUES SELECT should emit two two-column ResultRow ops, got {result_row_count}"
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_codegen_select_values_rejects_mismatched_arity() -> Result<(), String> {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Values(vec![
+                    vec![Expr::Literal(Literal::Integer(1), Span::ZERO)],
+                    vec![
+                        Expr::Literal(Literal::Integer(2), Span::ZERO),
+                        Expr::Literal(Literal::Integer(3), Span::ZERO),
+                    ],
+                ]),
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+
+        match codegen_select(&mut b, &stmt, &[], &ctx) {
+            Err(CodegenError::Unsupported(msg)) if msg.contains("same arity") => Ok(()),
+            other => Err(format!("expected VALUES arity error, got {other:?}")),
+        }
     }
 
     // === Test 2: INSERT VALUES ===
@@ -2720,6 +3990,126 @@ mod tests {
         assert_eq!(mr.p2, 2); // ALL columns, not just the changed one.
     }
 
+    #[test]
+    fn test_codegen_update_notexists_jump_skips_insert_to_close() {
+        // UPDATE t SET b = ?1 WHERE rowid = ?2 performs a read-modify-write:
+        // NotExists guards the whole block, so when the rowid is absent the jump
+        // must skip past the Insert (the REPLACE that writes the row back) and
+        // land on Close. Otherwise a missing-rowid UPDATE would silently insert a
+        // phantom row. `test_codegen_update_by_rowid` only checks the opcode
+        // subsequence + MakeRecord arity; this pins the guard's jump target.
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        let notexists = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::NotExists)
+            .expect("NotExists op present");
+        let insert = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Insert)
+            .expect("Insert (REPLACE write-back) op present");
+        let close = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Close)
+            .expect("Close op present");
+
+        // The write-back Insert sits strictly between the guard and Close, so it
+        // is part of the span the NotExists branch hops over.
+        assert!(notexists < insert, "NotExists must precede the write-back Insert");
+        assert!(insert < close, "the write-back Insert must precede Close");
+
+        // NotExists jumps to Close when the rowid is absent, skipping the Insert.
+        assert_eq!(
+            usize::try_from(ops[notexists].p2).unwrap(),
+            close,
+            "NotExists must jump to Close (skipping the write-back Insert) when the rowid is absent"
+        );
+    }
+
+    #[test]
+    fn test_codegen_update_makerecord_carries_table_affinity_string() {
+        // UPDATE re-packs the full row with MakeRecord, whose P4 must be the
+        // table's affinity string so each column value is coerced to its declared
+        // affinity on write-back. affinity_string()/type_to_affinity are unit
+        // tested in isolation, and test_codegen_update_by_rowid checks the
+        // MakeRecord column count, but neither pins that the computed affinity
+        // string actually reaches the emitted MakeRecord op's P4 operand.
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        // Derive the expectation from the schema itself (no brittle literal): for
+        // test_schema this is the two column affinities "dC".
+        let expected_affinity = schema[0].affinity_string();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let make_record = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::MakeRecord)
+            .expect("MakeRecord op present");
+        match &make_record.p4 {
+            P4::Affinity(aff) => assert_eq!(
+                *aff, expected_affinity,
+                "MakeRecord P4 affinity must equal the table's affinity_string()"
+            ),
+            _ => panic!("MakeRecord P4 must be P4::Affinity (got a different P4 variant)"),
+        }
+    }
+
     // === Test 4: DELETE by rowid ===
     #[test]
     fn test_codegen_delete_by_rowid() {
@@ -2760,6 +4150,65 @@ mod tests {
                 Opcode::Halt,
             ]
         ));
+    }
+
+    #[test]
+    fn test_codegen_delete_notexists_jump_skips_delete_to_close() {
+        // DELETE FROM t WHERE rowid = ?1 guards the row delete with NotExists:
+        // when the rowid is absent the NotExists jump must skip past Delete and
+        // land on Close, so a missing row is a no-op rather than deleting whatever
+        // the cursor currently points at. The subsequence check in
+        // `test_codegen_delete_by_rowid` only proves the opcodes are present in
+        // order; this pins the actual jump target.
+        let stmt = DeleteStatement {
+            with: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(1)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        let notexists = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::NotExists)
+            .expect("NotExists op present");
+        let delete = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Delete)
+            .expect("Delete op present");
+        let close = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Close)
+            .expect("Close op present");
+
+        // Delete sits strictly between the guard and Close, so it is exactly the
+        // instruction the NotExists branch hops over.
+        assert!(notexists < delete, "NotExists must precede Delete");
+        assert!(delete < close, "Delete must precede Close");
+
+        // NotExists jumps to the Close instruction when the rowid is absent.
+        assert_eq!(
+            usize::try_from(ops[notexists].p2).unwrap(),
+            close,
+            "NotExists must jump to Close (skipping Delete) when the rowid is absent"
+        );
     }
 
     // === Test 5: Label resolution ===
@@ -3020,6 +4469,75 @@ mod tests {
             .find(|op| op.opcode == Opcode::Next)
             .expect("index equality path must iterate duplicates");
         assert_eq!(next.p1, 1, "Next should advance the index cursor");
+    }
+
+    #[test]
+    fn test_codegen_select_unindexed_column_eq_uses_filtered_scan() {
+        let stmt = simple_select(&["b"], "t", Some(col_eq_param("a", 2)));
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let open_reads = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::OpenRead)
+            .count();
+        assert_eq!(
+            open_reads, 1,
+            "unindexed equality should scan the table without opening an index"
+        );
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::IdxGT | Opcode::IdxRowid)),
+            "unindexed equality should not emit index-probe opcodes"
+        );
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Init,
+                Opcode::Transaction,
+                Opcode::Variable,
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::Column,
+                Opcode::Ne,
+                Opcode::Column,
+                Opcode::ResultRow,
+                Opcode::Next,
+                Opcode::Close,
+                Opcode::Halt,
+            ]
+        ));
+
+        let variable = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Variable)
+            .expect("Variable should load the equality parameter");
+        assert_eq!(variable.p1, 2, "numbered placeholder should be preserved");
+        let ne = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Ne)
+            .expect("filtered scan should skip rows that do not match");
+        assert_eq!(ne.p1, variable.p2);
+        assert_ne!(
+            ne.p5 & 0x10,
+            0,
+            "WHERE equality must skip NULL comparisons instead of returning them"
+        );
+
+        let next = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Next)
+            .expect("filtered scan should advance the table cursor");
+        assert_eq!(next.p1, 0, "Next should advance the table cursor");
     }
 
     // === Test 10: INSERT RETURNING ===
@@ -3326,13 +4844,51 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_select_where_without_supported_pattern_is_error() {
+    fn test_codegen_select_unindexed_filter_projected_column_uses_filtered_scan() {
         let stmt = simple_select(&["a"], "t", Some(col_eq_param("a", 1)));
         let schema = test_schema();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
-        let err = codegen_select(&mut b, &stmt, &schema, &ctx).expect_err("should fail");
-        assert!(matches!(err, CodegenError::Unsupported(_)));
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Variable,
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::Column,
+                Opcode::Ne,
+                Opcode::Column,
+                Opcode::ResultRow,
+                Opcode::Next,
+            ]
+        ));
+        let column_reads: Vec<_> = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Column)
+            .collect();
+        assert_eq!(
+            column_reads.len(),
+            2,
+            "filtering and projecting the same unindexed column should read it for both the predicate and output"
+        );
+        assert!(
+            column_reads.iter().all(|op| op.p2 == 0),
+            "both reads should target column a"
+        );
+        let ne = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Ne)
+            .expect("filtered scan should skip non-matching rows");
+        assert_ne!(
+            ne.p5 & 0x10,
+            0,
+            "WHERE equality must skip NULL comparisons instead of returning them"
+        );
     }
 
     #[test]

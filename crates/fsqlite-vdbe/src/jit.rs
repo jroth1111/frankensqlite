@@ -13,6 +13,7 @@
 
 use fsqlite_types::{
     opcode::{Opcode, P4, VdbeOp},
+    record::PrecomputedRecordHeader,
     value::SqliteValue,
 };
 
@@ -65,6 +66,30 @@ pub enum InsertValueSource {
     Constant(SqliteValue),
 }
 
+/// Compiled record assembly strategy for a simple INSERT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompiledRecordBuilder {
+    /// Generic SQLite record assembly. This preserves semantics for dynamic
+    /// schemas and values whose serial-type shape is not known at compile time.
+    Generic,
+    /// Use the schema-derived `MakeRecord` header captured at compile time.
+    PrecomputedHeader(PrecomputedRecordHeader),
+}
+
+impl CompiledRecordBuilder {
+    fn from_make_record_p4(p4: &P4, num_cols: i32) -> Self {
+        let Ok(num_cols) = usize::try_from(num_cols) else {
+            return Self::Generic;
+        };
+        match p4 {
+            P4::PrecomputedHeader(header) if header.column_count() == num_cols => {
+                Self::PrecomputedHeader(header.clone())
+            }
+            _ => Self::Generic,
+        }
+    }
+}
+
 /// Template for a constant single-row result program.
 #[derive(Debug, Clone)]
 pub struct ConstantResultRowTemplate {
@@ -90,6 +115,8 @@ pub struct SimpleInsertTemplate {
     pub affinity: Option<String>,
     /// Original `MakeRecord` metadata used for row-image semantics.
     pub record_p4: P4,
+    /// Specialized record assembly strategy derived from `record_p4`.
+    pub record_builder: CompiledRecordBuilder,
     /// Insert flags (P5 from the Insert opcode).
     pub insert_flags: u16,
 }
@@ -386,6 +413,7 @@ pub fn try_compile_insert(ops: &[VdbeOp]) -> Option<SimpleInsertTemplate> {
             value_sources,
             affinity: find_affinity(ops, fused.p2, fused.p3),
             record_p4: fused.p4.clone(),
+            record_builder: CompiledRecordBuilder::from_make_record_p4(&fused.p4, fused.p3),
             insert_flags: fused.p5,
         });
     }
@@ -416,6 +444,7 @@ pub fn try_compile_insert(ops: &[VdbeOp]) -> Option<SimpleInsertTemplate> {
         value_sources,
         affinity: find_affinity(ops, make_record.p1, make_record.p2),
         record_p4: make_record.p4.clone(),
+        record_builder: CompiledRecordBuilder::from_make_record_p4(&make_record.p4, make_record.p2),
         insert_flags: insert.p5,
     })
 }
@@ -704,7 +733,89 @@ mod tests {
         );
         assert_eq!(template.affinity.as_deref(), Some("DB"));
         assert_eq!(template.record_p4, P4::Affinity("DB".to_owned()));
+        assert_eq!(template.record_builder, CompiledRecordBuilder::Generic);
         assert_eq!(template.insert_flags, 2);
+    }
+
+    #[test]
+    fn try_compile_insert_keeps_precomputed_record_builder() {
+        let header = PrecomputedRecordHeader::new(&[
+            fsqlite_types::record::PrecomputedSerialTypeKind::NullPlaceholder,
+            fsqlite_types::record::PrecomputedSerialTypeKind::IntegerOrNull,
+            fsqlite_types::record::PrecomputedSerialTypeKind::RealOrNull,
+        ]);
+        let ops = vec![
+            VdbeOp {
+                opcode: Opcode::OpenWrite,
+                p1: 0,
+                p2: 2,
+                p3: 0,
+                p4: P4::Table("jit_hot_query".to_owned()),
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Variable,
+                p1: 1,
+                p2: 2,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Variable,
+                p1: 2,
+                p2: 3,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Null,
+                p1: 0,
+                p2: 1,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::NewRowid,
+                p1: 0,
+                p2: 1,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::MakeRecord,
+                p1: 1,
+                p2: 3,
+                p3: 4,
+                p4: P4::PrecomputedHeader(header.clone()),
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Insert,
+                p1: 0,
+                p2: 4,
+                p3: 1,
+                p4: P4::Table("jit_hot_query".to_owned()),
+                p5: 2,
+            },
+            VdbeOp {
+                opcode: Opcode::Halt,
+                p1: 0,
+                p2: 0,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+        ];
+
+        let template = try_compile_insert(&ops).expect("precomputed INSERT should compile");
+        assert_eq!(
+            template.record_builder,
+            CompiledRecordBuilder::PrecomputedHeader(header)
+        );
     }
 
     #[test]
