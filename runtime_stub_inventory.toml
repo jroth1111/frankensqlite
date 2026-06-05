@@ -10,7 +10,7 @@ owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "Err(FrankenError::NotImplemented("
 
-[[resolved_runtime_stubs]]
+[[runtime_stubs]]
 stub_id = "RSTUB-0009"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 6201
@@ -24,7 +24,7 @@ anchor = "trigger_when_matches(connection, when_clause, frame)"
 resolved_date = "2026-04-23"
 resolved_by = "NavyCreek"
 
-[[resolved_runtime_stubs]]
+[[runtime_stubs]]
 stub_id = "RSTUB-0010"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 3175
@@ -42,18 +42,17 @@ resolved_by = "BrightForge"
 stub_id = "RSTUB-0011"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 3240
-kind = "not_implemented"
-kind_description = "WITH clause now supported; UPSERT/RETURNING still guarded"
-severity = "medium"
+kind = "resolved"
+kind_description = "WITH INSERT ... ON CONFLICT ... RETURNING is covered by the core SQL rusqlite conformance harness"
+severity = "resolved"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented("
-partial_date = "2026-03-06"
-partial_by = "BrightForge"
-partial_note = "WITH (CTE) support added by transferring WITH clause to SELECT; UPSERT and RETURNING remain unimplemented"
+closure_strategy = "implemented"
+anchor = "with_upsert_returning_matches_rusqlite"
+resolved_date = "2026-05-20"
+resolved_by = "cod_2"
 
-[[resolved_runtime_stubs]]
+[[runtime_stubs]]
 stub_id = "RSTUB-0013"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 3489
@@ -67,7 +66,7 @@ anchor = "INSERT OR REPLACE with UNIQUE constraint"
 resolved_date = "2026-03-06"
 resolved_by = "BrightForge"
 
-[[resolved_runtime_stubs]]
+[[runtime_stubs]]
 stub_id = "RSTUB-0019"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 5103
@@ -81,7 +80,7 @@ anchor = "ensure_schema_unchanged_with_prebound_publication"
 resolved_date = "2026-05-20"
 resolved_by = "cod_2"
 
-[[resolved_runtime_stubs]]
+[[runtime_stubs]]
 stub_id = "RSTUB-0020"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 5220
@@ -95,7 +94,7 @@ anchor = "can_use_query_row_result_row_cap"
 resolved_date = "2026-05-20"
 resolved_by = "cod_2"
 
-[[resolved_runtime_stubs]]
+[[runtime_stubs]]
 stub_id = "RSTUB-0022"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 5646
@@ -113,49 +112,57 @@ resolved_by = "cod_2"
 stub_id = "RSTUB-1000"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 6197
-kind = "not_implemented"
-kind_description = "Auto-added stub"
-severity = "high"
+kind = "resolved"
+kind_description = "attached-schema VACUUM dispatch strips schema and reuses the attached connection vacuum path"
+severity = "resolved"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented("
+closure_strategy = "implemented"
+anchor = "delegating attached-schema VACUUM target"
+resolved_date = "2026-05-20"
+resolved_by = "cod_2"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0025"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 6355
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
+kind = "resolved"
+kind_description = "attached-schema CREATE VIEW target delegation strips schema and dispatches to the attached connection"
+severity = "resolved"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented(format!("
+closure_strategy = "implemented"
+anchor = "delegating attached-schema CREATE VIEW target"
+resolved_date = "2026-05-20"
+resolved_by = "cod_2"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0029"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 6829
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
+kind = "resolved"
+kind_description = "attached-schema DROP target delegation strips schema and dispatches to the attached connection"
+severity = "resolved"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "FrankenError::NotImplemented("
+closure_strategy = "implemented"
+anchor = "delegating attached-schema DROP target"
+resolved_date = "2026-05-20"
+resolved_by = "cod_2"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0039"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 9788
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
+kind = "resolved"
+kind_description = "attached-schema INSERT ... SELECT dispatch materializes source rows and tracks changes"
+severity = "resolved"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented("
+closure_strategy = "implemented"
+anchor = "self.apply_attached_insert_tracking(affected, last_insert_rowid)"
+resolved_date = "2026-05-20"
+resolved_by = "cod_2"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-0"
@@ -173,13 +180,15 @@ anchor = "return Err(FrankenError::NotImplemented(format!("
 stub_id = "RSTUB-0044"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 9857
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
+kind = "resolved"
+kind_description = "attached-schema UPDATE target dispatch delegates through the attached connection"
+severity = "resolved"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented(format!("
+closure_strategy = "implemented"
+anchor = "strip_attached_schema_from_update(&mut rewritten, &target_schema)"
+resolved_date = "2026-05-20"
+resolved_by = "cod_2"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-1"
@@ -625,7 +634,7 @@ owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "return Err(FrankenError::NotImplemented("
 
-[[resolved_runtime_stubs]]
+[[runtime_stubs]]
 stub_id = "RSTUB-1002"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 17614

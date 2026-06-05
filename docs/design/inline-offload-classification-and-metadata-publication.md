@@ -480,6 +480,54 @@ are:
 
 ---
 
+## E3.3 Visibility, Retry, and Reclamation Contracts
+
+This section turns the E3.2 primitive selection into implementation contracts.
+Every metadata class must publish through the selected primitive with the
+visibility, retry, and reclamation rules below. A later implementation may tune
+layout, sharding, or cache placement, but it must not weaken these rules without
+reopening the E3.2 primitive decision.
+
+### Global Contract
+
+1. Writers fully initialize a metadata payload before making it reader-visible.
+2. Reader-visible publication uses release ordering or the primitive-specific
+   stronger barrier.
+3. Readers bind with acquire ordering or the primitive-specific retry protocol.
+4. Readers never take a writer mutex on the inline-critical path.
+5. Reclamation is delayed until the class-specific reader binding can no longer
+   observe the retired object.
+
+### Class Contracts
+
+| Class | Integration Point | Visibility Contract | Retry Contract | Reclamation Contract |
+|-------|-------------------|---------------------|----------------|----------------------|
+| M1 CommitIndex | `core_types.rs::CommitIndex`; commit publish in `begin_concurrent.rs` | Per-page `commit_seq` becomes visible only after the corresponding version-store entry is installed. Readers may observe stale-low values, never stale-high values. | One acquire load per page; no spin, park, or cross-page retry. | Hot entries are overwritten in place. Cold fallback entries live under shard ownership and may be reclaimed only after no shard reader holds them. |
+| M2 Page ownership directory | `core_types.rs::InProcessPageLockTable`; first-touch arbitration | Ownership changes are exact linearizable CAS transitions. Stale reads are not a valid visibility model. | Bounded CAS retry followed by the existing bounded waiter handoff. Readers/writers must not convert this into a snapshot read. | Slots are cleared in place on release. Waiter records are scoped to the bounded handoff queue and die with the wake attempt. |
+| M3 Commit sequence counter | `CommitSequenceCombiner`; transaction-manager commit clock | Each writer receives one globally unique sequence before publishing any dependent metadata. | Writers use the combiner, falling back to atomic allocation only through the approved path. Readers consume downstream publications, not the allocator. | No reclamation; monotone scalar. |
+| M3b Durable commit ledger | `core_types.rs::CommitLog`; recovery and diagnostics readers | Published records are immutable prefix history. A tail pointer or segment header may advance, but published records are never mutated. | Readers bind a tail generation and resample only if they require newer history. They must not hold the append lock during scans. | Retired segments wait for recovery, diagnostics, and time-travel readers to release their bound generation. |
+| M4a Active transaction snapshot table | `begin_concurrent.rs::ConcurrentRegistry` active set | SSI validation binds one immutable active-set image for the validation pass while lifecycle writers continue against mutable leaves. | No seqlock-style long scan retry. A validation pass either uses its bound image or restarts at the transaction validation boundary. | Retired registry images wait for a QSBR grace period before reuse. Per-handle leaves remain separately owned and are not copied into retired images. |
+| M4b Committed conflict ledger | `begin_concurrent.rs` committed reader/writer indexes | Conflict history is append-only by key family. Readers see a prefix-stable segment set. | Lookup may resample segment headers between validation passes, but must not retry inside a single exact-key overlap check. | Old immutable segments retire by conflict-history epoch after all active validators that could reference them complete. |
+| M5 Pager snapshot summary | `pager.rs::PublishedPagerState` | The summary fields are coherent within one even sequence generation. A reader may bind the previous complete generation. | Retry only while the sequence is odd or changes. If repeated retries exceed the local budget, use the existing bounded park/fallback diagnostics. | No object reclamation; summary is overwritten in place. Lag-detecting page-plane state remains separate. |
+| M5b SHM durable snapshot triple | `shm.rs::SharedMemoryLayout` | `(commit_seq, schema_epoch, ecs_epoch)` is a single coherent generation. Independent field sampling is forbidden for durable snapshot binding. | Retry while the seqlock generation is odd or changes. No reader lock. | No reclamation; triple is overwritten in place. |
+| M6 Schema invalidation epoch | `lifecycle.rs::schema_epoch`; `shm.rs::load_schema_epoch` | Standalone epoch reads are monotone staleness checks. Durable schema coupling must bind through M5b. | Statement path reads the scalar epoch once and recompiles on mismatch. No schema object RCU publication in this bead. | No global reclamation; schema objects remain connection-local. |
+| M7 Version store chain publication | `invariants.rs::VersionStore`; `gc.rs`; `ebr.rs` | Version nodes are initialized and linked before CommitIndex makes their `commit_seq` visible. Readers traverse immutable committed nodes under a guard. | Readers do not retry mutable chains; they traverse the bound chain for their snapshot and treat missing-visible entries as corruption. | Retired nodes go through EBR. GC may prune only below the active horizon and after reader guards can no longer reach the node. |
+| M7b GC horizon / reader pins | `core_types.rs::raise_gc_horizon`; `VersionGuardRegistry::min_pinned_epoch` | Published horizon is a safe lower bound. Stale-low is allowed; stale-high is forbidden. | Consumers may recompute or reread on conservative results. They must not require a coherent multi-field snapshot to reclaim. | The horizon itself is not reclaimed. It gates M7 and M4/M4b retire queues. |
+| M8 SSI decision telemetry | `ssi_abort_policy.rs`; `observability.rs` | Telemetry is best-effort and never correctness-bearing. Dropped records must be counted. | No retry on the commit path. Policy readers tolerate stale or missing samples. | Bounded ring/offload queue overwrites oldest records. |
+| M8b Witness publication archive | `witness_publication.rs::WitnessPublisher` | Pending reservations are private mutable state; committed witnesses become immutable archive chunks. | Readers bind committed chunks. Reservation mutation may use its existing mutex, but committed-history scans must not hold it. | Pending records die with abort/commit. Committed chunks retire by witness-retention epoch after proof replay and diagnostics readers release them. |
+
+### Implementation Handoff
+
+- E3.3.a should implement immutable publication bundles only for classes whose
+  contract requires reader-bound immutable history: M3b, M4a, M4b, and M8b.
+- E3.3.b should prove the reclamation side: QSBR for M4a, epoch-segment
+  retirement for M4b/M8b, and EBR horizon preservation for M7.
+- M1, M2, M3, M5, M5b, M6, M7b, and M8 are explicit no-new-primitive classes.
+  Their implementation work is limited to preserving the contract and adding
+  diagnostics/tests around violations.
+
+---
+
 ## Cross-Reference: Work Classification × Metadata Class
 
 This matrix shows which metadata classes are touched by each inline/offload work
