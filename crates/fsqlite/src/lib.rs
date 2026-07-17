@@ -4,8 +4,8 @@
 //! phases it also re-exports selected internal crates for integration tests.
 
 pub use fsqlite_core::connection::{
-    Connection, ConnectionEnv, IoPollStrategy, PreparedStatement, Row, RuntimeConfig,
-    RuntimeContext, TraceEvent, TraceMask, init_global_runtime,
+    Connection, ConnectionEnv, IoPollStrategy, PreparedPointQuery, PreparedStatement, Row,
+    RuntimeConfig, RuntimeContext, TraceEvent, TraceMask, init_global_runtime,
 };
 pub use fsqlite_error::FrankenError;
 pub use fsqlite_types::SqliteValue;
