@@ -7052,20 +7052,7 @@ where
             || journal_visibility_invalidation
             || refresh.page_cache_invalidated
             || inner.commit_seq != commit_seq_before_refresh;
-        // D1-CRITICAL Change 3: Use sharded publish_clear_if.
-        self.published.publish_clear_if(
-            cx,
-            PublishedPagerUpdate {
-                visible_commit_seq: inner.commit_seq,
-                db_size: inner.db_size,
-                journal_mode: inner.journal_mode,
-                freelist_count: inner.freelist.len(),
-                checkpoint_active: inner.checkpoint_active,
-            },
-            clear_published_pages,
-        );
-
-        Ok(self.published.snapshot())
+        self.publish_refreshed_committed_state(cx, &inner, clear_published_pages)
     }
 
     /// Refresh the publication plane for a clean WAL-mode read boundary.
@@ -7080,7 +7067,78 @@ where
         &self,
         cx: &Cx,
     ) -> Result<PagerPublishedSnapshot> {
-        self.refresh_published_snapshot(cx)
+        let maintenance_lease = self.maintenance_gate.enter_transaction()?;
+        self.validate_namespace_binding()?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+
+        if inner.active_transactions > 0 || inner.checkpoint_active {
+            return Ok(self.published.snapshot());
+        }
+
+        // Fall back to the full journal-aware refresh when the connection is
+        // not already on a clean WAL publication plane. VACUUM / hot-journal
+        // recovery must still take the main-file SHARED probe path.
+        if inner.journal_mode != JournalMode::Wal
+            || !matches!(
+                inner.rollback_journal_recovery_state,
+                RollbackJournalRecoveryState::Clean
+            )
+        {
+            drop(inner);
+            drop(maintenance_lease);
+            return self.refresh_published_snapshot(cx);
+        }
+
+        let commit_seq_before_refresh = inner.commit_seq;
+        // Probe WAL + main-header durable identity without the rollback-journal
+        // SHARED/exists ceremony. External writers still advance
+        // `wal_visible_commit_count` / base change-counter / generation here.
+        let refresh = inner.refresh_committed_state(cx, &self.cache, &self.wal_backend)?;
+        let clear_published_pages =
+            refresh.page_cache_invalidated || inner.commit_seq != commit_seq_before_refresh;
+        self.publish_refreshed_committed_state(cx, &inner, clear_published_pages)
+    }
+
+    /// Publish refreshed committed metadata only when the publication plane
+    /// actually changes.
+    ///
+    /// Prepared autocommit reads probe durable identity on every statement
+    /// boundary so external commits stay visible. When the probe is a pure
+    /// no-op, republishing would still bump `snapshot_gen` / publication write
+    /// counters and thrash the hot path without changing visibility.
+    fn publish_refreshed_committed_state(
+        &self,
+        cx: &Cx,
+        inner: &PagerInner<V::File>,
+        clear_published_pages: bool,
+    ) -> Result<PagerPublishedSnapshot> {
+        let published_before = self.published.snapshot();
+        let metadata_unchanged = published_before.visible_commit_seq == inner.commit_seq
+            && published_before.db_size == inner.db_size
+            && published_before.journal_mode == inner.journal_mode
+            && published_before.freelist_count == inner.freelist.len()
+            && published_before.checkpoint_active == inner.checkpoint_active;
+        if !clear_published_pages && metadata_unchanged {
+            return Ok(published_before);
+        }
+
+        // D1-CRITICAL Change 3: Use sharded publish_clear_if.
+        self.published.publish_clear_if(
+            cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: inner.commit_seq,
+                db_size: inner.db_size,
+                journal_mode: inner.journal_mode,
+                freelist_count: inner.freelist.len(),
+                checkpoint_active: inner.checkpoint_active,
+            },
+            clear_published_pages,
+        );
+
+        Ok(self.published.snapshot())
     }
 
     /// Number of snapshot retries steady-state readers have taken.

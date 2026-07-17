@@ -26,6 +26,8 @@
 
 mod conformal_retry;
 mod pragma_maintenance;
+#[cfg(test)]
+mod prepared_point_query_memdb_refresh_repro;
 
 use conformal_retry::{ConformalRetryBudget, ConformalRetryBudgetCell};
 
@@ -5141,6 +5143,36 @@ pub struct PreparedStatement<'conn> {
     /// the Connection's full execution pipeline (triggers, constraints,
     /// autocommit).
     conn: &'conn Connection,
+}
+
+/// Engine-owned handle for a planner-proven, at-most-one-row lookup.
+///
+/// Point handles are deliberately narrower than [`PreparedStatement`]: the
+/// planner must have selected either an integer-primary-key lookup or a
+/// single-column UNIQUE-index equality lookup.  The handle retains stable
+/// result-column metadata and its schema/function identities.  Execution
+/// reparses and replans the SQL whenever either identity becomes stale.
+pub struct PreparedPointQuery {
+    sql: Rc<str>,
+    template: PreparedStatementTemplate,
+    column_names: Vec<String>,
+    schema_cookie: u32,
+    schema_generation: u64,
+    function_registry_generation: u64,
+}
+
+impl PreparedPointQuery {
+    /// Number of result columns produced by this point lookup.
+    #[must_use]
+    pub fn column_count(&self) -> usize {
+        self.column_names.len()
+    }
+
+    /// Result-column labels captured from the currently valid plan.
+    #[must_use]
+    pub fn column_names(&self) -> &[String] {
+        &self.column_names
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -14714,6 +14746,107 @@ impl Connection {
         self.prepare_after_background_status(sql)
     }
 
+    /// Prepare a planner-proven at-most-one-row lookup.
+    ///
+    /// Only equality predicates on an INTEGER PRIMARY KEY (including
+    /// projections) or on a single-column UNIQUE index are accepted.  This
+    /// prevents callers from accidentally routing arbitrary reads through the
+    /// point-query contract.
+    pub fn prepare_point_query(&self, sql: &str) -> Result<Option<PreparedPointQuery>> {
+        self.background_status()?;
+        let statement = self.prepare_after_background_status(sql)?;
+        Ok(self.build_prepared_point_query(&statement))
+    }
+
+    fn build_prepared_point_query(
+        &self,
+        statement: &PreparedStatement<'_>,
+    ) -> Option<PreparedPointQuery> {
+        if !self.prepared_statement_is_proven_point_query(&statement) {
+            return None;
+        }
+        Some(PreparedPointQuery {
+            sql: Rc::clone(&statement.sql),
+            column_names: statement.column_names.clone(),
+            schema_cookie: statement.schema_cookie,
+            schema_generation: statement.schema_generation,
+            function_registry_generation: statement.function_registry_generation,
+            template: PreparedStatementTemplate::from_statement(
+                statement,
+                self.prepared_cache_commit_epoch(),
+            ),
+        })
+    }
+
+    fn prepared_statement_is_proven_point_query(&self, statement: &PreparedStatement<'_>) -> bool {
+        match statement.prepared_query_fast_path.as_ref() {
+            Some(
+                PreparedQueryFastPath::SimpleRowidLookup { .. }
+                | PreparedQueryFastPath::SimpleProjectedRowidLookup { .. },
+            ) => true,
+            Some(PreparedQueryFastPath::SimpleIndexedEqualityLookup {
+                index_root_page, ..
+            }) => self.schema.borrow().iter().any(|table| {
+                table
+                    .indexes
+                    .iter()
+                    .any(|index| index.root_page == *index_root_page && index.is_unique)
+            }),
+            _ => false,
+        }
+    }
+
+    /// Execute a prepared point lookup, returning `None` for an exact no-row
+    /// result.
+    ///
+    /// Schema-cookie, local schema-generation, and function-registry changes
+    /// force a reprepare before execution.  Cross-connection schema changes
+    /// discovered by the durable freshness boundary likewise reprepare once
+    /// and retry.  If the replacement plan is no longer provably singleton,
+    /// execution fails rather than weakening the contract.
+    pub fn query_point_with_params(
+        &self,
+        query: &mut PreparedPointQuery,
+        params: &[SqliteValue],
+    ) -> Result<Option<Row>> {
+        self.background_status()?;
+        let locally_stale = query.schema_cookie != self.schema_cookie()
+            || query.schema_generation != self.schema_generation()
+            || query.function_registry_generation != self.function_registry_generation();
+        if locally_stale {
+            self.reprepare_point_query(query)?;
+        }
+
+        let statement = query.template.instantiate(self);
+        match statement.query_row_with_params(params) {
+            Ok(row) => Ok(Some(row)),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(FrankenError::SchemaChanged) => {
+                self.reprepare_point_query(query)?;
+                let statement = query.template.instantiate(self);
+                match statement.query_row_with_params(params) {
+                    Ok(row) => Ok(Some(row)),
+                    Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn reprepare_point_query(&self, query: &mut PreparedPointQuery) -> Result<()> {
+        let replacement = self.prepare_after_background_status(query.sql.as_ref())?;
+        let replacement = self
+            .build_prepared_point_query(&replacement)
+            .ok_or_else(|| {
+                FrankenError::internal(
+                    "reprepared point query is no longer planner-proven at most one row",
+                )
+            })?;
+        *query = replacement;
+        Ok(())
+    }
+
     fn prepare_after_background_status(&self, sql: &str) -> Result<PreparedStatement<'_>> {
         let op_cx = self.op_cx_after_background_status();
         self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)?;
@@ -15753,6 +15886,33 @@ impl Connection {
         }
 
         let op_cx = self.op_cx_after_background_status();
+        // Prefer the same clean file-backed MemDB fast path as
+        // `query_prepared_with_params` so prepared point streams do not open an
+        // autocommit read transaction + dual publication bind per row callback.
+        if self.prepare_clean_file_backed_prepared_memdb_fast_path(stmt, &op_cx)?
+            && let Some(rows) = self.try_execute_prepared_query_fast_path(stmt, params)?
+        {
+            let fast_path = stmt
+                .prepared_query_fast_path_metadata("clean file-backed streaming query fast path")?;
+            fast_path.record_query_hit();
+            if hot_path_profile_enabled() {
+                FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
+                tracing::debug!(
+                    target: "fsqlite.execute_path",
+                    path = "fast_streaming",
+                    reason = fast_path.query_trace_reason(),
+                    read_boundary = "skipped_clean_file_backed_memdb",
+                );
+            }
+            self.note_connection_statement_execution_count(1);
+            for row in rows {
+                f(&row)?;
+            }
+            return Ok(());
+        }
+
         let prepared_auto_read = self.prepare_connection_for_prepared_read(stmt, &op_cx)?;
         let entry_proof = stmt.ensure_schema_unchanged_with_prebound_publication(&op_cx)?;
         if hot_path_profile_enabled() {
@@ -35874,9 +36034,12 @@ impl Connection {
                 .as_ref()
                 .is_some_and(PreparedQueryFastPath::can_use_clean_file_backed_memdb);
             if hydrate_file_backed_fast_path {
+                // Use the clean-WAL publication probe so unchanged prepared
+                // point reads do not pay rollback-journal SHARED + no-op
+                // republish on every statement boundary.
                 let _ = self.refresh_memdb_if_stale_with_publication_and_mode(
                     cx,
-                    "memdb_staleness_check",
+                    "clean_file_backed_memdb_staleness_check",
                     true,
                 )?;
             } else if !self.memdb_rows_loaded.get() {
