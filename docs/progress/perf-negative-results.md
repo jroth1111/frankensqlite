@@ -36,6 +36,81 @@ new kept, rejected, or non-candidate record, include the date, benchmark or
 artifact path, Beads comment or issue reference, touched source surface, and the
 retry condition so this preflight can emit actionable evidence.
 
+## 2026-07-18 - KEPT: bounded clean-buffer eviction removes the integrity traversal cliff
+
+- Target: remove the unchanged 3,600-second full-integrity failure on the
+  immutable 9.96 GB Chimera database after the first fused-traversal candidate
+  still failed. A symbolized 10-second sample of that rejected candidate
+  retained `6,865` main-thread samples; `3,240` were under
+  `read_page_copy -> evict_clean_any -> take_clean_buffer -> page_snapshots`,
+  where every cache miss snapshot and sorted the full saturated 4 GB page
+  cache. Raw local sample:
+  `/tmp/frankensqlite-fused-symbolized-profile.txt`.
+- Candidate: replace that full-cache snapshot/sort fallback with bounded
+  round-robin reclamation across fast, flat, and overflow cache tiers while
+  retaining preferred-policy victims, dirty-page exclusion, pool ownership,
+  tier-duplicate refusal, and eviction accounting. Touched pager surface:
+  `crates/fsqlite-pager/src/page_cache.rs`; integrity traversal and compact
+  ownership remain in `crates/fsqlite-core/src/connection.rs`.
+- Profile result: the same symbolized probe after the pager change retained
+  `6,381` samples, only `3` under `evict_clean_any`; the hot path became the
+  expected VFS `pread`. Raw local sample:
+  `/tmp/frankensqlite-pager-eviction-fixed-profile.txt`.
+- Real result: kept pending full qualification. A monotonic independent reopen
+  returned exact `'ok'` in `204.606751875s`, compared with stock SQLite
+  `1322.472000209s` and the official/rejected candidates' 3,600-second
+  failures. A preceding successful run reported maximum RSS
+  `14,372,421,632` bytes; this is not a timing blocker but remains explicit
+  memory evidence for later bounded-memory work. Focused cache tests passed,
+  strict pager/core Clippy passed, and the full pager library run passed
+  `812` tests with one deterministic unrelated macOS `/var` versus
+  `/private/var` canonicalization failure in `pager.rs`.
+- Beads issue: `bd-samtn`. Grok implementation session:
+  `019f7115-c44f-7883-bf15-2cf477728ba6`; Codex independently inspected the
+  diff, reran the full pager suite, rebuilt optimized and symbolized binaries,
+  and reproduced the profile and real result. Fresh detached adversarial review
+  session `019f712c-8334-7c92-a289-24f27359c6f0` returned `PASS` with no
+  reachable high- or critical-severity counterexample.
+- Revisit only if the immutable stage-0 receipt, fault suites, or alternating
+  stock/candidate pairs regress, or if production qualification imposes a
+  lower explicit RSS ceiling. Never restore the per-miss full resident
+  snapshot/sort fallback.
+
+## 2026-07-18 - REJECTED: fused integrity traversal still retains every expected index key
+
+- Target at official baseline `b20eccb619445a84db27c297cf8eb64ae953be99`:
+  make full `PRAGMA integrity_check` complete on the immutable 9.96 GB Chimera
+  database without weakening integrity semantics, skipping pages, substituting
+  `quick_check`, or raising the unchanged 3,600-second cap. Stock SQLite
+  completed the same database in `1322.472000209s`; official FrankenSQLite did
+  not complete by `3600.249956084s`.
+- Candidate: replace the per-page `HashMap<PageNumber, String>` ownership map
+  with dense owner ids and fuse structural ownership with table/index content
+  visitation. Touched surface:
+  `crates/fsqlite-core/src/connection.rs` (`IntegrityPageOwners`,
+  `walk_integrity_btree_pages`, and `validate_schema_btrees_in_txn`). Focused
+  integrity tests passed `26/26`, quick-check tests passed `5/5`, and strict
+  `cargo clippy -p fsqlite-core --lib -- -D warnings` passed.
+- Result: rejected before commit. The `release-perf` candidate produced no
+  result after crossing the unchanged 3,600-second ceiling and was terminated
+  at approximately `3679s`; `/usr/bin/time -l` reported maximum RSS
+  `4,372,398,080` bytes. Compact ownership removed retained DFS path strings,
+  but the rowid-table path still materialized a
+  `HashMap<i64, Vec<u8>>` for every index and retained every exact expected key
+  until all index walks completed. It also walked overflow pages twice, copied
+  every payload, formatted owner paths eagerly, and reparsed the previous index
+  record for every order comparison. Beads issue/comment: `bd-samtn`.
+- Grok 4.5 adversarial audit session
+  `019f7106-8844-7fa0-bbdb-b6f1c5e268bc` independently reproduced those
+  reachable causes from the diff and returned `FAIL`; Codex independently
+  confirmed the materialization and double-parse loops in the cited functions.
+- Retry only with exact streaming index-to-table reconciliation that removes
+  bulk expected-key retention, followed by one-pass overflow ownership/payload
+  handling, lazy owner diagnostics, and rolling decoded order state. The retry
+  must retain stale, duplicate, missing, partial-predicate, exact-payload,
+  overflow, freelist, orphan, and WITHOUT ROWID checks and must pass the same
+  immutable database plus the stock-parity gate.
+
 ## 2026-07-11 - SURFACE: prepared ORDER BY/LIMIT bypasses the assigned runtime/storage lane
 
 - Target at `d9e9b811`: find one fresh, output-identical lever in B-tree,

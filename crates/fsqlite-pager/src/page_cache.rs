@@ -1205,6 +1205,11 @@ fn flat_slot_capacity_for_pool(max_buffers: usize) -> usize {
     round_flat_slot_capacity(max_buffers.saturating_mul(2))
 }
 
+/// Test-only counter proving clean reclamation does not call
+/// [`ShardedPageCache::page_snapshots`]. Production builds compile this out.
+#[cfg(test)]
+static PAGE_SNAPSHOTS_INVOCATIONS: AtomicU64 = AtomicU64::new(0);
+
 fn flat_slot_capacity_for_initial_pages(max_buffers: usize, initial_pages: u32) -> usize {
     let page_hint = usize::try_from(initial_pages).unwrap_or(usize::MAX).max(1);
     let hot_page_bound = page_hint.min(max_buffers.max(1));
@@ -1537,6 +1542,63 @@ impl FastPageArray {
 
         self.next_eviction_scan_start = 0;
         None
+    }
+
+    /// Round-robin reclaim of one clean, pool-backed page buffer.
+    ///
+    /// Dirty and foreign-allocator residents are skipped in place so write
+    /// admission cannot discard unpublished pages or steal another pool's
+    /// buffers. The scan cursor advances past a successful victim so repeated
+    /// reclamation stays O(1)-amortized when eligible pages exist.
+    fn take_clean_from_pool(&mut self, pool: &PageBufPool) -> Option<(PageNumber, PageBuf)> {
+        if self.count == 0 || self.pages.is_empty() {
+            self.next_eviction_scan_start = 0;
+            return None;
+        }
+
+        let len = self.pages.len();
+        let start = self.next_eviction_scan_start.min(len);
+
+        for idx in start..len {
+            if let Some(result) = self.try_take_clean_at(idx, pool) {
+                return Some(result);
+            }
+        }
+        for idx in 0..start {
+            if let Some(result) = self.try_take_clean_at(idx, pool) {
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    fn try_take_clean_at(
+        &mut self,
+        idx: usize,
+        pool: &PageBufPool,
+    ) -> Option<(PageNumber, PageBuf)> {
+        let reclaimable = self
+            .pages
+            .get(idx)
+            .and_then(Option::as_ref)
+            .is_some_and(|entry| !entry.is_dirty() && entry.buf.returns_to_pool(pool));
+        if !reclaimable {
+            return None;
+        }
+
+        let entry = self.pages.get_mut(idx)?.take()?;
+        self.count = self.count.saturating_sub(1);
+        let len = self.pages.len();
+        self.next_eviction_scan_start = if self.count == 0 || idx + 1 >= len {
+            0
+        } else {
+            idx + 1
+        };
+        self.evictions = self.evictions.saturating_add(1);
+        // idx is a resident page slot, so idx+1 is a valid 1-based page number.
+        #[allow(clippy::cast_possible_truncation)]
+        let page_no = PageNumber::new((idx + 1) as u32)?;
+        Some((page_no, entry.buf))
     }
 
     /// Clear all pages.
@@ -2034,6 +2096,60 @@ impl FlatPageSlots {
                 self.evictions.fetch_add(1, Ordering::Relaxed);
                 return PageNumber::new(slot_pgno);
             }
+        }
+        None
+    }
+
+    /// Round-robin reclaim of one clean, pool-backed flat-slot resident.
+    ///
+    /// Mirrors [`Self::remove_any_page`]'s cursor advancement, but never takes
+    /// dirty or foreign-allocator entries. The payload lock spans the
+    /// eligibility check and tombstone CAS so a concurrent dirtying writer
+    /// cannot lose unpublished state.
+    fn take_clean_any_from_pool(&self, pool: &PageBufPool) -> Option<(PageNumber, PageBuf)> {
+        let start = self.eviction_cursor.fetch_add(1, Ordering::Relaxed);
+        for i in 0..self.slots.len() {
+            let idx = (start + i) & self.mask;
+            let slot_pgno = self.slots[idx].pgno.load(Ordering::Relaxed);
+            if slot_pgno == SLOT_EMPTY || slot_pgno == SLOT_TOMBSTONE {
+                continue;
+            }
+            let mut data = self.slots[idx].data.lock();
+            if self.slots[idx].pgno.load(Ordering::Acquire) != slot_pgno {
+                continue;
+            }
+            let reclaimable = data
+                .as_ref()
+                .is_some_and(|entry| !entry.is_dirty() && entry.buf.returns_to_pool(pool));
+            if !reclaimable {
+                continue;
+            }
+            if self.slots[idx]
+                .pgno
+                .compare_exchange(
+                    slot_pgno,
+                    SLOT_TOMBSTONE,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let entry = data
+                .take()
+                .expect("reclaimable flat cache entry must still be present");
+            self.count.fetch_sub(1, Ordering::Relaxed);
+            self.has_tombstones.store(true, Ordering::Release);
+            self.eviction_cursor
+                .store(idx.wrapping_add(1), Ordering::Relaxed);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+            if let Some(page_no) = PageNumber::new(slot_pgno) {
+                return Some((page_no, entry.buf));
+            }
+            // Invalid sentinel page numbers should never be resident; drop the
+            // buffer without advertising a bogus page identity.
+            drop(entry.buf);
         }
         None
     }
@@ -3255,8 +3371,13 @@ impl ShardedPageCache {
     /// intentionally fail-closed for dirty entries: transaction staging must
     /// never recover capacity by discarding an unpublished or unflushed page.
     /// The path is only used after the shared [`PageBufPool`] reaches its
-    /// configured ceiling, so the diagnostic snapshot and deterministic
-    /// victim scan do not burden ordinary cache hits.
+    /// configured ceiling, so a bounded round-robin victim scan does not
+    /// burden ordinary cache hits.
+    ///
+    /// Victim selection prefers a reconstructed policy victim when available,
+    /// then scans [`FastPageArray`], [`FlatPageSlots`], and overflow shards
+    /// with O(1)-amortized cursor advancement. Dirty, foreign-allocator, and
+    /// duplicate-tier residents are skipped without sorting the resident set.
     pub(crate) fn take_clean_buffer(&self) -> Option<PageBuf> {
         if let Some(preferred) = self.preferred_reconstructed_victim()
             && let Some(buffer) = self.take_clean_buffer_at(preferred)
@@ -3264,12 +3385,108 @@ impl ShardedPageCache {
             return Some(buffer);
         }
 
-        let mut candidates = self.page_snapshots();
-        candidates.sort_unstable_by_key(|snapshot| (snapshot.access_count, snapshot.page_no.get()));
-        candidates
-            .into_iter()
-            .filter(|snapshot| !snapshot.dirty)
-            .find_map(|snapshot| self.take_clean_buffer_at(snapshot.page_no))
+        // Fast path: sparse-array round-robin under the single fast lock.
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let mut fast = fast.lock();
+            if let Some((page_no, buffer)) = fast.take_clean_from_pool(&self.pool) {
+                drop(fast);
+                self.forget_eviction_page(page_no);
+                return Some(buffer);
+            }
+            return None;
+        }
+
+        // Flat slots first, then overflow shards — matching `evict_any` tier
+        // order while preserving clean/pool/duplicate fail-closed rules.
+        if let Some(buffer) = self.take_clean_buffer_from_flat_round_robin() {
+            return Some(buffer);
+        }
+        self.take_clean_buffer_from_overflow_round_robin()
+    }
+
+    /// Round-robin clean reclamation over the flat hash table.
+    ///
+    /// When overflow shards are observably empty the flat cursor can reclaim
+    /// directly. Otherwise every candidate is routed through
+    /// [`Self::take_clean_buffer_at`] so dirty, foreign-allocator, and
+    /// duplicate-tier pages stay fail-closed under the same lock protocol as
+    /// targeted reclaim.
+    fn take_clean_buffer_from_flat_round_robin(&self) -> Option<PageBuf> {
+        if !self.shards_dirty.load(Ordering::Acquire) {
+            if let Some((page_no, buffer)) = self.flat_slots.take_clean_any_from_pool(&self.pool) {
+                self.forget_eviction_page(page_no);
+                return Some(buffer);
+            }
+            return None;
+        }
+
+        let start = self
+            .flat_slots
+            .eviction_cursor
+            .fetch_add(1, Ordering::Relaxed);
+        let nslots = self.flat_slots.slots.len();
+        for i in 0..nslots {
+            let idx = (start + i) & self.flat_slots.mask;
+            let slot_pgno = self.flat_slots.slots[idx].pgno.load(Ordering::Relaxed);
+            if slot_pgno == SLOT_EMPTY || slot_pgno == SLOT_TOMBSTONE {
+                continue;
+            }
+            let Some(page_no) = PageNumber::new(slot_pgno) else {
+                continue;
+            };
+            if let Some(buffer) = self.take_clean_buffer_at(page_no) {
+                self.flat_slots
+                    .eviction_cursor
+                    .store(idx.wrapping_add(1), Ordering::Relaxed);
+                return Some(buffer);
+            }
+        }
+        None
+    }
+
+    /// Round-robin clean reclamation over overflow shards.
+    ///
+    /// Each shard is scanned under its own mutex. Dirty and foreign-allocator
+    /// entries are skipped; a page that is also present in the flat tier is
+    /// left untouched (duplicate-tier fail-closed).
+    fn take_clean_buffer_from_overflow_round_robin(&self) -> Option<PageBuf> {
+        if !self.shards_dirty.load(Ordering::Acquire) {
+            return None;
+        }
+
+        // Deterministic process-global cursor (same strategy as `evict_any`).
+        static CLEAN_EVICT_PROBE_CURSOR: AtomicUsize = AtomicUsize::new(0);
+        let start = CLEAN_EVICT_PROBE_CURSOR.fetch_add(1, Ordering::Relaxed) & self.shard_mask;
+        for i in 0..self.shards.len() {
+            let idx = (start + i) & self.shard_mask;
+            let mut shard = self.shards[idx].lock();
+            let mut victim = None;
+            for (&page_no, entry) in &shard.pages {
+                if entry.is_dirty() || !entry.buf.returns_to_pool(&self.pool) {
+                    continue;
+                }
+                if self.flat_slots.contains_stable(page_no) {
+                    // Fail-closed: never remove one image of a duplicate pair.
+                    continue;
+                }
+                victim = Some(page_no);
+                break;
+            }
+            let Some(page_no) = victim else {
+                continue;
+            };
+            let entry = shard
+                .pages
+                .remove(&page_no)
+                .expect("selected clean overflow page must still be present");
+            shard.evictions = shard.evictions.saturating_add(1);
+            drop(shard);
+            self.forget_eviction_page(page_no);
+            return Some(entry.buf);
+        }
+        None
     }
 
     /// Evict one clean pool-backed cache page and return its buffer to the
@@ -3556,6 +3773,9 @@ impl ShardedPageCache {
     /// Capture a read-only snapshot of the resident cache pages.
     #[must_use]
     pub fn page_snapshots(&self) -> Vec<PageCachePageSnapshot> {
+        #[cfg(test)]
+        PAGE_SNAPSHOTS_INVOCATIONS.fetch_add(1, Ordering::Relaxed);
+
         let mut snapshots = Vec::new();
 
         if self.use_fast_path.load(Ordering::Relaxed) {
@@ -5133,6 +5353,216 @@ mod tests {
                 .all(|byte| *byte == u8::try_from(overflow_page.get() & 0xff).unwrap())
         );
         assert!(!cache.contains(overflow_page));
+        drop(reclaimed);
+        assert_eq!(cache.pool().available(), 1);
+    }
+
+    #[test]
+    fn gh_131_arbitrary_clean_reclamation_avoids_page_snapshots() {
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 64);
+        for raw_page_no in 1..=64 {
+            let page_no = PageNumber::new(raw_page_no).unwrap();
+            let mut buffer = cache.pool().acquire().unwrap();
+            buffer.fill(u8::try_from(raw_page_no & 0xff).unwrap());
+            cache.insert_buffer(page_no, buffer);
+        }
+        assert_eq!(cache.pool().available(), 0, "pool must start saturated");
+
+        let snapshots_before = PAGE_SNAPSHOTS_INVOCATIONS.load(Ordering::Relaxed);
+        let reclaimed = cache
+            .take_clean_buffer()
+            .expect("saturated clean cache must reclaim a pool-backed victim");
+        let snapshots_after = PAGE_SNAPSHOTS_INVOCATIONS.load(Ordering::Relaxed);
+
+        assert_eq!(
+            snapshots_after, snapshots_before,
+            "arbitrary clean reclamation must not call page_snapshots"
+        );
+        assert!(
+            reclaimed.returns_to_pool(cache.pool()),
+            "reclaimed buffer must belong to this cache's pool"
+        );
+        drop(reclaimed);
+        assert_eq!(cache.pool().available(), 1);
+        assert_eq!(
+            cache.metrics_lightweight_snapshot().cached_pages,
+            63,
+            "exactly one clean flat resident should be reclaimed"
+        );
+    }
+
+    #[test]
+    fn gh_131_clean_eviction_skips_dirty_and_foreign_without_page_snapshots() {
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 2);
+        let dirty_page = PageNumber::ONE;
+        let foreign_page = PageNumber::new(2).unwrap();
+        let clean_page = PageNumber::new(3).unwrap();
+
+        cache
+            .insert_fresh(dirty_page, |bytes| bytes[0] = 0xD1)
+            .unwrap();
+        cache.insert_buffer(foreign_page, PageBuf::new(PageSize::DEFAULT));
+        cache.insert_buffer(clean_page, cache.pool().acquire().unwrap());
+        assert_eq!(cache.pool().available(), 0);
+
+        let snapshots_before = PAGE_SNAPSHOTS_INVOCATIONS.load(Ordering::Relaxed);
+        let reclaimed = cache
+            .take_clean_buffer()
+            .expect("only the clean pool-backed page is reclaimable");
+        let snapshots_after = PAGE_SNAPSHOTS_INVOCATIONS.load(Ordering::Relaxed);
+
+        assert_eq!(snapshots_after, snapshots_before);
+        assert!(reclaimed.returns_to_pool(cache.pool()));
+        assert!(!cache.contains(clean_page));
+        assert!(
+            cache.contains(dirty_page),
+            "dirty pages must not be discarded"
+        );
+        assert!(
+            cache.contains(foreign_page),
+            "foreign-allocator pages must not be discarded"
+        );
+        drop(reclaimed);
+        assert_eq!(cache.pool().available(), 1);
+
+        let snapshots_before = PAGE_SNAPSHOTS_INVOCATIONS.load(Ordering::Relaxed);
+        assert!(
+            cache.take_clean_buffer().is_none(),
+            "dirty + foreign-only cache must fail closed"
+        );
+        assert_eq!(
+            PAGE_SNAPSHOTS_INVOCATIONS.load(Ordering::Relaxed),
+            snapshots_before
+        );
+    }
+
+    #[test]
+    fn gh_131_clean_eviction_reclaims_overflow_tier_without_page_snapshots() {
+        let resident_count = MAX_PROBE_LENGTH + 1;
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, resident_count);
+        let target_bucket = cache.flat_slots.hash_pgno(PageNumber::ONE.get());
+        let colliders = track_q_collision_pages(&cache.flat_slots, target_bucket, resident_count);
+
+        for page_no in colliders.iter().copied() {
+            let mut buffer = cache.pool().acquire().unwrap();
+            buffer.fill(u8::try_from(page_no.get() & 0xff).unwrap());
+            cache.insert_buffer(page_no, buffer);
+        }
+        assert_eq!(cache.pool().available(), 0, "pool must start saturated");
+
+        let overflow_page = colliders
+            .iter()
+            .copied()
+            .find(|page_no| !cache.flat_slots.contains(*page_no))
+            .expect("one forced collider must reside only in overflow");
+        let overflow_shard = cache.shard_index(overflow_page);
+        assert!(cache.shards[overflow_shard].lock().contains(overflow_page));
+        assert!(cache.shards_dirty.load(Ordering::Acquire));
+
+        // Pin every flat resident as dirty so the only reclaimable victim is
+        // the overflow-tier page under test.
+        for page_no in colliders.iter().copied() {
+            if page_no == overflow_page {
+                continue;
+            }
+            if let Some(slot_idx) = cache.flat_slots.find_slot(page_no) {
+                let guard = cache.flat_slots.slots[slot_idx].data.lock();
+                if let Some(entry) = guard.as_ref() {
+                    entry.mark_dirty();
+                }
+            }
+        }
+
+        let snapshots_before = PAGE_SNAPSHOTS_INVOCATIONS.load(Ordering::Relaxed);
+        let reclaimed = cache
+            .take_clean_buffer()
+            .expect("overflow-only clean pool page must be reclaimable");
+        let snapshots_after = PAGE_SNAPSHOTS_INVOCATIONS.load(Ordering::Relaxed);
+
+        assert_eq!(snapshots_after, snapshots_before);
+        assert!(reclaimed.returns_to_pool(cache.pool()));
+        assert!(
+            reclaimed
+                .iter()
+                .all(|byte| *byte == u8::try_from(overflow_page.get() & 0xff).unwrap())
+        );
+        assert!(!cache.contains(overflow_page));
+        drop(reclaimed);
+        assert_eq!(cache.pool().available(), 1);
+    }
+
+    #[test]
+    fn gh_131_clean_eviction_refuses_duplicate_tier_page() {
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 2);
+        let page_no = PageNumber::ONE;
+
+        let mut flat = cache.pool().acquire().unwrap();
+        flat.fill(0x11);
+        cache.insert_buffer(page_no, flat);
+
+        let mut stale = cache.pool().acquire().unwrap();
+        stale.fill(0x22);
+        let shard_idx = cache.shard_index(page_no);
+        cache.shards[shard_idx]
+            .lock()
+            .insert_with_dirty_state(page_no, stale, false);
+        cache.shards_dirty.store(true, Ordering::Release);
+        assert_eq!(cache.pool().available(), 0);
+
+        let snapshots_before = PAGE_SNAPSHOTS_INVOCATIONS.load(Ordering::Relaxed);
+        assert!(
+            cache.take_clean_buffer().is_none(),
+            "duplicate-tier page must fail closed rather than evict either image"
+        );
+        assert_eq!(
+            PAGE_SNAPSHOTS_INVOCATIONS.load(Ordering::Relaxed),
+            snapshots_before
+        );
+        assert!(
+            cache.flat_slots.contains_stable(page_no),
+            "flat image must remain after refuse"
+        );
+        assert!(
+            cache.shards[shard_idx].lock().contains(page_no),
+            "overflow image must remain after refuse"
+        );
+        assert_eq!(cache.pool().available(), 0);
+    }
+
+    #[test]
+    fn gh_131_fast_path_clean_eviction_avoids_page_snapshots() {
+        let mut cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 4);
+        cache.enable_fast_path();
+
+        let dirty_page = PageNumber::ONE;
+        let foreign_page = PageNumber::new(2).unwrap();
+        let clean_a = PageNumber::new(3).unwrap();
+        let clean_b = PageNumber::new(4).unwrap();
+
+        cache
+            .insert_fresh(dirty_page, |bytes| bytes[0] = 0xAA)
+            .unwrap();
+        cache.insert_buffer(foreign_page, PageBuf::new(PageSize::DEFAULT));
+        cache.insert_buffer(clean_a, cache.pool().acquire().unwrap());
+        cache.insert_buffer(clean_b, cache.pool().acquire().unwrap());
+        assert_eq!(cache.pool().available(), 0);
+
+        let snapshots_before = PAGE_SNAPSHOTS_INVOCATIONS.load(Ordering::Relaxed);
+        let reclaimed = cache
+            .take_clean_buffer()
+            .expect("fast-path clean pool page must be reclaimable");
+        assert_eq!(
+            PAGE_SNAPSHOTS_INVOCATIONS.load(Ordering::Relaxed),
+            snapshots_before
+        );
+        assert!(reclaimed.returns_to_pool(cache.pool()));
+        assert!(cache.contains(dirty_page));
+        assert!(cache.contains(foreign_page));
+        assert_eq!(
+            usize::from(cache.contains(clean_a)) + usize::from(cache.contains(clean_b)),
+            1,
+            "exactly one clean pool-backed fast-path page should be reclaimed"
+        );
         drop(reclaimed);
         assert_eq!(cache.pool().available(), 1);
     }

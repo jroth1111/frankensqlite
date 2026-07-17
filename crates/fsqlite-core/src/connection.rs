@@ -8539,6 +8539,73 @@ pub(crate) mod fast_path_gate {
         IN_TRANSACTION | NO_STATEMENT_SAVEPOINT | TRACING_DISABLED | SCHEMA_STABLE;
 }
 
+/// Compact page-ownership authority used by `PRAGMA integrity_check`.
+///
+/// Database page numbers are dense, so a four-byte owner id per page avoids
+/// retaining a separately allocated recursive path string for every page in a
+/// large database. Owner labels are registered once per schema root (or
+/// freelist authority) and are expanded only when a duplicate is reported.
+struct IntegrityPageOwners {
+    by_page: Vec<u32>,
+    labels: Vec<String>,
+}
+
+/// B-tree cell context exposed to the fused integrity content visitor.
+///
+/// Constructed only after the cell and its overflow ownership chain have been
+/// structurally validated. Payload bytes are reassembled by the walker (overflow
+/// re-reads are typically immediate cache hits) so the visitor does not need to
+/// re-borrow the transaction handle.
+///
+/// Table b-trees emit only leaf cells. Index b-trees (including WITHOUT ROWID
+/// tables) emit both leaf and interior cells because interior separator keys are
+/// logical entries in this engine (see `BtCursor` / `count_all_rows`).
+struct IntegrityLeafCell {
+    page_type: fsqlite_btree::BtreePageType,
+    /// Table-leaf rowid key; `None` for index cells (rowid is in the payload).
+    rowid: Option<i64>,
+    payload: Vec<u8>,
+}
+
+impl IntegrityPageOwners {
+    fn new(total_pages: u32) -> Result<Self> {
+        let len = usize::try_from(total_pages)
+            .ok()
+            .and_then(|pages| pages.checked_add(1))
+            .ok_or(FrankenError::OutOfMemory)?;
+        let mut by_page = Vec::new();
+        by_page
+            .try_reserve_exact(len)
+            .map_err(|_| FrankenError::OutOfMemory)?;
+        by_page.resize(len, 0);
+        Ok(Self {
+            by_page,
+            labels: Vec::new(),
+        })
+    }
+
+    fn register(&mut self, label: String) -> Result<u32> {
+        self.labels
+            .try_reserve(1)
+            .map_err(|_| FrankenError::OutOfMemory)?;
+        self.labels.push(label);
+        u32::try_from(self.labels.len()).map_err(|_| FrankenError::OutOfMemory)
+    }
+
+    fn record(&mut self, page_no: PageNumber, owner_id: u32) -> Option<&str> {
+        let slot = &mut self.by_page[page_no.get() as usize];
+        if *slot == 0 {
+            *slot = owner_id;
+            return None;
+        }
+        self.labels.get((*slot - 1) as usize).map(String::as_str)
+    }
+
+    fn contains(&self, page_no: PageNumber) -> bool {
+        self.by_page[page_no.get() as usize] != 0
+    }
+}
+
 /// A database connection holding schema metadata and execution/cache state.
 ///
 /// Supports transactions (BEGIN/COMMIT/ROLLBACK) and savepoints
@@ -47195,11 +47262,12 @@ impl Connection {
     }
 
     fn record_integrity_page_owner(
-        owners: Option<&mut HashMap<PageNumber, String>>,
+        owners: Option<&mut IntegrityPageOwners>,
+        owner_id: Option<u32>,
         page_size: PageSize,
         page_no: PageNumber,
         total_pages: u32,
-        owner: String,
+        owner: &str,
     ) -> Result<()> {
         if page_no.get() > total_pages {
             return Err(FrankenError::DatabaseCorrupt {
@@ -47220,7 +47288,10 @@ impl Connection {
         }
 
         if let Some(owners) = owners {
-            if let Some(existing) = owners.insert(page_no, owner.clone()) {
+            let owner_id = owner_id.ok_or_else(|| {
+                FrankenError::Internal("integrity owner id is missing".to_owned())
+            })?;
+            if let Some(existing) = owners.record(page_no, owner_id) {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
                         "page {} is referenced multiple times ({existing}; {owner})",
@@ -47264,7 +47335,8 @@ impl Connection {
         payload_size: u32,
         local_size: u32,
         owner: &str,
-        mut owners: Option<&mut HashMap<PageNumber, String>>,
+        mut owners: Option<&mut IntegrityPageOwners>,
+        owner_id: Option<u32>,
     ) -> Result<()> {
         let usable_size = page_size.usable(reserved_per_page);
         if usable_size <= 4 {
@@ -47301,10 +47373,11 @@ impl Connection {
 
             Self::record_integrity_page_owner(
                 owners.as_deref_mut(),
+                owner_id,
                 page_size,
                 page_no,
                 total_pages,
-                format!("{owner} overflow[{overflow_idx}]"),
+                &format!("{owner} overflow[{overflow_idx}]"),
             )?;
 
             let page = txn.get_page(cx, page_no)?;
@@ -47351,12 +47424,19 @@ impl Connection {
     /// Recursively walk every page in a B-tree, validating page headers,
     /// cell pointers, freeblock chains, and overflow chains.
     ///
-    /// When `owners` is `Some`, page-ownership tracking is performed (for
-    /// full `integrity_check`).  When `None`, the walk still validates
-    /// every page's structural integrity but skips the ownership HashMap
-    /// and orphan detection — this is the `quick_check` path.
+    /// When `owners` is `Some`, compact page-ownership tracking is performed
+    /// (full `integrity_check`). When `None`, the walk still validates every
+    /// page's structural integrity but skips ownership and orphan detection —
+    /// this is the `quick_check` path.
+    ///
+    /// `leaf_visitor`, when enabled via `visit_entries`, is invoked for each
+    /// content-bearing cell after that cell's overflow ownership chain has been
+    /// validated. Table b-trees visit leaf cells only; index b-trees visit both
+    /// leaf and interior cells (interior separators are logical entries). Full
+    /// `integrity_check` uses this to reconcile table/index content during the
+    /// same structural traversal so pages are not cold-scanned again.
     #[allow(clippy::too_many_arguments)]
-    fn walk_integrity_btree_pages(
+    fn walk_integrity_btree_pages<F>(
         cx: &Cx,
         txn: &mut dyn TransactionHandle,
         page_size: PageSize,
@@ -47364,14 +47444,21 @@ impl Connection {
         total_pages: u32,
         page_no: PageNumber,
         owner: &str,
-        mut owners: Option<&mut HashMap<PageNumber, String>>,
-    ) -> Result<()> {
+        mut owners: Option<&mut IntegrityPageOwners>,
+        owner_id: Option<u32>,
+        leaf_visitor: &mut F,
+        visit_entries: bool,
+    ) -> Result<()>
+    where
+        F: FnMut(IntegrityLeafCell) -> Result<()>,
+    {
         Self::record_integrity_page_owner(
             owners.as_deref_mut(),
+            owner_id,
             page_size,
             page_no,
             total_pages,
-            owner.to_owned(),
+            owner,
         )?;
 
         let page = txn.get_page(cx, page_no)?;
@@ -47433,6 +47520,9 @@ impl Connection {
                     left_child,
                     &format!("{owner} -> child[{cell_idx}]"),
                     owners.as_deref_mut(),
+                    owner_id,
+                    leaf_visitor,
+                    visit_entries,
                 )?;
             }
 
@@ -47448,7 +47538,42 @@ impl Connection {
                     cell.local_size,
                     &format!("{owner} -> cell[{cell_idx}]"),
                     owners.as_deref_mut(),
+                    owner_id,
                 )?;
+            }
+
+            // Content reconciliation runs after overflow ownership so payload
+            // reassembly can reuse immediate cache hits. Table b-trees only
+            // store records on leaves; index b-trees also store logical entries
+            // as interior separators (inorder: left child, then key).
+            let emit_content = visit_entries
+                && if page_type.is_table() {
+                    page_type.is_leaf()
+                } else {
+                    // Index leaf or interior cell with a key payload.
+                    true
+                };
+            if emit_content {
+                let payload = fsqlite_btree::payload::read_payload(
+                    &cell,
+                    page_bytes,
+                    usable_size,
+                    &mut |overflow_page| {
+                        let overflow = txn.get_page(cx, overflow_page)?;
+                        Ok(overflow.as_ref().to_vec())
+                    },
+                )
+                .map_err(|err| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "{owner}: page {} cell {cell_idx} payload reassembly failed: {err}",
+                        page_no.get()
+                    ),
+                })?;
+                leaf_visitor(IntegrityLeafCell {
+                    page_type,
+                    rowid: cell.rowid,
+                    payload,
+                })?;
             }
         }
 
@@ -47462,52 +47587,77 @@ impl Connection {
                 right_child,
                 &format!("{owner} -> right_child"),
                 owners,
+                owner_id,
+                leaf_visitor,
+                visit_entries,
             )?;
         }
 
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn validate_page_ownership_in_txn(
+    fn walk_integrity_btree_pages_structural(
         cx: &Cx,
         txn: &mut dyn TransactionHandle,
         page_size: PageSize,
         reserved_per_page: u8,
         total_pages: u32,
-        freelist_trunk: u32,
-        freelist_count: u32,
-        auto_vacuum_enabled: bool,
-        schema: &[TableSchema],
-        live_freelist: Option<&[PageNumber]>,
+        page_no: PageNumber,
+        owner: &str,
+        owners: Option<&mut IntegrityPageOwners>,
+        owner_id: Option<u32>,
     ) -> Result<()> {
-        if total_pages == 0 {
-            return Ok(());
-        }
-
-        let mut owners = HashMap::new();
+        let mut noop = |_leaf: IntegrityLeafCell| -> Result<()> { Ok(()) };
         Self::walk_integrity_btree_pages(
             cx,
             txn,
             page_size,
             reserved_per_page,
             total_pages,
-            PageNumber::ONE,
-            "sqlite_master root",
-            Some(&mut owners),
-        )?;
+            page_no,
+            owner,
+            owners,
+            owner_id,
+            &mut noop,
+            false,
+        )
+    }
 
+    fn integrity_index_rowid_from_payload(payload: &[u8], index_name: &str) -> Result<i64> {
+        let key_values = parse_record(payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!("index `{index_name}` contains an invalid key record payload"),
+        })?;
+        key_values
+            .last()
+            .and_then(SqliteValue::as_integer)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "index `{index_name}` key record is missing a trailing integer rowid"
+                ),
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_integrity_freelist_owners(
+        cx: &Cx,
+        txn: &dyn TransactionHandle,
+        page_size: PageSize,
+        total_pages: u32,
+        freelist_trunk: u32,
+        freelist_count: u32,
+        live_freelist: Option<&[PageNumber]>,
+        owners: &mut IntegrityPageOwners,
+    ) -> Result<()> {
         if let Some(live) = live_freelist {
+            let freelist_owner = "freelist (in-transaction live set)".to_owned();
+            let freelist_owner_id = owners.register(freelist_owner.clone())?;
             // GH#113: a write transaction is active. The on-disk freelist trunk
-            // pages and page-1 header (offsets 32/36) are a deferred commit-time
+            // pages and the page-1 header (offsets 32/36) are a deferred commit-time
             // projection and are intentionally stale mid-transaction, so walking
             // them here cross-references fresh btree pages against an out-of-date
             // freelist and falsely flags pages legitimately allocated-from-
             // freelist this txn as "referenced multiple times". Record ownership
-            // from the pager's authoritative live freelist set instead. The btree
-            // walks above and below are unchanged, so a genuine inconsistency —
-            // a page that is both live-free and reachable as a live btree child —
-            // still trips the double-owner check in record_integrity_page_owner.
+            // from the pager's authoritative live freelist set instead.
             for &free_page in live {
                 // The live freelist can transiently name a page beyond the
                 // currently-walked db extent: the txn may have grown the file,
@@ -47519,111 +47669,72 @@ impl Connection {
                     continue;
                 }
                 Self::record_integrity_page_owner(
-                    Some(&mut owners),
+                    Some(owners),
+                    Some(freelist_owner_id),
                     page_size,
                     free_page,
                     total_pages,
-                    "freelist (in-transaction live set)".to_string(),
+                    &freelist_owner,
                 )?;
             }
-        } else {
-            let mut counted_freelist_pages = 0_u32;
-            let mut next_trunk = PageNumber::new(freelist_trunk);
-            let mut trunk_index = 0_usize;
-            while let Some(trunk_page) = next_trunk {
-                Self::record_integrity_page_owner(
-                    Some(&mut owners),
-                    page_size,
-                    trunk_page,
-                    total_pages,
-                    format!("freelist trunk[{trunk_index}]"),
-                )?;
+            return Ok(());
+        }
 
-                let page = txn.get_page(cx, trunk_page)?;
-                let trunk = fsqlite_btree::freelist::FreelistTrunk::parse(page.as_ref()).map_err(
-                    |err| FrankenError::DatabaseCorrupt {
+        let freelist_owner = "freelist".to_owned();
+        let freelist_owner_id = owners.register(freelist_owner)?;
+        let mut counted_freelist_pages = 0_u32;
+        let mut next_trunk = PageNumber::new(freelist_trunk);
+        let mut trunk_index = 0_usize;
+        while let Some(trunk_page) = next_trunk {
+            Self::record_integrity_page_owner(
+                Some(owners),
+                Some(freelist_owner_id),
+                page_size,
+                trunk_page,
+                total_pages,
+                &format!("freelist trunk[{trunk_index}]"),
+            )?;
+
+            let page = txn.get_page(cx, trunk_page)?;
+            let trunk =
+                fsqlite_btree::freelist::FreelistTrunk::parse(page.as_ref()).map_err(|err| {
+                    FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "freelist trunk page {} is malformed: {err}",
                             trunk_page.get()
                         ),
-                    },
+                    }
+                })?;
+            counted_freelist_pages = counted_freelist_pages.saturating_add(1);
+
+            for (leaf_idx, leaf_page) in trunk.leaf_pages.iter().copied().enumerate() {
+                Self::record_integrity_page_owner(
+                    Some(owners),
+                    Some(freelist_owner_id),
+                    page_size,
+                    leaf_page,
+                    total_pages,
+                    &format!("freelist trunk[{trunk_index}] leaf[{leaf_idx}]"),
                 )?;
                 counted_freelist_pages = counted_freelist_pages.saturating_add(1);
-
-                for (leaf_idx, leaf_page) in trunk.leaf_pages.iter().copied().enumerate() {
-                    Self::record_integrity_page_owner(
-                        Some(&mut owners),
-                        page_size,
-                        leaf_page,
-                        total_pages,
-                        format!("freelist trunk[{trunk_index}] leaf[{leaf_idx}]"),
-                    )?;
-                    counted_freelist_pages = counted_freelist_pages.saturating_add(1);
-                }
-
-                next_trunk = trunk.next_trunk;
-                trunk_index = trunk_index.saturating_add(1);
             }
 
-            if counted_freelist_pages != freelist_count {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "freelist header claims {freelist_count} pages but the freelist walk found {counted_freelist_pages}",
-                    ),
-                });
-            }
+            next_trunk = trunk.next_trunk;
+            trunk_index = trunk_index.saturating_add(1);
         }
 
-        for table in schema {
-            if table.root_page <= 0 {
-                continue;
-            }
-            let table_root = page_number_from_schema_root(table.root_page, &table.name, "table")?;
-            if table_root != PageNumber::ONE {
-                Self::walk_integrity_btree_pages(
-                    cx,
-                    txn,
-                    page_size,
-                    reserved_per_page,
-                    total_pages,
-                    table_root,
-                    &format!("table `{}` root", table.name),
-                    Some(&mut owners),
-                )?;
-            }
-
-            for index in &table.indexes {
-                let index_root =
-                    page_number_from_schema_root(index.root_page, &index.name, "index")?;
-                Self::walk_integrity_btree_pages(
-                    cx,
-                    txn,
-                    page_size,
-                    reserved_per_page,
-                    total_pages,
-                    index_root,
-                    &format!("index `{}` root", index.name),
-                    Some(&mut owners),
-                )?;
-            }
-        }
-
-        if !auto_vacuum_enabled {
-            if let Some(page_no) =
-                Self::first_unowned_database_page(total_pages, page_size, |page_no| {
-                    owners.contains_key(&page_no)
-                })
-            {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!("page {} is never used", page_no.get()),
-                });
-            }
+        if counted_freelist_pages != freelist_count {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "freelist header claims {freelist_count} pages but the freelist walk found {counted_freelist_pages}",
+                ),
+            });
         }
 
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn validate_schema_btrees_in_txn(
         &self,
         cx: &Cx,
@@ -47639,73 +47750,6 @@ impl Connection {
         live_freelist: Option<&[PageNumber]>,
     ) -> Result<()> {
         let schema = self.schema.borrow().clone();
-        let rowid_alias_col_by_root_page = (!quick).then(|| self.rowid_alias_column_by_root_page());
-        let column_defaults_by_root_page = (!quick).then(|| self.column_defaults_by_root_page());
-
-        if !quick {
-            Self::validate_page_ownership_in_txn(
-                cx,
-                txn,
-                page_size,
-                reserved_per_page,
-                total_pages,
-                freelist_trunk,
-                freelist_count,
-                auto_vacuum_enabled,
-                &schema,
-                live_freelist,
-            )?;
-        } else {
-            // quick_check: walk every B-tree page to validate headers, cell
-            // pointers, and freeblock chains without tracking page ownership
-            // or scanning for orphans.  This catches free-space corruption
-            // (malformed freeblock chains within pages) that the root-page-
-            // only validation below would miss.
-            Self::walk_integrity_btree_pages(
-                cx,
-                txn,
-                page_size,
-                reserved_per_page,
-                total_pages,
-                PageNumber::ONE,
-                "sqlite_master root",
-                None,
-            )?;
-            for table in &schema {
-                if table.root_page <= 0 {
-                    continue;
-                }
-                let table_root =
-                    page_number_from_schema_root(table.root_page, &table.name, "table")?;
-                if table_root != PageNumber::ONE {
-                    Self::walk_integrity_btree_pages(
-                        cx,
-                        txn,
-                        page_size,
-                        reserved_per_page,
-                        total_pages,
-                        table_root,
-                        &format!("table `{}`", table.name),
-                        None,
-                    )?;
-                }
-                for index in &table.indexes {
-                    let index_root =
-                        page_number_from_schema_root(index.root_page, &index.name, "index")?;
-                    Self::walk_integrity_btree_pages(
-                        cx,
-                        txn,
-                        page_size,
-                        reserved_per_page,
-                        total_pages,
-                        index_root,
-                        &format!("index `{}`", index.name),
-                        None,
-                    )?;
-                }
-            }
-        }
-
         let mut without_rowid_tables = HashSet::new();
         for row in master_rows {
             let (entry_type, name, _, _) = sqlite_master_signature(row)?;
@@ -47715,6 +47759,299 @@ impl Connection {
                 without_rowid_tables.insert(name.to_ascii_lowercase());
             }
         }
+
+        if quick {
+            // quick_check: structural B-tree walk only (no ownership map, no
+            // table/index row reconciliation). Root page-type checks remain.
+            Self::walk_integrity_btree_pages_structural(
+                cx,
+                txn,
+                page_size,
+                reserved_per_page,
+                total_pages,
+                PageNumber::ONE,
+                "sqlite_master root",
+                None,
+                None,
+            )?;
+            for table in &schema {
+                if table.root_page <= 0 {
+                    continue;
+                }
+                let table_root =
+                    page_number_from_schema_root(table.root_page, &table.name, "table")?;
+                if table_root != PageNumber::ONE {
+                    Self::walk_integrity_btree_pages_structural(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        total_pages,
+                        table_root,
+                        &format!("table `{}`", table.name),
+                        None,
+                        None,
+                    )?;
+                }
+                for index in &table.indexes {
+                    let index_root =
+                        page_number_from_schema_root(index.root_page, &index.name, "index")?;
+                    Self::walk_integrity_btree_pages_structural(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        total_pages,
+                        index_root,
+                        &format!("index `{}`", index.name),
+                        None,
+                        None,
+                    )?;
+                }
+            }
+
+            for table in &schema {
+                if table.root_page <= 0 {
+                    continue;
+                }
+                let uses_index_btree =
+                    without_rowid_tables.contains(&table.name.to_ascii_lowercase());
+                let root_page =
+                    page_number_from_schema_root(table.root_page, &table.name, "table")?;
+                let page = txn.get_page(cx, root_page)?;
+                let header =
+                    BTreePageHeader::parse(page.as_ref(), page_size, reserved_per_page, false)
+                        .map_err(|err| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "table `{}` root page {} invalid: {err}",
+                                table.name, table.root_page
+                            ),
+                        })?;
+                if uses_index_btree {
+                    if header.page_type.is_table() {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "WITHOUT ROWID table `{}` root page {} is not an index b-tree page",
+                                table.name, table.root_page
+                            ),
+                        });
+                    }
+                } else if !header.page_type.is_table() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{}` root page {} is not a table b-tree page",
+                            table.name, table.root_page
+                        ),
+                    });
+                }
+                header
+                    .parse_cell_pointers(page.as_ref(), page_size, reserved_per_page)
+                    .map_err(|err| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{}` root page {} cell pointers invalid: {err}",
+                            table.name, table.root_page
+                        ),
+                    })?;
+                header
+                    .parse_freeblocks(page.as_ref(), page_size, reserved_per_page)
+                    .map_err(|err| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{}` root page {} freeblocks invalid: {err}",
+                            table.name, table.root_page
+                        ),
+                    })?;
+
+                if uses_index_btree {
+                    let mut cursor = Self::new_header_btree_cursor(
+                        txn,
+                        root_page,
+                        page_size,
+                        reserved_per_page,
+                        false,
+                    );
+                    if cursor.first(cx)? {
+                        loop {
+                            let payload = cursor.payload(cx)?;
+                            parse_record(&payload).ok_or_else(|| {
+                                FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "WITHOUT ROWID table `{}` contains an invalid key record payload",
+                                        table.name
+                                    ),
+                                }
+                            })?;
+                            if !cursor.next(cx)? {
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    let mut cursor = Self::new_header_btree_cursor(
+                        txn,
+                        root_page,
+                        page_size,
+                        reserved_per_page,
+                        true,
+                    );
+                    if cursor.first(cx)? {
+                        loop {
+                            let rowid = cursor.rowid(cx)?;
+                            let payload = cursor.payload(cx)?;
+                            parse_record(&payload).ok_or_else(|| {
+                                FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "table `{}` rowid {rowid} payload is not a valid SQLite record",
+                                        table.name
+                                    ),
+                                }
+                            })?;
+                            if !cursor.next(cx)? {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                for index in &table.indexes {
+                    let index_root =
+                        page_number_from_schema_root(index.root_page, &index.name, "index")?;
+                    let page = txn.get_page(cx, index_root)?;
+                    let header =
+                        BTreePageHeader::parse(page.as_ref(), page_size, reserved_per_page, false)
+                            .map_err(|err| FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "index `{}` root page {} invalid: {err}",
+                                    index.name, index.root_page
+                                ),
+                            })?;
+                    if header.page_type.is_table() {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{}` root page {} is not an index b-tree page",
+                                index.name, index.root_page
+                            ),
+                        });
+                    }
+                    header
+                        .parse_cell_pointers(page.as_ref(), page_size, reserved_per_page)
+                        .map_err(|err| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{}` root page {} cell pointers invalid: {err}",
+                                index.name, index.root_page
+                            ),
+                        })?;
+                    header
+                        .parse_freeblocks(page.as_ref(), page_size, reserved_per_page)
+                        .map_err(|err| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{}` root page {} freeblocks invalid: {err}",
+                                index.name, index.root_page
+                            ),
+                        })?;
+
+                    let mut cursor = Self::new_header_btree_index_cursor(
+                        txn,
+                        index_root,
+                        page_size,
+                        reserved_per_page,
+                        (0..index.key_term_count())
+                            .map(|key_pos| index.key_term_descending(key_pos))
+                            .collect(),
+                        (0..index.key_term_count())
+                            .map(|key_pos| index.key_term_collation(key_pos).map(str::to_owned))
+                            .collect(),
+                        Arc::clone(&self.collation_registry),
+                    );
+                    let mut prev_payload: Option<Vec<u8>> = None;
+                    if cursor.first(cx)? {
+                        loop {
+                            let payload = cursor.payload(cx)?;
+                            let payload_values = parse_record(&payload).ok_or_else(|| {
+                                FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "index `{}` contains an invalid key record payload",
+                                        index.name
+                                    ),
+                                }
+                            })?;
+                            if let Some(previous) = prev_payload.as_ref() {
+                                let previous_values = parse_record(previous).ok_or_else(|| {
+                                    FrankenError::DatabaseCorrupt {
+                                        detail: format!(
+                                            "index `{}` contains an invalid key record payload",
+                                            index.name
+                                        ),
+                                    }
+                                })?;
+                                let ordering = self
+                                    .compare_index_key_values_for_integrity(
+                                        index,
+                                        &previous_values,
+                                        &payload_values,
+                                    )
+                                    .unwrap_or_else(|| previous.as_slice().cmp(payload.as_slice()));
+                                if ordering != std::cmp::Ordering::Less {
+                                    return Err(FrankenError::DatabaseCorrupt {
+                                        detail: format!(
+                                            "index `{}` entries are out of order for their declared key directions",
+                                            index.name
+                                        ),
+                                    });
+                                }
+                            }
+                            prev_payload = Some(payload);
+                            if !cursor.next(cx)? {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // Full integrity_check: compact ownership + content reconciliation fused
+        // into a single structural DFS per B-tree so leaf/index pages are not
+        // cold-scanned again after ownership validation.
+        let rowid_alias_col_by_root_page = self.rowid_alias_column_by_root_page();
+        let column_defaults_by_root_page = self.column_defaults_by_root_page();
+
+        if total_pages == 0 {
+            return Ok(());
+        }
+
+        let mut owners = IntegrityPageOwners::new(total_pages)?;
+        let master_owner = "sqlite_master root".to_owned();
+        let master_owner_id = owners.register(master_owner.clone())?;
+        Self::walk_integrity_btree_pages_structural(
+            cx,
+            txn,
+            page_size,
+            reserved_per_page,
+            total_pages,
+            PageNumber::ONE,
+            &master_owner,
+            Some(&mut owners),
+            Some(master_owner_id),
+        )?;
+
+        Self::record_integrity_freelist_owners(
+            cx,
+            txn,
+            page_size,
+            total_pages,
+            freelist_trunk,
+            freelist_count,
+            live_freelist,
+            &mut owners,
+        )?;
+
+        struct IntegrityIndexSpec<'a> {
+            index: &'a IndexSchema,
+            positions: Vec<usize>,
+            predicate: Option<Expr>,
+        }
+
         for table in &schema {
             if table.root_page <= 0 {
                 continue;
@@ -47763,166 +48100,68 @@ impl Connection {
                     ),
                 })?;
 
-            // Table records may carry an INTEGER PRIMARY KEY alias slot as
-            // either SQLite's NULL placeholder or a full-width FrankenSQLite
-            // rowid value; materialize the physical rowid before comparing
-            // expected index keys against persisted indexes.
             let max_payload_columns = table.columns.len();
 
             if uses_index_btree {
-                let mut cursor = Self::new_header_btree_cursor(
-                    txn,
-                    root_page,
-                    page_size,
-                    reserved_per_page,
-                    false,
-                );
-                if cursor.first(cx)? {
-                    loop {
-                        let payload = cursor.payload(cx)?;
-                        let values = parse_record(&payload).ok_or_else(|| {
+                let table_name = table.name.as_str();
+                let mut without_rowid_visitor = |leaf: IntegrityLeafCell| -> Result<()> {
+                    // WITHOUT ROWID tables use index b-trees; interior keys are
+                    // logical entries too.
+                    if leaf.page_type.is_table() {
+                        return Ok(());
+                    }
+                    let values = parse_record(&leaf.payload).ok_or_else(|| {
                             FrankenError::DatabaseCorrupt {
                                 detail: format!(
-                                    "WITHOUT ROWID table `{}` contains an invalid key record payload",
-                                    table.name
+                                    "WITHOUT ROWID table `{table_name}` contains an invalid key record payload"
                                 ),
                             }
                         })?;
-                        if !quick && values.len() > max_payload_columns {
-                            return Err(FrankenError::DatabaseCorrupt {
-                                detail: format!(
-                                    "WITHOUT ROWID table `{}` stores {} payload columns but schema allows at most {}",
-                                    table.name,
-                                    values.len(),
-                                    max_payload_columns
-                                ),
-                            });
-                        }
-                        if !cursor.next(cx)? {
-                            break;
-                        }
+                    if values.len() > max_payload_columns {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "WITHOUT ROWID table `{table_name}` stores {} payload columns but schema allows at most {max_payload_columns}",
+                                values.len(),
+                            ),
+                        });
                     }
-                }
-            } else {
-                struct IntegrityIndexSpec<'a> {
-                    index: &'a IndexSchema,
-                    positions: Vec<usize>,
-                    predicate: Option<Expr>,
+                    Ok(())
+                };
+
+                let owner = format!("table `{}` root", table.name);
+                let owner_id = owners.register(owner.clone())?;
+                if root_page != PageNumber::ONE {
+                    Self::walk_integrity_btree_pages(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        total_pages,
+                        root_page,
+                        &owner,
+                        Some(&mut owners),
+                        Some(owner_id),
+                        &mut without_rowid_visitor,
+                        true,
+                    )?;
+                } else {
+                    // sqlite_master already owned; still reconcile leaf content.
+                    Self::walk_integrity_btree_pages(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        total_pages,
+                        root_page,
+                        &owner,
+                        None,
+                        None,
+                        &mut without_rowid_visitor,
+                        true,
+                    )?;
                 }
 
-                let index_specs = if quick {
-                    Vec::new()
-                } else {
-                    table
-                        .indexes
-                        .iter()
-                        .map(|index| {
-                            let positions = index
-                                .columns
-                                .iter()
-                                .map(|column_name| {
-                                    table.column_index(column_name).ok_or_else(|| {
-                                        FrankenError::DatabaseCorrupt {
-                                            detail: format!(
-                                                "index `{}` references unknown column `{}` on table `{}`",
-                                                index.name, column_name, table.name
-                                            ),
-                                        }
-                                    })
-                                })
-                                .collect::<Result<Vec<_>>>()?;
-                            let predicate =
-                                Self::parse_partial_index_predicate_for_integrity(index)?;
-                            Ok(IntegrityIndexSpec {
-                                index,
-                                positions,
-                                predicate,
-                            })
-                        })
-                        .collect::<Result<Vec<_>>>()?
-                };
-                let mut expected_index_keys = index_specs
-                    .iter()
-                    .map(|_| HashMap::<i64, Vec<u8>>::new())
-                    .collect::<Vec<_>>();
-                let mut table_rowids = HashSet::new();
-                let rowid_alias_col_idx = rowid_alias_col_by_root_page
-                    .as_ref()
-                    .and_then(|map| map.get(&table.root_page))
-                    .copied();
-                let column_defaults = column_defaults_by_root_page
-                    .as_ref()
-                    .and_then(|map| map.get(&table.root_page))
-                    .map(Vec::as_slice);
-                let mut cursor = Self::new_header_btree_cursor(
-                    txn,
-                    root_page,
-                    page_size,
-                    reserved_per_page,
-                    true,
-                );
-                if cursor.first(cx)? {
-                    loop {
-                        let rowid = cursor.rowid(cx)?;
-                        let payload = cursor.payload(cx)?;
-                        let values = parse_record(&payload).ok_or_else(|| {
-                            FrankenError::DatabaseCorrupt {
-                                detail: format!(
-                                    "table `{}` rowid {rowid} payload is not a valid SQLite record",
-                                    table.name
-                                ),
-                            }
-                        })?;
-                        if !quick && values.len() > max_payload_columns {
-                            return Err(FrankenError::DatabaseCorrupt {
-                                detail: format!(
-                                    "table `{}` rowid {rowid} stores {} payload columns but schema allows at most {}",
-                                    table.name,
-                                    values.len(),
-                                    max_payload_columns
-                                ),
-                            });
-                        }
-                        if !quick {
-                            let row_values = Self::inflate_table_row_values_for_integrity(
-                                table,
-                                rowid,
-                                &values,
-                                rowid_alias_col_idx,
-                                column_defaults,
-                            )?;
-                            table_rowids.insert(rowid);
-                            for (index_spec, expected_keys) in
-                                index_specs.iter().zip(expected_index_keys.iter_mut())
-                            {
-                                if !Self::row_matches_partial_index_for_integrity(
-                                    table,
-                                    index_spec.predicate.as_ref(),
-                                    rowid,
-                                    &row_values,
-                                    rowid_alias_col_idx,
-                                )? {
-                                    continue;
-                                }
-                                let key = Self::build_expected_index_key_for_integrity(
-                                    &table.name,
-                                    &index_spec.index.name,
-                                    rowid,
-                                    &row_values,
-                                    &index_spec.positions,
-                                )?;
-                                expected_keys.insert(rowid, key);
-                            }
-                        }
-                        if !cursor.next(cx)? {
-                            break;
-                        }
-                    }
-                }
-                for (index_spec, expected_keys) in
-                    index_specs.iter().zip(expected_index_keys.iter())
-                {
-                    let index = index_spec.index;
+                for index in &table.indexes {
                     let index_root =
                         page_number_from_schema_root(index.root_page, &index.name, "index")?;
                     let page = txn.get_page(cx, index_root)?;
@@ -47959,115 +48198,191 @@ impl Connection {
                             ),
                         })?;
 
-                    let mut actual_rowids = HashSet::new();
-                    let mut cursor = Self::new_header_btree_index_cursor(
-                        txn,
-                        index_root,
-                        page_size,
-                        reserved_per_page,
-                        (0..index.key_term_count())
-                            .map(|key_pos| index.key_term_descending(key_pos))
-                            .collect(),
-                        (0..index.key_term_count())
-                            .map(|key_pos| index.key_term_collation(key_pos).map(str::to_owned))
-                            .collect(),
-                        Arc::clone(&self.collation_registry),
-                    );
                     let mut prev_payload: Option<Vec<u8>> = None;
-                    if cursor.first(cx)? {
-                        loop {
-                            let payload = cursor.payload(cx)?;
-                            let payload_values = parse_record(&payload).ok_or_else(|| {
+                    let index_name = index.name.as_str();
+                    let mut order_visitor = |leaf: IntegrityLeafCell| -> Result<()> {
+                        if leaf.page_type.is_table() {
+                            return Ok(());
+                        }
+                        let payload = leaf.payload;
+                        let payload_values = parse_record(&payload).ok_or_else(|| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "index `{index_name}` contains an invalid key record payload"
+                                ),
+                            }
+                        })?;
+                        if let Some(prev) = prev_payload.as_ref() {
+                            let prev_values = parse_record(prev).ok_or_else(|| {
                                 FrankenError::DatabaseCorrupt {
                                     detail: format!(
-                                        "index `{}` contains an invalid key record payload",
-                                        index.name
+                                        "index `{index_name}` contains an invalid key record payload"
                                     ),
                                 }
                             })?;
-                            if let Some(prev_payload) = prev_payload.as_ref() {
-                                let prev_values = parse_record(prev_payload).ok_or_else(|| {
-                                    FrankenError::DatabaseCorrupt {
-                                        detail: format!(
-                                            "index `{}` contains an invalid key record payload",
-                                            index.name
-                                        ),
-                                    }
-                                })?;
-                                let ordering = self
-                                    .compare_index_key_values_for_integrity(
-                                        index,
-                                        &prev_values,
-                                        &payload_values,
-                                    )
-                                    .unwrap_or_else(|| {
-                                        prev_payload.as_slice().cmp(payload.as_slice())
-                                    });
-                                if ordering != std::cmp::Ordering::Less {
-                                    return Err(FrankenError::DatabaseCorrupt {
-                                        detail: format!(
-                                            "index `{}` entries are out of order for their declared key directions",
-                                            index.name
-                                        ),
-                                    });
-                                }
-                            }
-                            let rowid = cursor.rowid(cx)?;
-                            let Some(expected_payload) = expected_keys.get(&rowid) else {
-                                let detail = if table_rowids.contains(&rowid) {
-                                    format!(
-                                        "index `{}` contains rowid {rowid} for a table row that does not satisfy the partial index predicate",
-                                        index.name
-                                    )
-                                } else {
-                                    format!(
-                                        "index `{}` contains stale rowid {rowid} with no matching table row",
-                                        index.name
-                                    )
-                                };
-                                return Err(FrankenError::DatabaseCorrupt { detail });
-                            };
-                            if expected_payload.as_slice() != payload.as_slice() {
+                            let ordering = self
+                                .compare_index_key_values_for_integrity(
+                                    index,
+                                    &prev_values,
+                                    &payload_values,
+                                )
+                                .unwrap_or_else(|| prev.as_slice().cmp(payload.as_slice()));
+                            if ordering != std::cmp::Ordering::Less {
                                 return Err(FrankenError::DatabaseCorrupt {
                                     detail: format!(
-                                        "index `{}` entry for rowid {rowid} does not match the table row payload",
-                                        index.name
+                                        "index `{index_name}` entries are out of order for their declared key directions"
                                     ),
                                 });
-                            }
-                            if !actual_rowids.insert(rowid) {
-                                return Err(FrankenError::DatabaseCorrupt {
-                                    detail: format!(
-                                        "index `{}` contains duplicate entries for rowid {rowid}",
-                                        index.name
-                                    ),
-                                });
-                            }
-                            prev_payload = Some(payload);
-                            if !cursor.next(cx)? {
-                                break;
                             }
                         }
-                    }
+                        prev_payload = Some(payload);
+                        Ok(())
+                    };
 
-                    if let Some(missing_rowid) = expected_keys
-                        .keys()
-                        .find(|rowid| !actual_rowids.contains(rowid))
-                        .copied()
-                    {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "table `{}` rowid {missing_rowid} is missing from index `{}`",
-                                table.name, index.name
-                            ),
-                        });
-                    }
+                    let owner = format!("index `{}` root", index.name);
+                    let owner_id = owners.register(owner.clone())?;
+                    Self::walk_integrity_btree_pages(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        total_pages,
+                        index_root,
+                        &owner,
+                        Some(&mut owners),
+                        Some(owner_id),
+                        &mut order_visitor,
+                        true,
+                    )?;
                 }
-
                 continue;
             }
 
-            for index in &table.indexes {
+            let index_specs = table
+                .indexes
+                .iter()
+                .map(|index| {
+                    let positions = index
+                        .columns
+                        .iter()
+                        .map(|column_name| {
+                            table.column_index(column_name).ok_or_else(|| {
+                                FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "index `{}` references unknown column `{}` on table `{}`",
+                                        index.name, column_name, table.name
+                                    ),
+                                }
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let predicate = Self::parse_partial_index_predicate_for_integrity(index)?;
+                    Ok(IntegrityIndexSpec {
+                        index,
+                        positions,
+                        predicate,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut expected_index_keys = index_specs
+                .iter()
+                .map(|_| HashMap::<i64, Vec<u8>>::new())
+                .collect::<Vec<_>>();
+            let mut table_rowids = HashSet::new();
+            let rowid_alias_col_idx = rowid_alias_col_by_root_page.get(&table.root_page).copied();
+            let column_defaults = column_defaults_by_root_page
+                .get(&table.root_page)
+                .map(Vec::as_slice);
+            let table_name = table.name.as_str();
+
+            let mut table_visitor = |leaf: IntegrityLeafCell| -> Result<()> {
+                if !leaf.page_type.is_leaf() || !leaf.page_type.is_table() {
+                    return Ok(());
+                }
+                let rowid = leaf.rowid.ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("table `{table_name}` leaf cell is missing a rowid key"),
+                })?;
+                let values = parse_record(&leaf.payload).ok_or_else(|| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{table_name}` rowid {rowid} payload is not a valid SQLite record"
+                        ),
+                    }
+                })?;
+                if values.len() > max_payload_columns {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{table_name}` rowid {rowid} stores {} payload columns but schema allows at most {max_payload_columns}",
+                            values.len(),
+                        ),
+                    });
+                }
+                let row_values = Self::inflate_table_row_values_for_integrity(
+                    table,
+                    rowid,
+                    &values,
+                    rowid_alias_col_idx,
+                    column_defaults,
+                )?;
+                table_rowids.insert(rowid);
+                for (index_spec, expected_keys) in
+                    index_specs.iter().zip(expected_index_keys.iter_mut())
+                {
+                    if !Self::row_matches_partial_index_for_integrity(
+                        table,
+                        index_spec.predicate.as_ref(),
+                        rowid,
+                        &row_values,
+                        rowid_alias_col_idx,
+                    )? {
+                        continue;
+                    }
+                    let key = Self::build_expected_index_key_for_integrity(
+                        table_name,
+                        &index_spec.index.name,
+                        rowid,
+                        &row_values,
+                        &index_spec.positions,
+                    )?;
+                    expected_keys.insert(rowid, key);
+                }
+                Ok(())
+            };
+
+            let owner = format!("table `{}` root", table.name);
+            let owner_id = owners.register(owner.clone())?;
+            if root_page != PageNumber::ONE {
+                Self::walk_integrity_btree_pages(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    total_pages,
+                    root_page,
+                    &owner,
+                    Some(&mut owners),
+                    Some(owner_id),
+                    &mut table_visitor,
+                    true,
+                )?;
+            } else {
+                Self::walk_integrity_btree_pages(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    total_pages,
+                    root_page,
+                    &owner,
+                    None,
+                    None,
+                    &mut table_visitor,
+                    true,
+                )?;
+            }
+
+            for (index_spec, expected_keys) in index_specs.iter().zip(expected_index_keys.iter()) {
+                let index = index_spec.index;
                 let index_root =
                     page_number_from_schema_root(index.root_page, &index.name, "index")?;
                 let page = txn.get_page(cx, index_root)?;
@@ -48104,62 +48419,113 @@ impl Connection {
                         ),
                     })?;
 
-                let mut cursor = Self::new_header_btree_index_cursor(
-                    txn,
-                    index_root,
-                    page_size,
-                    reserved_per_page,
-                    (0..index.key_term_count())
-                        .map(|key_pos| index.key_term_descending(key_pos))
-                        .collect(),
-                    (0..index.key_term_count())
-                        .map(|key_pos| index.key_term_collation(key_pos).map(str::to_owned))
-                        .collect(),
-                    Arc::clone(&self.collation_registry),
-                );
+                let mut actual_rowids = HashSet::new();
                 let mut prev_payload: Option<Vec<u8>> = None;
-                if cursor.first(cx)? {
-                    loop {
-                        let payload = cursor.payload(cx)?;
-                        let payload_values = parse_record(&payload).ok_or_else(|| {
-                            FrankenError::DatabaseCorrupt {
-                                detail: format!(
-                                    "index `{}` contains an invalid key record payload",
-                                    index.name
-                                ),
-                            }
+                let index_name = index.name.as_str();
+                let mut index_visitor = |leaf: IntegrityLeafCell| -> Result<()> {
+                    if leaf.page_type.is_table() {
+                        return Ok(());
+                    }
+                    let payload = leaf.payload;
+                    let payload_values =
+                        parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{index_name}` contains an invalid key record payload"
+                            ),
                         })?;
-                        if let Some(prev_payload) = prev_payload.as_ref() {
-                            let prev_values = parse_record(prev_payload).ok_or_else(|| {
-                                FrankenError::DatabaseCorrupt {
-                                    detail: format!(
-                                        "index `{}` contains an invalid key record payload",
-                                        index.name
-                                    ),
-                                }
+                    if let Some(prev) = prev_payload.as_ref() {
+                        let prev_values =
+                            parse_record(prev).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "index `{index_name}` contains an invalid key record payload"
+                                ),
                             })?;
-                            let ordering = self
-                                .compare_index_key_values_for_integrity(
-                                    index,
-                                    &prev_values,
-                                    &payload_values,
-                                )
-                                .unwrap_or_else(|| prev_payload.as_slice().cmp(payload.as_slice()));
-                            if ordering != std::cmp::Ordering::Less {
-                                return Err(FrankenError::DatabaseCorrupt {
-                                    detail: format!(
-                                        "index `{}` entries are out of order for their declared key directions",
-                                        index.name
-                                    ),
-                                });
-                            }
-                        }
-                        prev_payload = Some(payload);
-                        if !cursor.next(cx)? {
-                            break;
+                        let ordering = self
+                            .compare_index_key_values_for_integrity(
+                                index,
+                                &prev_values,
+                                &payload_values,
+                            )
+                            .unwrap_or_else(|| prev.as_slice().cmp(payload.as_slice()));
+                        if ordering != std::cmp::Ordering::Less {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "index `{index_name}` entries are out of order for their declared key directions"
+                                ),
+                            });
                         }
                     }
+                    let rowid = Self::integrity_index_rowid_from_payload(&payload, index_name)?;
+                    let Some(expected_payload) = expected_keys.get(&rowid) else {
+                        let detail = if table_rowids.contains(&rowid) {
+                            format!(
+                                "index `{index_name}` contains rowid {rowid} for a table row that does not satisfy the partial index predicate"
+                            )
+                        } else {
+                            format!(
+                                "index `{index_name}` contains stale rowid {rowid} with no matching table row"
+                            )
+                        };
+                        return Err(FrankenError::DatabaseCorrupt { detail });
+                    };
+                    if expected_payload.as_slice() != payload.as_slice() {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{index_name}` entry for rowid {rowid} does not match the table row payload"
+                            ),
+                        });
+                    }
+                    if !actual_rowids.insert(rowid) {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{index_name}` contains duplicate entries for rowid {rowid}"
+                            ),
+                        });
+                    }
+                    prev_payload = Some(payload);
+                    Ok(())
+                };
+
+                let owner = format!("index `{}` root", index.name);
+                let owner_id = owners.register(owner.clone())?;
+                Self::walk_integrity_btree_pages(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    total_pages,
+                    index_root,
+                    &owner,
+                    Some(&mut owners),
+                    Some(owner_id),
+                    &mut index_visitor,
+                    true,
+                )?;
+
+                if let Some(missing_rowid) = expected_keys
+                    .keys()
+                    .find(|rowid| !actual_rowids.contains(rowid))
+                    .copied()
+                {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{}` rowid {missing_rowid} is missing from index `{}`",
+                            table.name, index.name
+                        ),
+                    });
                 }
+            }
+        }
+
+        if !auto_vacuum_enabled {
+            if let Some(page_no) =
+                Self::first_unowned_database_page(total_pages, page_size, |page_no| {
+                    owners.contains(page_no)
+                })
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("page {} is never used", page_no.get()),
+                });
             }
         }
 
@@ -160227,6 +160593,151 @@ mod pager_routing_tests {
         let rows = conn.query("PRAGMA integrity_check;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".into()));
+    }
+
+    #[test]
+    fn test_integrity_page_owners_compact_duplicate_detection() {
+        // Compact ownership stores only a root label id per page, not a full
+        // recursive path string. Duplicate claims must still surface the first
+        // owner label (reachable multi-ref counterexample).
+        let mut owners = super::IntegrityPageOwners::new(8).unwrap();
+        let table_owner = owners
+            .register("table `t` root".to_owned())
+            .expect("register table owner");
+        let index_owner = owners
+            .register("index `i` root".to_owned())
+            .expect("register index owner");
+        let page = PageNumber::new(3).expect("page 3");
+        assert!(
+            owners.record(page, table_owner).is_none(),
+            "first claim must succeed"
+        );
+        assert!(owners.contains(page));
+        let existing = owners
+            .record(page, index_owner)
+            .expect("second claim must report prior owner");
+        assert_eq!(existing, "table `t` root");
+        assert!(!owners.contains(PageNumber::new(4).expect("page 4")));
+    }
+
+    #[test]
+    fn test_pragma_integrity_check_fused_path_large_indexed_ok() {
+        let conn = Connection::open(":memory:").unwrap();
+        let pad = "z".repeat(40);
+        conn.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, h TEXT, lo INTEGER, a INTEGER, b TEXT);",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_h ON t(h);").unwrap();
+        conn.execute("CREATE INDEX idx_lo ON t(lo);").unwrap();
+        conn.execute("CREATE INDEX idx_ab ON t(a, b);").unwrap();
+        conn.execute("BEGIN;").unwrap();
+        for id in 1..=8_000_i64 {
+            let lo = id % 17;
+            let a = id % 53;
+            let b = id % 101;
+            conn.execute(&format!(
+                "INSERT INTO t(id, h, lo, a, b) VALUES ({id}, 'h{id:08}_{pad}', {lo}, {a}, 'b{b:04}_{pad}');",
+            ))
+            .unwrap();
+        }
+        conn.execute("COMMIT;").unwrap();
+        let rows = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("ok".into()),
+            "large memory integrity: {:?}",
+            rows[0].values()[0]
+        );
+    }
+
+    #[test]
+    fn test_pragma_integrity_check_fused_path_accepts_indexed_table() {
+        // Fused ownership+content walk must still return ok for a healthy
+        // multi-row indexed table (table leaf scan + index order/payload).
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, flag INT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t_name ON t(name);").unwrap();
+        conn.execute("CREATE INDEX idx_t_flag ON t(flag) WHERE flag IS NOT NULL;")
+            .unwrap();
+        for i in 1..=50 {
+            conn.execute(&format!(
+                "INSERT INTO t VALUES ({i}, 'n{i}', {});",
+                if i % 3 == 0 {
+                    "NULL".to_owned()
+                } else {
+                    i.to_string()
+                }
+            ))
+            .unwrap();
+        }
+        let rows = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("ok".into()),
+            "fused integrity_check must accept healthy indexed table"
+        );
+        let quick = conn.query("PRAGMA quick_check;").unwrap();
+        assert_eq!(quick[0].values()[0], SqliteValue::Text("ok".into()));
+    }
+
+    #[test]
+    fn test_pragma_integrity_check_fused_path_reports_missing_index_entry() {
+        // Reachable counterexample: drop the secondary index root's only cell
+        // pointer so the table row is missing from the index. The fused walker
+        // must still report the missing entry.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t_name ON t(name);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'Alice');").unwrap();
+
+        let index_root = conn
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case("t"))
+            .and_then(|table| {
+                table
+                    .indexes
+                    .iter()
+                    .find(|index| index.name.eq_ignore_ascii_case("idx_t_name"))
+                    .map(|index| index.root_page)
+            })
+            .expect("test index root page");
+
+        let cx = Cx::new();
+        if conn.retained_autocommit_txn.borrow().is_some() {
+            conn.flush_retained_autocommit_txn(&cx).unwrap();
+        }
+        conn.invalidate_cached_write_txn(&cx);
+        conn.invalidate_cached_read_snapshot(&cx);
+        let mut txn = conn.pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page_no = PageNumber::new(u32::try_from(index_root).unwrap()).unwrap();
+        let mut page = txn.get_page(&cx, page_no).unwrap().into_vec();
+        let header_offset = fsqlite_btree::header_offset_for_page(page_no);
+        // Zero the cell count in the leaf index header so the index appears empty.
+        // SQLite leaf index header: type(1) + first_freeblock(2) + cell_count(2) + ...
+        let cell_count_offset = header_offset + 3;
+        page[cell_count_offset] = 0;
+        page[cell_count_offset + 1] = 0;
+        txn.write_page(&cx, page_no, &page).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let rows = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(rows.len(), 1);
+        let SqliteValue::Text(message) = &rows[0].values()[0] else {
+            panic!("integrity_check should return a text diagnostic row");
+        };
+        assert_ne!(&**message, "ok");
+        assert!(
+            message.contains("missing from index")
+                || message.contains("idx_t_name")
+                || message.contains("cell"),
+            "fused path must report missing index content: {message}"
+        );
     }
 
     #[test]
